@@ -1,0 +1,2 @@
+"""Nucleo compartido del sistema."""
+

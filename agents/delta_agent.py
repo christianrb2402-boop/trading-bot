@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Sequence
 
 from core.database import Database, StoredCandle
@@ -9,16 +10,27 @@ from core.database import Database, StoredCandle
 @dataclass(slots=True, frozen=True)
 class DeltaSignal:
     symbol: str
-    k: float
+    timeframe: str
     signal: bool
+    signal_type: str
+    k_value: float
+    confidence: float
     direction: str
+    timestamp: str
+    roc_price: float
 
     def as_dict(self) -> dict[str, str | float | bool]:
         return {
             "symbol": self.symbol,
-            "k": self.k,
+            "timeframe": self.timeframe,
             "signal": self.signal,
+            "signal_type": self.signal_type,
+            "k": self.k_value,
+            "k_value": self.k_value,
+            "confidence": self.confidence,
             "direction": self.direction,
+            "timestamp": self.timestamp,
+            "roc_price": self.roc_price,
         }
 
 
@@ -31,6 +43,8 @@ class HistoricalDeltaSignal:
     roc_price: float
     k: float
     signal: bool
+    signal_type: str
+    confidence: float
     direction: str
 
     def as_dict(self) -> dict[str, str | float | bool]:
@@ -42,6 +56,8 @@ class HistoricalDeltaSignal:
             "roc_price": self.roc_price,
             "k": self.k,
             "signal": self.signal,
+            "signal_type": self.signal_type,
+            "confidence": self.confidence,
             "direction": self.direction,
         }
 
@@ -76,17 +92,33 @@ class DeltaAgent:
     def evaluate(self, symbol: str, timeframe: str) -> dict[str, str | float | bool]:
         candles = self._database.get_recent_candles(symbol=symbol, timeframe=timeframe, limit=2)
         if len(candles) < 2:
-            return DeltaSignal(symbol=symbol, k=0.0, signal=False, direction="NONE").as_dict()
+            return DeltaSignal(
+                symbol=symbol,
+                timeframe=timeframe,
+                signal=False,
+                signal_type="NONE",
+                k_value=0.0,
+                confidence=0.0,
+                direction="NONE",
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                roc_price=0.0,
+            ).as_dict()
 
         previous_candle, current_candle = candles[-2], candles[-1]
         roc_price, _, k, direction = self._calculate_signal_metrics(previous_candle, current_candle)
         signal = self._is_long_signal(roc_price=roc_price, k=k)
+        signal_type = self._resolve_signal_type(roc_price=roc_price, k=k)
 
         return DeltaSignal(
             symbol=symbol,
-            k=round(k, 6),
+            timeframe=timeframe,
             signal=signal,
-            direction="LONG" if signal else "NONE",
+            signal_type=signal_type,
+            k_value=round(k, 6),
+            confidence=self._calculate_confidence(k),
+            direction=signal_type,
+            timestamp=current_candle.close_time,
+            roc_price=round(roc_price, 6),
         ).as_dict()
 
     def evaluate_windows(
@@ -124,6 +156,7 @@ class DeltaAgent:
         for previous_candle, current_candle in zip(candles, candles[1:]):
             roc_price, _, k, direction = self._calculate_signal_metrics(previous_candle, current_candle)
             signal = self._is_long_signal(roc_price=roc_price, k=k)
+            signal_type = self._resolve_signal_type(roc_price=roc_price, k=k)
             signals.append(
                 HistoricalDeltaSignal(
                     symbol=symbol,
@@ -133,7 +166,9 @@ class DeltaAgent:
                     roc_price=round(roc_price, 6),
                     k=round(k, 6),
                     signal=signal,
-                    direction="LONG" if signal else "NONE",
+                    signal_type=signal_type,
+                    confidence=self._calculate_confidence(k),
+                    direction=signal_type,
                 )
             )
         return signals
@@ -193,6 +228,21 @@ class DeltaAgent:
 
     def _is_long_signal(self, *, roc_price: float, k: float) -> bool:
         return roc_price > 0 and k > self._threshold
+
+    def _resolve_signal_type(self, *, roc_price: float, k: float) -> str:
+        if k <= self._threshold:
+            return "NONE"
+        if roc_price > 0:
+            return "LONG"
+        if roc_price < 0:
+            return "SHORT"
+        return "NONE"
+
+    def _calculate_confidence(self, k: float) -> float:
+        if self._threshold <= 0:
+            return 1.0
+        normalized = k / (self._threshold * 2)
+        return round(max(0.0, min(normalized, 1.0)), 6)
 
     @staticmethod
     def _resolve_direction(roc_price: float) -> str:

@@ -30,6 +30,10 @@ class Settings:
     paper_stop_loss_pct: float
     paper_take_profit_pct: float
     paper_poll_seconds: int
+    binance_max_retries: int
+    binance_retry_delay_seconds: int
+    continuous_loop_seconds: int
+    simulated_trade_exit_candles: int
 
 
 def _load_env_file(env_file: Path) -> None:
@@ -114,4 +118,8 @@ def load_settings() -> Settings:
         paper_stop_loss_pct=float(os.getenv("PAPER_STOP_LOSS_PCT", "0.5")),
         paper_take_profit_pct=float(os.getenv("PAPER_TAKE_PROFIT_PCT", "1.0")),
         paper_poll_seconds=int(os.getenv("PAPER_POLL_SECONDS", "5")),
+        binance_max_retries=int(os.getenv("BINANCE_MAX_RETRIES", "3")),
+        binance_retry_delay_seconds=int(os.getenv("BINANCE_RETRY_DELAY_SECONDS", "2")),
+        continuous_loop_seconds=int(os.getenv("CONTINUOUS_LOOP_SECONDS", "60")),
+        simulated_trade_exit_candles=int(os.getenv("SIMULATED_TRADE_EXIT_CANDLES", "5")),
     )

@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import argparse
 import logging
+import time
 
 from agents.delta_agent import DeltaAgent
 from agents.signal_evaluator import SignalEvaluator
 from config.settings import Settings, load_settings
-from core.database import Database
+from core.database import Database, SignalLogRecord
 from core.exceptions import TradingSystemError
 from core.logger import configure_logging
-from data.binance_market_data import BinanceMarketDataService
+from data.binance_market_data import Candle, BinanceMarketDataService
 from execution.paper_trader import PaperTrader
+from execution.simulated_trade_tracker import SimulatedTradeTracker
 
 
 logger = logging.getLogger(__name__)
@@ -26,6 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--evaluate-direction", action="store_true", help="Evalua performance separada de LONG y SHORT")
     parser.add_argument("--optimize-threshold", action="store_true", help="Compara thresholds para Delta LONG-only")
     parser.add_argument("--paper-trade", action="store_true", help="Ejecuta paper trading LONG-only con datos reales de Binance")
+    parser.add_argument("--continuous-engine", action="store_true", help="Ejecuta analisis continuo de mercado cada 60 segundos")
     parser.add_argument("--symbols", nargs="+", help="Lista de simbolos, ejemplo BTCUSDT ETHUSDT")
     parser.add_argument("--timeframe", help="Timeframe, ejemplo 1m")
     parser.add_argument("--limit", type=int, help="Cantidad de velas por simbolo")
@@ -34,6 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--evaluation-windows", nargs="+", type=int, help="Horizontes post-senal, ejemplo 5 10 15")
     parser.add_argument("--optimization-thresholds", nargs="+", type=float, help="Thresholds a comparar, ejemplo 0.5 1.0 1.5 2.0")
     parser.add_argument("--paper-cycles", type=int, help="Cantidad de ciclos de paper trading para pruebas")
+    parser.add_argument("--max-loops", type=int, help="Cantidad de iteraciones para pruebas del motor continuo")
     return parser
 
 
@@ -199,8 +203,10 @@ def run_delta_agent(
             "context": {
                 "symbol": result["symbol"],
                 "timeframe": timeframe,
-                "k": result["k"],
                 "signal": result["signal"],
+                "signal_type": result["signal_type"],
+                "k_value": result["k_value"],
+                "confidence": result["confidence"],
             },
         },
     )
@@ -383,6 +389,155 @@ def run_paper_trading(
     paper_trader.run(symbols=symbols, timeframe=timeframe, max_cycles=max_cycles)
 
 
+def run_continuous_engine(
+    *,
+    database: Database,
+    market_data_service: BinanceMarketDataService,
+    delta_agent: DeltaAgent,
+    simulated_trade_tracker: SimulatedTradeTracker,
+    symbols: tuple[str, ...],
+    timeframe: str,
+    loop_seconds: int,
+    max_loops: int | None,
+) -> None:
+    last_processed_open_time: dict[str, str] = {}
+    loop_count = 0
+
+    while True:
+        try:
+            loop_count += 1
+            logger.info(
+                "Continuous engine cycle started",
+                extra={
+                    "event": "continuous_cycle_start",
+                    "context": {
+                        "loop_count": loop_count,
+                        "symbols": list(symbols),
+                        "timeframe": timeframe,
+                    },
+                },
+            )
+
+            for symbol in symbols:
+                try:
+                    _process_continuous_symbol(
+                        database=database,
+                        market_data_service=market_data_service,
+                        delta_agent=delta_agent,
+                        simulated_trade_tracker=simulated_trade_tracker,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        last_processed_open_time=last_processed_open_time,
+                    )
+                except TradingSystemError as exc:
+                    logger.exception(
+                        "Continuous symbol processing failed",
+                        extra={
+                            "event": "continuous_symbol_error",
+                            "context": {"symbol": symbol, "timeframe": timeframe, "error": str(exc)},
+                        },
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        "Unexpected continuous symbol failure",
+                        extra={
+                            "event": "continuous_symbol_error",
+                            "context": {"symbol": symbol, "timeframe": timeframe, "error": str(exc)},
+                        },
+                    )
+        except Exception as exc:
+            logger.exception(
+                "Continuous engine cycle failed",
+                extra={
+                    "event": "continuous_cycle_error",
+                    "context": {"loop_count": loop_count, "timeframe": timeframe, "error": str(exc)},
+                },
+            )
+
+        if max_loops is not None and loop_count >= max_loops:
+            logger.info(
+                "Continuous engine stopped by max loops",
+                extra={"event": "continuous_cycle_stop", "context": {"loop_count": loop_count}},
+            )
+            return
+
+        time.sleep(loop_seconds)
+
+
+def _process_continuous_symbol(
+    *,
+    database: Database,
+    market_data_service: BinanceMarketDataService,
+    delta_agent: DeltaAgent,
+    simulated_trade_tracker: SimulatedTradeTracker,
+    symbol: str,
+    timeframe: str,
+    last_processed_open_time: dict[str, str],
+) -> None:
+    closed_candles = market_data_service.fetch_latest_closed_candles(symbol=symbol, timeframe=timeframe, limit=2)
+    if len(closed_candles) < 2:
+        return
+
+    latest_candle = closed_candles[-1]
+    if last_processed_open_time.get(symbol) == latest_candle.open_time:
+        return
+
+    insert_result = database.insert_candles(closed_candles)
+    logger.info(
+        "Continuous market data synced",
+        extra={
+            "event": "fetch",
+            "context": {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "inserted": insert_result.inserted,
+                "duplicates": insert_result.duplicates,
+                "open_time": latest_candle.open_time,
+            },
+        },
+    )
+
+    signal = delta_agent.evaluate(symbol=symbol, timeframe=timeframe)
+    database.insert_signal_log(
+        SignalLogRecord(
+            symbol=symbol,
+            timeframe=timeframe,
+            signal=str(signal["signal_type"]),
+            k_value=float(signal["k_value"]),
+            confidence=float(signal["confidence"]),
+            timestamp=str(signal["timestamp"]),
+        )
+    )
+    logger.info(
+        "Structured signal logged",
+        extra={
+            "event": "signal",
+            "context": {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "signal": signal["signal_type"],
+                "k_value": signal["k_value"],
+                "confidence": signal["confidence"],
+                "timestamp": signal["timestamp"],
+            },
+        },
+    )
+
+    latest_stored_candle = database.get_recent_candles(symbol=symbol, timeframe=timeframe, limit=1)[-1]
+    simulated_trade_tracker.process_signal(
+        symbol=symbol,
+        timeframe=timeframe,
+        signal=signal,
+        latest_candle=latest_stored_candle,
+    )
+    stats = simulated_trade_tracker.build_stats(symbol)
+    print(
+        f"{symbol}: signal={signal['signal_type']} k={signal['k_value']} confidence={signal['confidence']} "
+        f"trades={stats.total_trades} winrate={stats.winrate}% pnl={stats.cumulative_pnl}% drawdown={stats.drawdown}%"
+    )
+    last_processed_open_time[symbol] = latest_candle.open_time
+
+
 def main() -> int:
     settings = load_settings()
     parser = build_parser()
@@ -407,6 +562,10 @@ def main() -> int:
         market_data_service=service,
         delta_agent=delta_agent,
         settings=settings,
+    )
+    simulated_trade_tracker = SimulatedTradeTracker(
+        database=database,
+        exit_after_candles=settings.simulated_trade_exit_candles,
     )
     had_errors = False
 
@@ -498,6 +657,23 @@ def main() -> int:
             logger.info(
                 "Clean shutdown",
                 extra={"event": "shutdown", "context": {"status": "paper_trade_success"}},
+            )
+            return 0
+
+        if args.continuous_engine:
+            run_continuous_engine(
+                database=database,
+                market_data_service=service,
+                delta_agent=delta_agent,
+                simulated_trade_tracker=simulated_trade_tracker,
+                symbols=symbols,
+                timeframe=timeframe,
+                loop_seconds=settings.continuous_loop_seconds,
+                max_loops=args.max_loops,
+            )
+            logger.info(
+                "Clean shutdown",
+                extra={"event": "shutdown", "context": {"status": "continuous_engine_success"}},
             )
             return 0
 

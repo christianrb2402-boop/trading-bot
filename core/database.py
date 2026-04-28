@@ -55,6 +55,16 @@ class SignalEvaluationRecord:
 
 
 @dataclass(slots=True, frozen=True)
+class SignalLogRecord:
+    symbol: str
+    timeframe: str
+    signal: str
+    k_value: float
+    confidence: float
+    timestamp: str
+
+
+@dataclass(slots=True, frozen=True)
 class TradeRecord:
     id: int
     symbol: str
@@ -65,6 +75,18 @@ class TradeRecord:
     pnl_pct: float | None
     duration: int | None
     exit_reason: str | None
+
+
+@dataclass(slots=True, frozen=True)
+class SimulatedTradeRecord:
+    id: int
+    symbol: str
+    entry_price: float
+    exit_price: float | None
+    direction: str
+    pnl: float | None
+    timestamp_entry: str
+    timestamp_exit: str | None
 
 
 class Database:
@@ -161,6 +183,45 @@ class Database:
                     exit_reason TEXT,
                     created_at TEXT NOT NULL
                 )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS signals_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    signal TEXT NOT NULL,
+                    k_value REAL NOT NULL,
+                    confidence REAL NOT NULL,
+                    timestamp TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_signals_log_symbol_timestamp
+                ON signals_log (symbol, timeframe, timestamp)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS simulated_trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    entry_price REAL NOT NULL,
+                    exit_price REAL,
+                    direction TEXT NOT NULL,
+                    pnl REAL,
+                    timestamp_entry TEXT NOT NULL,
+                    timestamp_exit TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_simulated_trades_symbol_entry
+                ON simulated_trades (symbol, timestamp_entry)
                 """
             )
             conn.execute(
@@ -453,6 +514,134 @@ class Database:
             ).fetchall()
         return [self._row_to_trade(row) for row in rows]
 
+    def insert_signal_log(self, record: SignalLogRecord) -> int:
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO signals_log (
+                    symbol,
+                    timeframe,
+                    signal,
+                    k_value,
+                    confidence,
+                    timestamp
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.symbol,
+                    record.timeframe,
+                    record.signal,
+                    record.k_value,
+                    record.confidence,
+                    record.timestamp,
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def get_open_simulated_trade(self, symbol: str) -> SimulatedTradeRecord | None:
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT id, symbol, entry_price, exit_price, direction, pnl, timestamp_entry, timestamp_exit
+                FROM simulated_trades
+                WHERE symbol = ? AND timestamp_exit IS NULL
+                ORDER BY timestamp_entry DESC
+                LIMIT 1
+                """,
+                (symbol,),
+            ).fetchone()
+        return self._row_to_simulated_trade(row) if row else None
+
+    def insert_simulated_trade(
+        self,
+        *,
+        symbol: str,
+        entry_price: float,
+        direction: str,
+        timestamp_entry: str,
+    ) -> int:
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO simulated_trades (
+                    symbol,
+                    entry_price,
+                    direction,
+                    timestamp_entry
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (symbol, entry_price, direction, timestamp_entry),
+            )
+        return int(cursor.lastrowid)
+
+    def close_simulated_trade(
+        self,
+        *,
+        trade_id: int,
+        exit_price: float,
+        pnl: float,
+        timestamp_exit: str,
+    ) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                """
+                UPDATE simulated_trades
+                SET exit_price = ?,
+                    pnl = ?,
+                    timestamp_exit = ?
+                WHERE id = ?
+                """,
+                (exit_price, pnl, timestamp_exit, trade_id),
+            )
+
+    def get_closed_simulated_trades(self, symbol: str) -> list[SimulatedTradeRecord]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, symbol, entry_price, exit_price, direction, pnl, timestamp_entry, timestamp_exit
+                FROM simulated_trades
+                WHERE symbol = ? AND timestamp_exit IS NOT NULL
+                ORDER BY timestamp_exit ASC
+                """,
+                (symbol,),
+            ).fetchall()
+        return [self._row_to_simulated_trade(row) for row in rows]
+
+    def get_candles_after_close_time(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        close_time: str,
+        limit: int,
+    ) -> list[StoredCandle]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT symbol, timeframe, open_time, open, high, low, close, volume, close_time
+                FROM candles
+                WHERE symbol = ? AND timeframe = ? AND close_time > ?
+                ORDER BY close_time ASC
+                LIMIT ?
+                """,
+                (symbol, timeframe, close_time, limit),
+            ).fetchall()
+
+        return [
+            StoredCandle(
+                symbol=row["symbol"],
+                timeframe=row["timeframe"],
+                open_time=row["open_time"],
+                open=row["open"],
+                high=row["high"],
+                low=row["low"],
+                close=row["close"],
+                volume=row["volume"],
+                close_time=row["close_time"],
+            )
+            for row in rows
+        ]
+
     @staticmethod
     def _row_to_trade(row: sqlite3.Row) -> TradeRecord:
         return TradeRecord(
@@ -465,6 +654,19 @@ class Database:
             pnl_pct=row["pnl_pct"],
             duration=row["duration"],
             exit_reason=row["exit_reason"],
+        )
+
+    @staticmethod
+    def _row_to_simulated_trade(row: sqlite3.Row) -> SimulatedTradeRecord:
+        return SimulatedTradeRecord(
+            id=row["id"],
+            symbol=row["symbol"],
+            entry_price=row["entry_price"],
+            exit_price=row["exit_price"],
+            direction=row["direction"],
+            pnl=row["pnl"],
+            timestamp_entry=row["timestamp_entry"],
+            timestamp_exit=row["timestamp_exit"],
         )
 
     @staticmethod

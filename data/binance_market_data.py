@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import logging
+import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -34,6 +35,8 @@ class BinanceMarketDataService:
     def __init__(self, settings: Settings) -> None:
         self._base_url = settings.binance_base_url
         self._timeout = settings.binance_timeout_seconds
+        self._max_retries = settings.binance_max_retries
+        self._retry_delay_seconds = settings.binance_retry_delay_seconds
 
     def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int) -> list[Candle]:
         if limit <= 0:
@@ -148,11 +151,41 @@ class BinanceMarketDataService:
         url = f"{self._base_url}{path}?{query}"
         request = Request(url, headers={"User-Agent": "multiagent-trading-system/0.1"})
 
-        try:
-            with urlopen(request, timeout=self._timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise ExternalServiceError(f"Error consultando Binance: {exc}") from exc
+        last_error: Exception | None = None
+        for attempt in range(1, self._max_retries + 2):
+            try:
+                with urlopen(request, timeout=self._timeout) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except HTTPError as exc:
+                if exc.code == 451:
+                    logger.error(
+                        "Binance request blocked with HTTP 451",
+                        extra={
+                            "event": "fetch_http_451",
+                            "context": {"url": url, "attempt": attempt, "status_code": exc.code},
+                        },
+                    )
+                    raise ExternalServiceError(f"Binance HTTP 451 for {url}") from exc
+                last_error = exc
+            except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+                last_error = exc
+
+            logger.warning(
+                "Binance request failed, retrying",
+                extra={
+                    "event": "fetch_retry",
+                    "context": {
+                        "url": url,
+                        "attempt": attempt,
+                        "max_retries": self._max_retries,
+                        "error": str(last_error),
+                    },
+                },
+            )
+            if attempt <= self._max_retries:
+                time.sleep(self._retry_delay_seconds)
+
+        raise ExternalServiceError(f"Error consultando Binance: {last_error}") from last_error
 
     @staticmethod
     def _build_candle(symbol: str, timeframe: str, payload: list) -> Candle:

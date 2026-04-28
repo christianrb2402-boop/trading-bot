@@ -1,6 +1,8 @@
 # Multi-Agent Trading System
 
-Capa fundacional minima para consumir OHLCV de Binance en modo lectura, guardarlo en SQLite y registrar todo con logging estructurado.
+Base evolutiva de un sistema de inteligencia de trading para cripto: ingesta de mercado, analisis Delta, evaluacion historica, paper trading y motor continuo de analisis.
+
+Nota: [PROJECT_STATE.md](C:\Users\chris\OneDrive\Documentos\New%20project\PROJECT_STATE.md) es la fuente de verdad del estado actual y la arquitectura operativa del proyecto.
 
 ## Alcance del sprint
 
@@ -9,7 +11,7 @@ Capa fundacional minima para consumir OHLCV de Binance en modo lectura, guardarl
 - Timeframe inicial: `1m`.
 - Simbolos iniciales: `BTCUSDT` y `ETHUSDT`.
 - Sin ordenes reales.
-- Sin paper trading todavia.
+- Paper trading y simulacion solamente.
 - Sin dashboard ni LLMs.
 
 ## Estructura relevante
@@ -19,6 +21,8 @@ config/settings.py
 core/logger.py
 core/database.py
 data/binance_market_data.py
+agents/delta_agent.py
+execution/simulated_trade_tracker.py
 main.py
 .env.example
 README.md
@@ -41,6 +45,9 @@ Variables principales:
 - `MARKET_SYMBOLS`: lista separada por comas.
 - `MARKET_TIMEFRAME`: timeframe a consumir.
 - `BINANCE_KLINES_LIMIT`: numero de velas a pedir por simbolo.
+- `BINANCE_MAX_RETRIES`: reintentos ante errores de red/API.
+- `CONTINUOUS_LOOP_SECONDS`: frecuencia del motor continuo.
+- `SIMULATED_TRADE_EXIT_CANDLES`: salida simulada despues de N velas.
 
 Ejemplo de `.env`:
 
@@ -115,6 +122,18 @@ Ejecutar paper trading LONG-only con datos reales de Binance:
 python main.py --paper-trade
 ```
 
+Ejecutar el motor continuo de analisis de mercado:
+
+```bash
+python main.py --continuous-engine
+```
+
+Ejecutar una cantidad acotada de iteraciones para pruebas:
+
+```bash
+python main.py --continuous-engine --max-loops 1
+```
+
 Ejecutar un numero acotado de ciclos para pruebas:
 
 ```bash
@@ -146,7 +165,9 @@ python main.py --symbols BTCUSDT ETHUSDT --timeframe 1m --limit 10
 3. Crea la base SQLite y la tabla `candles`.
 4. Consulta OHLCV desde Binance.
 5. Inserta velas evitando duplicados por `UNIQUE(symbol, timeframe, open_time)`.
-6. Registra inicio, fetch, inserciones, duplicados, errores y cierre limpio.
+6. Calcula senales Delta estructuradas.
+7. Registra senales y trades simulados en SQLite.
+8. Registra inicio, fetch, inserciones, duplicados, errores y cierre limpio.
 
 ## Esquema SQLite
 
@@ -167,6 +188,27 @@ Tabla `candles`:
 Restriccion unica:
 
 - `(symbol, timeframe, open_time)`
+
+Tabla `signals_log`:
+
+- `id`
+- `symbol`
+- `timeframe`
+- `signal`
+- `k_value`
+- `confidence`
+- `timestamp`
+
+Tabla `simulated_trades`:
+
+- `id`
+- `symbol`
+- `entry_price`
+- `exit_price`
+- `direction`
+- `pnl`
+- `timestamp_entry`
+- `timestamp_exit`
 
 ## Logs
 
@@ -191,6 +233,12 @@ Eventos principales:
 - `paper_trade_cycle`
 - `paper_trade_open`
 - `paper_trade_close`
+- `signal`
+- `trade_simulation_open`
+- `trade_simulation_close`
+- `continuous_cycle_start`
+- `continuous_cycle_error`
+- `continuous_symbol_error`
 - `shutdown`
 - `fatal_error`
 

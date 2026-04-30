@@ -6,10 +6,9 @@
 - No real trading was added.
 - No API keys are required.
 - No private order execution exists.
-- The project now includes explicit HTTP-based Binance diagnosis and a readiness gate for long live-paper runs.
-- The fixed Windows machine appears viable for Binance HTTP based on external operator validation.
-- The current Codex environment still fails live Binance HTTP with `WinError 10061`.
-- The strategy is currently losing after fees, slippage and spread.
+- Multi-timeframe research, benchmark, walk-forward and ledger reconciliation are implemented.
+- The current Codex environment still cannot reach Binance HTTP and is not ready for a long live-paper run.
+- The strategy is still losing after fees, slippage and spread.
 
 ## A. Architecture Summary
 
@@ -18,14 +17,15 @@
 - `main.py`
 - `config/settings.py`
 - `core/database.py`
-- `core/logger.py`
 - `core/runtime_checks.py`
+- `core/ledger_reconciler.py`
 
 ### Agents
 
 - `MarketDataAgent`
 - `MarketContextAgent`
 - `DeltaAgent`
+- `SymbolSelectionAgent`
 - `RiskRewardAgent`
 - `CostModelAgent`
 - `PerformanceLearningAgent`
@@ -47,42 +47,42 @@
 ### Database / memory layer
 
 - SQLite at `runtime/market_data.db`
-- Candles, signals, decisions, context, trades, portfolio, orders, ledger, equity and errors persisted
+- Candles, signals, rejections, context, decisions, simulated trades, portfolio, equity, benchmarks, walk-forward results and errors persisted
 
 ### Reporting layer
 
 - `python main.py --status-report`
 - `python main.py --export-report`
+- `python main.py --export-report --format csv`
 
 ## B. Current Commands Available
 
-Implemented:
-
 - `python main.py --init-only`
-- `python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 1m --limit 1000`
-- `python main.py --delta-only`
-- `python main.py --delta-test`
-- `python main.py --evaluate-signals`
-- `python main.py --evaluate-direction`
-- `python main.py --optimize-threshold`
-- `python main.py --paper-trade`
-- `python main.py --continuous-engine`
-- `python main.py --backtest --limit 5000 --timeframes 1m,5m,15m --min-trades 100`
 - `python main.py --diagnose-connectivity`
 - `python main.py --readiness-check`
+- `python main.py --reconcile-ledger`
+- `python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 1m --limit 1000`
+- `python main.py --backtest --limit 5000 --timeframes "1m,5m,15m,30m,1h,4h,1d" --min-trades 100`
+- `python main.py --benchmark --limit 5000 --timeframes "1m,5m,15m,30m,1h,4h,1d"`
+- `python main.py --walk-forward --limit 10000 --train-pct 70 --timeframes "1m,5m,15m,30m,1h,4h,1d"`
 - `python main.py --live-paper-engine`
 - `python main.py --live-paper-engine --max-loops 5`
 - `python main.py --live-paper-engine --run-minutes 60`
-- `python main.py --live-paper-engine --allow-stale-fallback`
 - `python main.py --status-report`
 - `python main.py --export-report`
+- `python main.py --export-report --format csv`
 
-Not implemented:
-
-- `python main.py --benchmark --limit 2000 --timeframes 1m,5m,15m`
-- `python main.py --walk-forward --limit 5000 --train-pct 70`
+PowerShell note:
+- Quote `--timeframes` values.
+- Example: `--timeframes "1m,5m,15m,30m,1h,4h,1d"`
 
 ## C. Validation Performed
+
+### `python main.py --init-only`
+
+- Status: PASSED
+- Important output:
+  - SQLite initialized successfully
 
 ### `python main.py --diagnose-connectivity`
 
@@ -95,22 +95,78 @@ Not implemented:
 - Error:
   - `WinError 10061`
 
-### `python main.py --init-only`
+### `python main.py --reconcile-ledger`
 
 - Status: PASSED
 - Important output:
-  - SQLite initialized successfully
+  - `open_positions_count=0`
+  - `open_simulated_trades_count=0`
+  - `orphan_positions=0`
+  - `duplicated_positions=0`
+  - `cash_check=0.0`
+  - `equity_check=0.0`
+  - `result=OK`
 
-### `python main.py --load-history --symbols BTCUSDT ETHUSDT --timeframe 1m --limit 100`
+### `python main.py --status-report`
 
-- Status: FAILED / PARTIAL
+- Status: PASSED
+- Important output after final reconciliation:
+  - `Current provider: LOCAL_SQLITE`
+  - `Ledger Consistency Check: OK`
+  - `Signals by symbol: BTCUSDT=2335, ETHUSDT=2335`
+  - `Closed simulated trades: 159`
+  - `Net winrate: 5.03%`
+  - `Total net pnl: -59.309828`
+
+### `python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 1m --limit 1000`
+
+- Status: FAILED
 - Important output:
   - `successful_symbols=[]`
-  - `failed_symbols=['BTCUSDT', 'ETHUSDT']`
+  - `failed_symbols=['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT']`
   - `candles_inserted=0`
-  - `duplicates=0`
 - Error:
-  - Binance HTTP refused in current Codex environment
+  - `Error consultando Binance: <urlopen error [WinError 10061] ...>`
+- Probable file:
+  - `data/binance_market_data.py`
+- Recommendation:
+  - run this command on the fixed Windows machine without VPN
+
+### `python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 5m --limit 1000`
+
+- Status: FAILED
+- Error:
+  - `WinError 10061`
+
+### `python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 15m --limit 1000`
+
+- Status: FAILED
+- Error:
+  - `WinError 10061`
+
+### `python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 30m --limit 1000`
+
+- Status: FAILED
+- Error:
+  - `WinError 10061`
+
+### `python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 1h --limit 1000`
+
+- Status: FAILED
+- Error:
+  - `WinError 10061`
+
+### `python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 4h --limit 1000`
+
+- Status: FAILED
+- Error:
+  - `WinError 10061`
+
+### `python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 1d --limit 1000`
+
+- Status: FAILED
+- Error:
+  - `WinError 10061`
 
 ### `python main.py --readiness-check`
 
@@ -124,72 +180,113 @@ Not implemented:
   - Missing symbols: `BNBUSDT`, `SOLUSDT`, `XRPUSDT`
   - Stale symbols: `BTCUSDT`, `ETHUSDT`
 
+### `python main.py --backtest --limit 5000 --timeframes "1m,5m,15m,30m,1h,4h,1d" --min-trades 100`
+
+- Status: PASSED
+- Important output:
+  - `Events processed: 4670`
+  - `Trades opened: 159`
+  - `Trades closed: 159`
+  - `Winrate: 5.03%`
+  - `Total pnl: -59.309828`
+
+### `python main.py --benchmark --limit 5000 --timeframes "1m,5m,15m,30m,1h,4h,1d"`
+
+- Status: PASSED
+- Important output:
+  - `BOT_STRATEGY trades=156 winrate=4.49% net_pnl=-59.431848`
+  - `BUY_AND_HOLD net_pnl=-12.278755`
+  - `RANDOM_ENTRY net_pnl=-50.544552`
+  - `TREND_FOLLOWING_BASELINE net_pnl=-63.769936`
+  - `NO_TRADE net_pnl=0.0`
+
+### `python main.py --walk-forward --limit 10000 --train-pct 70`
+
+- Status: PASSED
+- Important output:
+  - `Selected relaxation: 0.3`
+  - `Train net_pnl: -26.166546`
+  - `Test net_pnl: -7.17661`
+  - `Survived out of sample: False`
+
 ### `python main.py --live-paper-engine --max-loops 5`
 
 - Status: PASSED
 - Important output:
   - `Loops completed: 5`
-  - `Decisions persisted: 225`
+  - `Decisions persisted: 595`
   - `Trades opened: 0`
   - `Trades closed: 0`
 - Interpretation:
   - bounded fallback execution is safe
-  - no fresh live Binance data used in current Codex environment
-
-### `python main.py --status-report`
-
-- Status: PASSED
-- Important output:
-  - current provider: `LOCAL_SQLITE`
-  - latest candles are stale
-  - total agent decisions: `3000`
-  - closed simulated trades: `142`
-  - net PnL remains negative
+  - no fresh live Binance data was used here
 
 ### `python main.py --export-report`
 
 - Status: PASSED
 - Important output:
-  - exported report to `runtime/report_export.json`
+  - exported JSON report successfully
+
+### `python main.py --export-report --format csv`
+
+- Status: PASSED
+- Important output:
+  - exported CSV bundle to `runtime`
 
 ## D. Current Results
 
-- Candles total: `2102`
-- Signals total: `2610`
-- Decisions total: `3000`
-- Simulated trades total: `142`
-- Open positions: `0`
-- Closed positions: `142`
-- Net winrate: `2.82%`
-- Gross winrate: `4.93%`
-- Gross PnL: `-16.214382`
-- Net PnL: `-54.550338`
-- Fees: `28.395951`
-- Slippage: `7.1`
-- Spread: `2.84`
-- Funding estimate: `0.0`
-- Current simulated equity: `945.449662`
+- Candles total:
+  - `BTCUSDT 1m=1011`
+  - `ETHUSDT 1m=1011`
+  - materialized higher timeframes only for BTC/ETH
+- Signals total:
+  - `BTCUSDT=2335`
+  - `ETHUSDT=2335`
+- Decisions total:
+  - `4670`
+- Simulated trades total:
+  - `159`
+- Open positions:
+  - `0`
+- Closed positions:
+  - `159`
+- Gross winrate:
+  - `7.55%`
+- Net winrate:
+  - `5.03%`
+- Gross pnl:
+  - `-16.388537`
+- Net pnl:
+  - `-59.309828`
+- Fees:
+  - `31.791287`
+- Slippage:
+  - `7.95`
+- Spread:
+  - `3.18`
+- Funding estimate:
+  - `0.0`
+- Current simulated equity:
+  - `940.690172`
 
 Interpretation:
-
 - The strategy is losing.
 - It is losing after all modeled costs.
-- It is not ready for profitability work yet.
+- It is not ready for profitability claims.
 
 ## E. Data Health
 
 ### Fixed Windows machine
 
-- External operator validation says Binance HTTP is usable.
-- `nslookup` failure is not treated as a fatal connectivity failure.
+- Operator validation says Binance HTTP is usable.
 - This is the intended runtime target.
 
 ### Current Codex environment
 
-- Current provider used in live-paper validation: `LOCAL_SQLITE`
+- Current provider used in validation: `LOCAL_SQLITE`
 - Binance connectivity status: FAIL
 - Fallback status: working
-- Stale data status: YES
+- Stale data status: YES for intraday timeframes
 - Missing symbols: `BNBUSDT`, `SOLUSDT`, `XRPUSDT`
 - Data gaps: YES
 - Valid enough for long live-paper execution here: `NO`
@@ -206,55 +303,29 @@ Interpretation:
 ## G. Remaining Risks
 
 - Binance HTTP is still blocked in the current Codex environment.
-- Local historical dataset is incomplete and stale.
-- Missing symbol coverage for `BNBUSDT`, `SOLUSDT`, `XRPUSDT`.
-- Strategy performance is currently negative after costs.
-- Overfitting risk remains because useful fresh sample size is still limited.
+- Local historical dataset is incomplete and stale here.
+- Symbol coverage is still missing for `BNBUSDT`, `SOLUSDT`, `XRPUSDT`.
+- Strategy performance is clearly negative after costs.
+- Overfitting risk remains high because out-of-sample walk-forward failed.
 - No dashboard yet.
 - No macro/news context sources yet.
-- Long live-paper should not be started until the readiness check passes on the fixed machine.
+- Full live committee logic is strongest in `live_paper_engine`; historical engines still need future harmonization if we want exact committee parity later.
+- If `--timeframes` is not quoted in PowerShell, values like `1d` can be distorted.
 
 ## H. Tomorrow's Recommended Next Step
 
 1. Go to the fixed Windows machine without VPN.
 2. Run `python main.py --diagnose-connectivity`.
-3. If HTTP is OK, run `python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 1m --limit 1000`.
+3. Load fresh history for `1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`.
 4. Run `python main.py --readiness-check`.
-5. Only if readiness says `READY_FOR_LIVE_PAPER: YES` or recommends `LIVE_BINANCE`, run `python main.py --live-paper-engine --run-minutes 60`.
-
-## Git Checkpoint Summary
-
-### `git status --short`
-
-This repository currently has uncommitted research and operational changes, including:
-
-- new audit and runtime-check files
-- new live-paper provider and Windows runbook files
-- modified main engine, database and report logic
-
-### `git diff --stat`
-
-The change set is substantial and includes:
-
-- live paper intelligence engine work
-- connectivity diagnosis
-- readiness gating
-- richer status reporting
-- Windows operational runbook and batch launchers
-
-### `git log --oneline -5`
-
-Current recent visible history:
-
-```text
-cf75a2e checkpoint: continuous engine and project state memory
-2aa8caa initial commit
-```
+5. Run `python main.py --reconcile-ledger`.
+6. Run `python main.py --benchmark --limit 5000 --timeframes "1m,5m,15m,30m,1h,4h,1d"`.
+7. Only if readiness recommends `LIVE_BINANCE`, run `python main.py --live-paper-engine --run-minutes 60`.
 
 ## Bottom Line
 
 - Safe to continue tomorrow: `YES`
 - Safe to start real trading: `NO`
 - Safe to run bounded paper validation: `YES`
-- Ready for 60-minute live paper in current Codex environment: `NO`
-- Potentially ready for 60-minute live paper on the fixed Windows machine after `--diagnose-connectivity`, `--load-history` and `--readiness-check` all pass there: `YES`
+- Ready for 60-minute live paper in the current Codex environment: `NO`
+- Potentially ready for 60-minute live paper on the fixed Windows machine after connectivity, history load and readiness all pass there: `YES`

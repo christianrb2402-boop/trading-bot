@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from agents.cost_model_agent import CostSnapshot
 from config.settings import Settings
 
 
@@ -12,6 +13,11 @@ class RiskRewardAssessment:
     reward_risk_ratio: float
     expected_reward_pct: float
     expected_risk_pct: float
+    expected_net_reward_pct: float
+    expected_net_risk_pct: float
+    expected_net_reward_risk: float
+    cost_drag_pct: float
+    minimum_profitable_move_pct: float
     reason: str
     stop_loss_price: float
     take_profit_price: float
@@ -23,6 +29,11 @@ class RiskRewardAssessment:
             "reward_risk_ratio": self.reward_risk_ratio,
             "expected_reward_pct": self.expected_reward_pct,
             "expected_risk_pct": self.expected_risk_pct,
+            "expected_net_reward_pct": self.expected_net_reward_pct,
+            "expected_net_risk_pct": self.expected_net_risk_pct,
+            "expected_net_reward_risk": self.expected_net_reward_risk,
+            "cost_drag_pct": self.cost_drag_pct,
+            "minimum_profitable_move_pct": self.minimum_profitable_move_pct,
             "reason": self.reason,
             "stop_loss_price": self.stop_loss_price,
             "take_profit_price": self.take_profit_price,
@@ -37,36 +48,45 @@ class RiskRewardAgent:
         self,
         *,
         signal: dict[str, object],
-        price: float,
-        volatility_pct: float,
-        estimated_cost_pct: float,
+        cost_snapshot: CostSnapshot,
     ) -> RiskRewardAssessment:
         direction = str(signal.get("signal_type", "NONE"))
-        base_stop_pct = max(self._settings.simulated_stop_loss_pct * 100, max(volatility_pct, 0.05))
-        base_reward_pct = max(self._settings.simulated_take_profit_pct * 100, base_stop_pct * self._settings.min_reward_risk_ratio)
-        reward_risk_ratio = base_reward_pct / max(base_stop_pct, 0.000001)
-        cost_adjusted_reward_pct = max(base_reward_pct - estimated_cost_pct, 0.0)
+        reward_risk_ratio = float(cost_snapshot.expected_gross_reward_pct) / max(float(cost_snapshot.expected_gross_risk_pct), 0.000001)
+        expected_net_reward_risk = float(cost_snapshot.expected_net_reward_risk)
+        expected_net_reward_pct = float(cost_snapshot.expected_net_reward_pct)
+        expected_net_risk_pct = float(cost_snapshot.expected_net_risk_pct)
+        minimum_profitable_move_pct = float(cost_snapshot.minimum_profitable_move_pct)
+        cost_drag_pct = float(cost_snapshot.cost_drag_pct)
 
-        if direction == "SHORT":
-            stop_loss_price = price * (1 + (base_stop_pct / 100))
-            take_profit_price = price * (1 - (base_reward_pct / 100))
-        else:
-            stop_loss_price = price * (1 - (base_stop_pct / 100))
-            take_profit_price = price * (1 + (base_reward_pct / 100))
-
-        approved = direction in {"LONG", "SHORT"} and reward_risk_ratio >= self._settings.min_reward_risk_ratio and cost_adjusted_reward_pct > base_stop_pct * 0.25
-        reason = (
-            f"reward/risk {round(reward_risk_ratio, 4)} with expected reward {round(cost_adjusted_reward_pct, 4)}% after costs"
-            if approved
-            else f"reward/risk {round(reward_risk_ratio, 4)} was not attractive enough after estimated costs"
+        approved = bool(
+            direction in {"LONG", "SHORT"}
+            and expected_net_reward_pct > self._settings.min_expected_net_edge_pct
+            and expected_net_reward_risk >= self._settings.min_net_reward_risk_ratio
+            and cost_drag_pct <= self._settings.max_cost_drag_pct
         )
+        if approved:
+            reason = (
+                f"net reward/risk {round(expected_net_reward_risk, 4)} with expected net reward "
+                f"{round(expected_net_reward_pct, 4)}% after estimated costs; cost drag {round(cost_drag_pct, 4)}"
+            )
+        else:
+            reason = (
+                f"rejected because net edge {round(expected_net_reward_pct, 4)}%, net reward/risk "
+                f"{round(expected_net_reward_risk, 4)} and cost drag {round(cost_drag_pct, 4)} did not satisfy the filters"
+            )
+
         return RiskRewardAssessment(
             vote=direction if approved else "REJECT",
-            confidence=0.8 if approved else 0.25,
+            confidence=0.82 if approved else 0.22,
             reward_risk_ratio=round(reward_risk_ratio, 6),
-            expected_reward_pct=round(cost_adjusted_reward_pct, 6),
-            expected_risk_pct=round(base_stop_pct, 6),
+            expected_reward_pct=round(float(cost_snapshot.expected_gross_reward_pct), 6),
+            expected_risk_pct=round(float(cost_snapshot.expected_gross_risk_pct), 6),
+            expected_net_reward_pct=round(expected_net_reward_pct, 6),
+            expected_net_risk_pct=round(expected_net_risk_pct, 6),
+            expected_net_reward_risk=round(expected_net_reward_risk, 6),
+            cost_drag_pct=round(cost_drag_pct, 6),
+            minimum_profitable_move_pct=round(minimum_profitable_move_pct, 6),
             reason=reason,
-            stop_loss_price=round(stop_loss_price, 6),
-            take_profit_price=round(take_profit_price, 6),
+            stop_loss_price=float(cost_snapshot.stop_loss_price),
+            take_profit_price=float(cost_snapshot.take_profit_price),
         )

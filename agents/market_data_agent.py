@@ -109,9 +109,16 @@ class MarketDataAgent:
 
     @staticmethod
     def _timeframe_seconds(timeframe: str) -> int:
-        raw = timeframe.strip().lower()
-        if raw.endswith("m"):
-            return int(raw[:-1]) * 60
-        if raw.endswith("h"):
-            return int(raw[:-1]) * 3600
+        raw = timeframe.strip()
+        lower = raw.lower()
+        if raw.endswith("M"):
+            return 2592000
+        if lower.endswith("m"):
+            return int(lower[:-1]) * 60
+        if lower.endswith("h"):
+            return int(lower[:-1]) * 3600
+        if lower.endswith("d"):
+            return int(lower[:-1]) * 86400
+        if lower.endswith("w"):
+            return int(lower[:-1]) * 604800
         return 60

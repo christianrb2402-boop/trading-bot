@@ -17,8 +17,18 @@ class CostSnapshot:
     spread_cost: float
     funding_rate_estimate: float
     funding_cost_estimate: float
+    total_estimated_costs: float
     break_even_price: float
     minimum_required_move_to_profit: float
+    minimum_profitable_move_pct: float
+    stop_loss_price: float
+    take_profit_price: float
+    expected_gross_reward_pct: float
+    expected_gross_risk_pct: float
+    expected_net_reward_pct: float
+    expected_net_risk_pct: float
+    expected_net_reward_risk: float
+    cost_drag_pct: float
 
     def as_dict(self) -> dict[str, float | str]:
         return {
@@ -32,8 +42,18 @@ class CostSnapshot:
             "spread_cost": self.spread_cost,
             "funding_rate_estimate": self.funding_rate_estimate,
             "funding_cost_estimate": self.funding_cost_estimate,
+            "total_estimated_costs": self.total_estimated_costs,
             "break_even_price": self.break_even_price,
             "minimum_required_move_to_profit": self.minimum_required_move_to_profit,
+            "minimum_profitable_move_pct": self.minimum_profitable_move_pct,
+            "stop_loss_price": self.stop_loss_price,
+            "take_profit_price": self.take_profit_price,
+            "expected_gross_reward_pct": self.expected_gross_reward_pct,
+            "expected_gross_risk_pct": self.expected_gross_risk_pct,
+            "expected_net_reward_pct": self.expected_net_reward_pct,
+            "expected_net_risk_pct": self.expected_net_risk_pct,
+            "expected_net_reward_risk": self.expected_net_reward_risk,
+            "cost_drag_pct": self.cost_drag_pct,
         }
 
 
@@ -45,11 +65,13 @@ class CostModelAgent:
         self,
         *,
         entry_price: float,
-        stop_loss_price: float,
         direction: str,
         position_size_usd: float,
+        volatility_pct: float = 0.0,
         leverage_simulated: float | None = None,
         market_type: str | None = None,
+        stop_loss_price: float | None = None,
+        take_profit_price: float | None = None,
     ) -> CostSnapshot:
         leverage = min(
             max(leverage_simulated or self._settings.simulated_default_leverage, 1.0),
@@ -57,18 +79,44 @@ class CostModelAgent:
         )
         market = (market_type or self._settings.simulated_market_type).upper()
         notional = position_size_usd * leverage
-        fees_open = notional * self._settings.simulated_fee_pct
-        fees_close = notional * self._settings.simulated_fee_pct
+        entry_fee_rate = max(self._settings.simulated_taker_fee_pct, self._settings.simulated_fee_pct)
+        exit_fee_rate = max(self._settings.simulated_taker_fee_pct, self._settings.simulated_fee_pct)
+        fees_open = notional * entry_fee_rate
+        fees_close = notional * exit_fee_rate
         slippage_cost = notional * self._settings.simulated_slippage_pct * 2
         spread_cost = notional * self._settings.simulated_spread_pct
-        funding_cost_estimate = notional * max(self._settings.simulated_funding_rate_estimate, 0.0) if market == "FUTURES_SIMULATED" else 0.0
+        funding_cost_estimate = (
+            notional * max(self._settings.simulated_funding_rate_estimate, 0.0)
+            if market == "FUTURES_SIMULATED"
+            else 0.0
+        )
         total_cost = fees_open + fees_close + slippage_cost + spread_cost + funding_cost_estimate
         quantity = notional / entry_price if entry_price else 0.0
-        minimum_required_move = (total_cost / quantity) if quantity else 0.0
-        if direction == "SHORT":
-            break_even_price = entry_price - minimum_required_move
+
+        stop_pct = max(self._settings.simulated_stop_loss_pct * 100, volatility_pct or 0.0, 0.05)
+        reward_pct = max(
+            self._settings.simulated_take_profit_pct * 100,
+            stop_pct * max(self._settings.min_reward_risk_ratio, 1.0),
+        )
+
+        if stop_loss_price is None:
+            stop_loss_price = entry_price * (1 + (stop_pct / 100)) if direction == "SHORT" else entry_price * (1 - (stop_pct / 100))
         else:
-            break_even_price = entry_price + minimum_required_move
+            stop_pct = abs(((stop_loss_price - entry_price) / entry_price) * 100)
+
+        if take_profit_price is None:
+            take_profit_price = entry_price * (1 - (reward_pct / 100)) if direction == "SHORT" else entry_price * (1 + (reward_pct / 100))
+        else:
+            reward_pct = abs(((take_profit_price - entry_price) / entry_price) * 100)
+
+        minimum_required_move = (total_cost / quantity) if quantity else 0.0
+        minimum_profitable_move_pct = (minimum_required_move / entry_price) * 100 if entry_price else 0.0
+        break_even_price = entry_price - minimum_required_move if direction == "SHORT" else entry_price + minimum_required_move
+
+        expected_net_reward_pct = max(reward_pct - minimum_profitable_move_pct, 0.0)
+        expected_net_risk_pct = stop_pct + minimum_profitable_move_pct
+        expected_net_reward_risk = expected_net_reward_pct / max(expected_net_risk_pct, 0.000001)
+        cost_drag_pct = (minimum_profitable_move_pct / max(reward_pct, 0.000001)) if reward_pct else 1.0
 
         return CostSnapshot(
             market_type=market,
@@ -81,6 +129,16 @@ class CostModelAgent:
             spread_cost=round(spread_cost, 6),
             funding_rate_estimate=round(self._settings.simulated_funding_rate_estimate, 6),
             funding_cost_estimate=round(funding_cost_estimate, 6),
+            total_estimated_costs=round(total_cost, 6),
             break_even_price=round(break_even_price, 6),
-            minimum_required_move_to_profit=round((minimum_required_move / entry_price) * 100, 6) if entry_price else 0.0,
+            minimum_required_move_to_profit=round(minimum_profitable_move_pct, 6),
+            minimum_profitable_move_pct=round(minimum_profitable_move_pct, 6),
+            stop_loss_price=round(stop_loss_price, 6),
+            take_profit_price=round(take_profit_price, 6),
+            expected_gross_reward_pct=round(reward_pct, 6),
+            expected_gross_risk_pct=round(stop_pct, 6),
+            expected_net_reward_pct=round(expected_net_reward_pct, 6),
+            expected_net_risk_pct=round(expected_net_risk_pct, 6),
+            expected_net_reward_risk=round(expected_net_reward_risk, 6),
+            cost_drag_pct=round(cost_drag_pct, 6),
         )

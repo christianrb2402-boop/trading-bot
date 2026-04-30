@@ -46,11 +46,18 @@ class ReadinessReport:
 
 
 def timeframe_to_seconds(timeframe: str) -> int:
-    raw = timeframe.strip().lower()
-    if raw.endswith("m"):
-        return max(1, int(raw[:-1])) * 60
-    if raw.endswith("h"):
-        return max(1, int(raw[:-1])) * 3600
+    raw = timeframe.strip()
+    lower = raw.lower()
+    if raw.endswith("M"):
+        return 2592000
+    if lower.endswith("m"):
+        return max(1, int(lower[:-1])) * 60
+    if lower.endswith("h"):
+        return max(1, int(lower[:-1])) * 3600
+    if lower.endswith("d"):
+        return max(1, int(lower[:-1])) * 86400
+    if lower.endswith("w"):
+        return max(1, int(lower[:-1])) * 604800
     return 60
 
 

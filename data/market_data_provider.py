@@ -75,11 +75,18 @@ class LocalSQLiteProvider:
 
     @staticmethod
     def _timeframe_minutes(timeframe: str) -> int:
-        raw = timeframe.strip().lower()
-        if raw.endswith("m"):
-            return max(1, int(raw[:-1]))
-        if raw.endswith("h"):
-            return max(1, int(raw[:-1])) * 60
+        raw = timeframe.strip()
+        lower = raw.lower()
+        if raw.endswith("M"):
+            return 43200
+        if lower.endswith("m"):
+            return max(1, int(lower[:-1]))
+        if lower.endswith("h"):
+            return max(1, int(lower[:-1])) * 60
+        if lower.endswith("d"):
+            return max(1, int(lower[:-1])) * 1440
+        if lower.endswith("w"):
+            return max(1, int(lower[:-1])) * 10080
         return 1
 
     def _materialize_timeframe(self, *, symbol: str, timeframe: str, candles: Sequence[StoredCandle]) -> list[StoredCandle]:
@@ -88,10 +95,10 @@ class LocalSQLiteProvider:
             return list(candles)
         buckets: list[list[StoredCandle]] = []
         current_bucket: list[StoredCandle] = []
-        current_bucket_start: datetime | None = None
+        current_bucket_start: int | None = None
         for candle in candles:
             open_dt = datetime.fromisoformat(candle.open_time)
-            bucket_start = open_dt.replace(second=0, microsecond=0) - timedelta(minutes=open_dt.minute % minutes)
+            bucket_start = int(open_dt.timestamp()) // (minutes * 60)
             if current_bucket_start is None or bucket_start != current_bucket_start:
                 if current_bucket:
                     buckets.append(current_bucket)

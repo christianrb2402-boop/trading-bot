@@ -19,8 +19,14 @@ class Settings:
     binance_base_url: str
     binance_timeout_seconds: int
     market_symbols: tuple[str, ...]
+    core_symbols: tuple[str, ...]
+    watchlist_symbols: tuple[str, ...]
+    enable_watchlist: bool
     market_timeframe: str
     market_timeframes: tuple[str, ...]
+    execution_timeframes: tuple[str, ...]
+    context_timeframes: tuple[str, ...]
+    structural_timeframes: tuple[str, ...]
     binance_klines_limit: int
     delta_k_threshold: float
     delta_weak_threshold_factor: float
@@ -40,6 +46,8 @@ class Settings:
     simulated_initial_capital: float
     simulated_position_size_usd: float
     simulated_fee_pct: float
+    simulated_maker_fee_pct: float
+    simulated_taker_fee_pct: float
     simulated_slippage_pct: float
     simulated_spread_pct: float
     simulated_stop_loss_pct: float
@@ -53,6 +61,9 @@ class Settings:
     max_open_positions: int
     max_daily_simulated_loss_pct: float
     min_reward_risk_ratio: float
+    min_net_reward_risk_ratio: float
+    min_expected_net_edge_pct: float
+    max_cost_drag_pct: float
     allow_weak_signals: bool
     allow_medium_signals: bool
     allow_strong_signals: bool
@@ -116,6 +127,17 @@ def _parse_timeframes(raw_timeframes: str) -> tuple[str, ...]:
     return timeframes
 
 
+def _parse_pct_fraction(raw_value: str, default_fraction: float) -> float:
+    cleaned = raw_value.strip()
+    if not cleaned:
+        return default_fraction
+    value = float(cleaned)
+    # Accept both fractional notation (0.005 = 0.5%) and percentage-point notation (0.5 = 0.5%).
+    if value >= 0.02:
+        return value / 100
+    return value
+
+
 def _parse_bool(raw_value: str, default: bool) -> bool:
     normalized = raw_value.strip().lower()
     if not normalized:
@@ -138,8 +160,11 @@ def load_settings() -> Settings:
         os.getenv("LOGS_DIR", "logs"),
         ROOT_DIR / "logs",
     )
-    market_timeframes = _parse_timeframes(os.getenv("MARKET_TIMEFRAMES", "1m,5m,15m"))
+    market_timeframes = _parse_timeframes(os.getenv("MARKET_TIMEFRAMES", "1m,5m,15m,30m,1h,4h,1d"))
     market_timeframe = os.getenv("MARKET_TIMEFRAME", market_timeframes[0] if market_timeframes else "1m")
+    execution_timeframes = _parse_timeframes(os.getenv("EXECUTION_TIMEFRAMES", "1m,5m,15m"))
+    context_timeframes = _parse_timeframes(os.getenv("CONTEXT_TIMEFRAMES", "30m,1h,4h,1d"))
+    structural_timeframes = _parse_timeframes(os.getenv("STRUCTURAL_TIMEFRAMES", "1w,1M"))
 
     return Settings(
         app_name=os.getenv("APP_NAME", "multiagent-trading-system"),
@@ -150,8 +175,19 @@ def load_settings() -> Settings:
         binance_base_url=os.getenv("BINANCE_BASE_URL", "https://api.binance.com").rstrip("/"),
         binance_timeout_seconds=int(os.getenv("BINANCE_TIMEOUT_SECONDS", "10")),
         market_symbols=_parse_symbols(os.getenv("MARKET_SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT")),
+        core_symbols=_parse_symbols(os.getenv("CORE_SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT")),
+        watchlist_symbols=_parse_symbols(
+            os.getenv(
+                "WATCHLIST_SYMBOLS",
+                "DOGEUSDT,ADAUSDT,AVAXUSDT,LINKUSDT,LTCUSDT,DOTUSDT,MATICUSDT,TRXUSDT,BCHUSDT,NEARUSDT,ARBUSDT,OPUSDT",
+            )
+        ),
+        enable_watchlist=_parse_bool(os.getenv("ENABLE_WATCHLIST", "false"), False),
         market_timeframe=market_timeframe,
         market_timeframes=market_timeframes,
+        execution_timeframes=execution_timeframes,
+        context_timeframes=context_timeframes,
+        structural_timeframes=structural_timeframes,
         binance_klines_limit=int(os.getenv("BINANCE_KLINES_LIMIT", "5")),
         delta_k_threshold=float(os.getenv("DELTA_K_THRESHOLD", "0.5")),
         delta_weak_threshold_factor=float(os.getenv("DELTA_WEAK_THRESHOLD_FACTOR", "0.1")),
@@ -172,11 +208,13 @@ def load_settings() -> Settings:
         simulated_trade_exit_candles=int(os.getenv("SIMULATED_TRADE_EXIT_CANDLES", "5")),
         simulated_initial_capital=float(os.getenv("SIMULATED_INITIAL_CAPITAL", "1000")),
         simulated_position_size_usd=float(os.getenv("SIMULATED_POSITION_SIZE_USD", "100")),
-        simulated_fee_pct=float(os.getenv("SIMULATED_FEE_PCT", "0.001")),
-        simulated_slippage_pct=float(os.getenv("SIMULATED_SLIPPAGE_PCT", "0.0005")),
-        simulated_spread_pct=float(os.getenv("SIMULATED_SPREAD_PCT", "0.0002")),
-        simulated_stop_loss_pct=float(os.getenv("SIMULATED_STOP_LOSS_PCT", "0.005")),
-        simulated_take_profit_pct=float(os.getenv("SIMULATED_TAKE_PROFIT_PCT", "0.01")),
+        simulated_fee_pct=_parse_pct_fraction(os.getenv("SIMULATED_FEE_PCT", "0.1"), 0.001),
+        simulated_maker_fee_pct=_parse_pct_fraction(os.getenv("SIMULATED_MAKER_FEE_PCT", "0.1"), 0.001),
+        simulated_taker_fee_pct=_parse_pct_fraction(os.getenv("SIMULATED_TAKER_FEE_PCT", "0.1"), 0.001),
+        simulated_slippage_pct=_parse_pct_fraction(os.getenv("SIMULATED_SLIPPAGE_PCT", "0.05"), 0.0005),
+        simulated_spread_pct=_parse_pct_fraction(os.getenv("SIMULATED_SPREAD_PCT", "0.02"), 0.0002),
+        simulated_stop_loss_pct=_parse_pct_fraction(os.getenv("SIMULATED_STOP_LOSS_PCT", "0.005"), 0.005),
+        simulated_take_profit_pct=_parse_pct_fraction(os.getenv("SIMULATED_TAKE_PROFIT_PCT", "0.01"), 0.01),
         simulated_max_hold_candles=int(os.getenv("SIMULATED_MAX_HOLD_CANDLES", "15")),
         simulated_market_type=os.getenv("SIMULATED_MARKET_TYPE", "SPOT").upper(),
         simulated_default_leverage=float(os.getenv("SIMULATED_DEFAULT_LEVERAGE", "1")),
@@ -186,6 +224,9 @@ def load_settings() -> Settings:
         max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "5")),
         max_daily_simulated_loss_pct=float(os.getenv("MAX_DAILY_SIMULATED_LOSS_PCT", "0.03")),
         min_reward_risk_ratio=float(os.getenv("MIN_REWARD_RISK_RATIO", "1.5")),
+        min_net_reward_risk_ratio=float(os.getenv("MIN_NET_REWARD_RISK_RATIO", "1.5")),
+        min_expected_net_edge_pct=float(os.getenv("MIN_EXPECTED_NET_EDGE_PCT", "0.15")),
+        max_cost_drag_pct=float(os.getenv("MAX_COST_DRAG_PCT", "0.35")),
         allow_weak_signals=_parse_bool(os.getenv("ALLOW_WEAK_SIGNALS", "true"), True),
         allow_medium_signals=_parse_bool(os.getenv("ALLOW_MEDIUM_SIGNALS", "true"), True),
         allow_strong_signals=_parse_bool(os.getenv("ALLOW_STRONG_SIGNALS", "true"), True),

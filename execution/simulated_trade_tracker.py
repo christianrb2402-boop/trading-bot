@@ -77,7 +77,13 @@ class SimulatedTradeTracker:
 
         signal_type = str(signal["signal_type"])
         opened_trade_id: int | None = None
-        if signal_type in {"LONG", "SHORT"} and open_trade is None:
+        if signal_type in {"LONG", "SHORT"} and open_trade is None and not self._is_duplicate_setup(
+            symbol=symbol,
+            timeframe=timeframe,
+            direction=signal_type,
+            entry_time=latest_candle.close_time,
+            setup_signature=str(signal.get("setup_signature", "")),
+        ):
             opened_trade_id = self._open_trade(
                 symbol=symbol,
                 timeframe=timeframe,
@@ -97,6 +103,20 @@ class SimulatedTradeTracker:
                         "reason": "existing_open_trade",
                         "active_trade_id": open_trade.id,
                         "incoming_signal": signal_type,
+                    },
+                },
+            )
+        elif signal_type in {"LONG", "SHORT"}:
+            logger.info(
+                "Simulated trade rejected",
+                extra={
+                    "event": "trade_simulation_rejected",
+                    "context": {
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "reason": "duplicate_setup",
+                        "incoming_signal": signal_type,
+                        "setup_signature": str(signal.get("setup_signature", "")),
                     },
                 },
             )
@@ -217,24 +237,34 @@ class SimulatedTradeTracker:
     ) -> int:
         direction = str(signal.get("signal_type", "LONG"))
         entry_price = self._entry_fill_price(direction=direction, mark_price=latest_candle.close)
-        signal_volatility_pct = max(float(signal.get("volatility_pct", 0.0)), 0.0) / 100
-        stop_loss_pct = max(self._stop_loss_pct, signal_volatility_pct)
-        take_profit_pct = max(self._take_profit_pct, stop_loss_pct * self._risk_reward_ratio)
-        if direction == "SHORT":
-            stop_loss = entry_price * (1 + stop_loss_pct)
-            take_profit = entry_price * (1 - take_profit_pct)
-        else:
-            stop_loss = entry_price * (1 - stop_loss_pct)
-            take_profit = entry_price * (1 + take_profit_pct)
+        risk_reward_snapshot = signal.get("risk_reward_snapshot", {})
+        stop_loss = float(risk_reward_snapshot.get("stop_loss_price", 0.0) or 0.0)
+        take_profit = float(risk_reward_snapshot.get("take_profit_price", 0.0) or 0.0)
+        if stop_loss <= 0 or take_profit <= 0:
+            signal_volatility_pct = max(float(signal.get("volatility_pct", 0.0)), 0.0) / 100
+            stop_loss_pct = max(self._stop_loss_pct, signal_volatility_pct)
+            take_profit_pct = max(self._take_profit_pct, stop_loss_pct * self._risk_reward_ratio)
+            if direction == "SHORT":
+                stop_loss = entry_price * (1 + stop_loss_pct)
+                take_profit = entry_price * (1 - take_profit_pct)
+            else:
+                stop_loss = entry_price * (1 - stop_loss_pct)
+                take_profit = entry_price * (1 + take_profit_pct)
 
         leverage_simulated = float(signal.get("leverage_simulated", self._default_leverage))
         notional_exposure = self._position_size_usd * leverage_simulated
         quantity = notional_exposure / entry_price if entry_price else 0.0
-        fees_open = notional_exposure * self._fee_pct
-        slippage_cost = notional_exposure * self._slippage_pct
-        spread_cost = notional_exposure * self._spread_pct
-        funding_cost_estimate = notional_exposure * self._funding_rate_estimate if self._market_type == "FUTURES_SIMULATED" else 0.0
-        minimum_required_move = ((fees_open * 2) + (slippage_cost * 2) + spread_cost + funding_cost_estimate) / quantity if quantity else 0.0
+        cost_snapshot = signal.get("cost_snapshot", {})
+        fees_open = float(cost_snapshot.get("fees_open", notional_exposure * self._fee_pct))
+        slippage_cost = float(cost_snapshot.get("slippage_cost", notional_exposure * self._slippage_pct))
+        spread_cost = float(cost_snapshot.get("spread_cost", notional_exposure * self._spread_pct))
+        funding_cost_estimate = float(
+            cost_snapshot.get(
+                "funding_cost_estimate",
+                notional_exposure * self._funding_rate_estimate if self._market_type == "FUTURES_SIMULATED" else 0.0,
+            )
+        )
+        minimum_required_move = ((fees_open * 2) + slippage_cost + spread_cost + funding_cost_estimate) / quantity if quantity else 0.0
         break_even_price = entry_price - minimum_required_move if direction == "SHORT" else entry_price + minimum_required_move
         liquidation_price_estimate = (
             entry_price * (1 + (0.9 / max(leverage_simulated, 1.0)))
@@ -322,6 +352,31 @@ class SimulatedTradeTracker:
             },
         )
         return trade_id
+
+    def _is_duplicate_setup(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        direction: str,
+        entry_time: str,
+        setup_signature: str,
+    ) -> bool:
+        with self._database.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT id
+                FROM simulated_trades
+                WHERE symbol = ?
+                  AND COALESCE(timeframe, '1m') = ?
+                  AND direction = ?
+                  AND COALESCE(entry_time, timestamp_entry) = ?
+                  AND COALESCE(setup_signature, '') = ?
+                LIMIT 1
+                """,
+                (symbol, timeframe, direction, entry_time, setup_signature),
+            ).fetchone()
+        return row is not None
 
     def _update_open_trade(
         self,

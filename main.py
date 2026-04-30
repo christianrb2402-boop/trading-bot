@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import time
 from datetime import datetime, timezone
 
 from analytics.backtest_engine import BacktestEngine
+from analytics.benchmark_engine import BenchmarkEngine
 from analytics.performance_analyzer import PerformanceAnalyzer
+from analytics.walk_forward_engine import WalkForwardEngine
 from agents.audit_agent import AuditAgent
 from agents.cost_model_agent import CostModelAgent
 from agents.decision_orchestrator import DecisionOrchestrator
@@ -18,6 +21,7 @@ from agents.market_context_agent import MarketContextAgent
 from agents.performance_learning_agent import PerformanceLearningAgent
 from agents.risk_reward_agent import RiskRewardAgent
 from agents.signal_evaluator import SignalEvaluator
+from agents.symbol_selection_agent import SymbolSelectionAgent
 from config.settings import Settings, load_settings
 from core.database import (
     AgentDecisionRecord,
@@ -28,6 +32,7 @@ from core.database import (
     SignalLogRecord,
 )
 from core.exceptions import TradingSystemError
+from core.ledger_reconciler import LedgerConsistencyReport, LedgerReconciler
 from core.logger import configure_logging
 from core.runtime_checks import ReadinessReport, build_readiness_report, format_age_seconds, inspect_symbol_health, timeframe_to_seconds
 from data.binance_market_data import BinanceConnectivityProbe, BinanceMarketDataService
@@ -53,6 +58,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--continuous-engine", action="store_true", help="Ejecuta analisis continuo de mercado cada 60 segundos")
     parser.add_argument("--live-paper-engine", action="store_true", help="Ejecuta el motor live paper trading con comite y ledger simulado")
     parser.add_argument("--backtest", action="store_true", help="Ejecuta backtest historico candle by candle sin fuga de datos")
+    parser.add_argument("--benchmark", action="store_true", help="Compara la estrategia contra benchmarks basicos")
+    parser.add_argument("--walk-forward", action="store_true", help="Ejecuta validacion walk-forward sin fuga de datos")
+    parser.add_argument("--reconcile-ledger", action="store_true", help="Revisa y reconcilia ledger, posiciones y exposicion")
     parser.add_argument("--status-report", action="store_true", help="Muestra el estado persistido del sistema")
     parser.add_argument("--export-report", action="store_true", help="Exporta un reporte auditable en JSON")
     parser.add_argument("--diagnose-connectivity", action="store_true", help="Prueba conectividad HTTP real hacia Binance")
@@ -62,6 +70,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeframe", help="Timeframe, ejemplo 1m")
     parser.add_argument("--limit", type=int, help="Cantidad de velas por simbolo")
     parser.add_argument("--min-trades", type=int, help="Minimo de trades cerrados para el backtest")
+    parser.add_argument("--train-pct", type=int, help="Porcentaje del historico usado para entrenar en walk-forward")
+    parser.add_argument("--format", choices=("json", "csv"), default="json", help="Formato de exportacion para reportes")
     parser.add_argument("--delta-threshold", type=float, help="Threshold para la metrica k")
     parser.add_argument("--delta-windows", nargs="+", type=int, help="Ventanas para delta-test, ejemplo 10 20 50")
     parser.add_argument("--evaluation-windows", nargs="+", type=int, help="Horizontes post-senal, ejemplo 5 10 15")
@@ -87,7 +97,8 @@ def resolve_runtime_settings(
     tuple[int, ...],
     tuple[float, ...],
 ]:
-    symbols = tuple(symbol.upper() for symbol in args.symbols) if args.symbols else base.market_symbols
+    default_symbols = base.core_symbols + tuple(symbol for symbol in base.watchlist_symbols if base.enable_watchlist)
+    symbols = tuple(symbol.upper() for symbol in args.symbols) if args.symbols else default_symbols
     timeframes = tuple(item.strip() for item in args.timeframes.split(",") if item.strip()) if args.timeframes else base.market_timeframes
     timeframe = args.timeframe or base.market_timeframe
     limit = args.limit or base.binance_klines_limit
@@ -567,6 +578,79 @@ def run_backtest(
     return result
 
 
+def run_benchmark(
+    benchmark_engine: BenchmarkEngine,
+    *,
+    symbols: tuple[str, ...],
+    timeframes: tuple[str, ...],
+    limit: int,
+    min_trades: int,
+) -> dict[str, object]:
+    result = benchmark_engine.run(
+        symbols=symbols,
+        timeframes=timeframes,
+        limit=limit,
+        min_trades=min_trades,
+    )
+    print("Benchmark Summary")
+    for row in result["benchmarks"]:
+        print(
+            f"- {row['benchmark_name']} trades={row['trade_count']} "
+            f"winrate={row['winrate']}% net_pnl={row['total_net_pnl']} "
+            f"max_drawdown={row['max_drawdown']} profit_factor={row['profit_factor']} "
+            f"average_trade={row['average_trade']} total_cost={row['total_cost']} "
+            f"edge_vs_strategy={row['edge_vs_strategy']}"
+        )
+    return result
+
+
+def run_walk_forward(
+    walk_forward_engine: WalkForwardEngine,
+    *,
+    symbols: tuple[str, ...],
+    timeframes: tuple[str, ...],
+    limit: int,
+    train_pct: int,
+) -> dict[str, object]:
+    result = walk_forward_engine.run(
+        symbols=symbols,
+        timeframes=timeframes,
+        limit=limit,
+        train_pct=train_pct,
+    )
+    summary = result["summary"]
+    print("Walk Forward Summary")
+    print(f"Selected relaxation: {summary['selected_relaxation']}")
+    print(f"Train trades: {summary['train_trade_count']} net_pnl={summary['train_net_pnl']} winrate={summary['train_winrate']}%")
+    print(f"Test trades: {summary['test_trade_count']} net_pnl={summary['test_net_pnl']} winrate={summary['test_winrate']}%")
+    print(f"Survived out of sample: {summary['survived_out_of_sample']}")
+    return result
+
+
+def run_reconcile_ledger(ledger_reconciler: LedgerReconciler) -> LedgerConsistencyReport:
+    report = ledger_reconciler.reconcile()
+    print("Ledger Reconciliation Summary")
+    print(f"open_positions_count={report.open_positions_count}")
+    print(f"open_simulated_trades_count={report.open_simulated_trades_count}")
+    print(f"orphan_positions={report.orphan_positions}")
+    print(f"duplicated_positions={report.duplicated_positions}")
+    print(f"gross_exposure={report.gross_exposure}")
+    print(f"net_exposure={report.net_exposure}")
+    print(f"unrealized_pnl={report.unrealized_pnl}")
+    print(f"available_cash={report.available_cash}")
+    print(f"realized_pnl={report.realized_pnl}")
+    print(f"total_equity={report.total_equity}")
+    print(f"cash_check={report.cash_check}")
+    print(f"equity_check={report.equity_check}")
+    print(f"reconciled_positions={report.reconciled_positions}")
+    print(f"reconciled_duplicates={report.reconciled_duplicates}")
+    print(f"result={report.result}")
+    print("notes:")
+    for note in report.notes:
+        print(f"- {note}")
+    return report
+
+
 def run_diagnose_connectivity(service: BinanceMarketDataService) -> list[BinanceConnectivityProbe]:
     probes = service.diagnose_connectivity()
     print("Connectivity Diagnosis")
@@ -645,7 +729,12 @@ def run_readiness_check(
     return report
 
 
-def build_status_snapshot(database: Database, settings: Settings, performance_analyzer: PerformanceAnalyzer) -> dict[str, object]:
+def build_status_snapshot(
+    database: Database,
+    settings: Settings,
+    performance_analyzer: PerformanceAnalyzer,
+    ledger_reconciler: LedgerReconciler,
+) -> dict[str, object]:
     performance_report = performance_analyzer.refresh()
     candle_counts = database.list_candle_counts()
     signal_counts = database.list_signal_counts()
@@ -664,7 +753,10 @@ def build_status_snapshot(database: Database, settings: Settings, performance_an
     performance_by_symbol = database.get_performance_by_symbol()
     performance_by_timeframe = database.get_performance_by_timeframe()
     recent_orders = database.get_recent_paper_orders(limit=10)
+    recent_benchmarks = database.get_recent_benchmark_results(limit=10)
+    recent_walk_forward = database.get_recent_walk_forward_results(limit=10)
     latest_decisions_by_agent = database.get_latest_agent_decisions_by_agent()
+    ledger_report = ledger_reconciler.inspect()
     current_provider = recent_market_snapshots[0]["provider_used"] if recent_market_snapshots else "UNKNOWN"
     market_data_agent = MarketDataAgent()
     symbol_health: list[dict[str, object]] = []
@@ -712,16 +804,24 @@ def build_status_snapshot(database: Database, settings: Settings, performance_an
         "performance_by_symbol": performance_by_symbol,
         "performance_by_timeframe": performance_by_timeframe,
         "recent_orders": recent_orders,
+        "recent_benchmarks": recent_benchmarks,
+        "recent_walk_forward": recent_walk_forward,
         "total_agent_decisions": database.count_agent_decisions(),
         "total_paper_orders": database.count_paper_orders(),
         "open_paper_positions_count": database.count_open_paper_positions(),
         "symbol_health": symbol_health,
         "latest_decisions_by_agent": latest_decisions_by_agent,
+        "ledger_report": ledger_report.as_dict(),
     }
 
 
-def run_status_report(database: Database, settings: Settings, performance_analyzer: PerformanceAnalyzer) -> None:
-    snapshot = build_status_snapshot(database, settings, performance_analyzer)
+def run_status_report(
+    database: Database,
+    settings: Settings,
+    performance_analyzer: PerformanceAnalyzer,
+    ledger_reconciler: LedgerReconciler,
+) -> None:
+    snapshot = build_status_snapshot(database, settings, performance_analyzer, ledger_reconciler)
     performance_report = snapshot["performance_report"]
     candle_counts = snapshot["candle_counts"]
     signal_counts = snapshot["signal_counts"]
@@ -740,8 +840,11 @@ def run_status_report(database: Database, settings: Settings, performance_analyz
     performance_by_symbol = snapshot["performance_by_symbol"]
     performance_by_timeframe = snapshot["performance_by_timeframe"]
     recent_orders = snapshot["recent_orders"]
+    recent_benchmarks = snapshot["recent_benchmarks"]
+    recent_walk_forward = snapshot["recent_walk_forward"]
     symbol_health = snapshot["symbol_health"]
     latest_decisions_by_agent = snapshot["latest_decisions_by_agent"]
+    ledger_report = snapshot["ledger_report"]
 
     print("Status Report")
     print(f"Database path: {snapshot['database_path']}")
@@ -853,6 +956,22 @@ def run_status_report(database: Database, settings: Settings, performance_analyz
         print("- none")
     print("")
 
+    print("Ledger Consistency Check:")
+    print(f"- open_positions_count: {ledger_report['open_positions_count']}")
+    print(f"- open_simulated_trades_count: {ledger_report['open_simulated_trades_count']}")
+    print(f"- orphan_positions: {ledger_report['orphan_positions']}")
+    print(f"- duplicated_positions: {ledger_report['duplicated_positions']}")
+    print(f"- gross_exposure: {ledger_report['gross_exposure']}")
+    print(f"- net_exposure: {ledger_report['net_exposure']}")
+    print(f"- unrealized_pnl: {ledger_report['unrealized_pnl']}")
+    print(f"- cash_check: {ledger_report['cash_check']}")
+    print(f"- equity_check: {ledger_report['equity_check']}")
+    print(f"- result: {ledger_report['result']}")
+    print("- notes:")
+    for note in ledger_report["notes"]:
+        print(f"  {note}")
+    print("")
+
     print("Operational counters:")
     print(f"- total agent decisions: {snapshot['total_agent_decisions']}")
     print(f"- total paper orders: {snapshot['total_paper_orders']}")
@@ -897,6 +1016,8 @@ def run_status_report(database: Database, settings: Settings, performance_analyz
     print(f"- total slippage paid: {trade_metrics['total_slippage_paid']}")
     print(f"- total spread paid: {trade_metrics['total_spread_paid']}")
     print(f"- total funding estimate: {trade_metrics['total_funding_cost']}")
+    print(f"- gross_win_net_loss: {trade_metrics['gross_win_net_loss']}")
+    print(f"- average cost per trade: {trade_metrics['average_cost_per_trade']}")
     print("")
 
     print("Performance learning summary:")
@@ -952,6 +1073,29 @@ def run_status_report(database: Database, settings: Settings, performance_analyz
             print(
                 f"- {item['regime']} trades={item['trade_count']} "
                 f"winrate={item['winrate']}% avg_pnl={item['average_pnl']}"
+            )
+    else:
+        print("- none")
+    print("")
+
+    print("Recent benchmark results:")
+    if recent_benchmarks:
+        for row in recent_benchmarks[:10]:
+            print(
+                f"- {row['benchmark_name']} trades={row['trade_count']} winrate={row['winrate']}% "
+                f"net_pnl={row['total_net_pnl']} max_drawdown={row['max_drawdown']} edge_vs_strategy={row['edge_vs_strategy']}"
+            )
+    else:
+        print("- none")
+    print("")
+
+    print("Recent walk-forward results:")
+    if recent_walk_forward:
+        for row in recent_walk_forward[:10]:
+            print(
+                f"- train_pct={row['train_pct']} relaxation={row['selected_relaxation']} "
+                f"train_net_pnl={row['train_net_pnl']} test_net_pnl={row['test_net_pnl']} "
+                f"survived={bool(row['survived_out_of_sample'])}"
             )
     else:
         print("- none")
@@ -1070,10 +1214,65 @@ def run_status_report(database: Database, settings: Settings, performance_analyz
         print("- none")
 
 
-def run_export_report(database: Database, settings: Settings, performance_analyzer: PerformanceAnalyzer) -> str:
-    snapshot = build_status_snapshot(database, settings, performance_analyzer)
-    output_path = settings.sqlite_path.parent / "report_export.json"
-    output_path.write_text(json.dumps(snapshot, ensure_ascii=True, indent=2, default=str), encoding="utf-8")
+def run_export_report(
+    database: Database,
+    settings: Settings,
+    performance_analyzer: PerformanceAnalyzer,
+    ledger_reconciler: LedgerReconciler,
+    export_format: str,
+) -> str:
+    snapshot = build_status_snapshot(database, settings, performance_analyzer, ledger_reconciler)
+    output_dir = settings.sqlite_path.parent
+    if export_format == "csv":
+        csv_targets = {
+            "trades.csv": snapshot["recent_trades"],
+            "decisions.csv": snapshot["recent_decisions"],
+            "signals.csv": snapshot["recent_signals"],
+            "portfolio.csv": [snapshot["portfolio"]] if snapshot["portfolio"] else [],
+            "errors.csv": snapshot["recent_errors"],
+            "benchmark.csv": snapshot["recent_benchmarks"],
+        }
+        for filename, rows in csv_targets.items():
+            path = output_dir / filename
+            if not rows:
+                path.write_text("", encoding="utf-8")
+                continue
+            fieldnames = sorted({key for row in rows for key in row.keys()})
+            with path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow({key: row.get(key) for key in fieldnames})
+        print(f"Exported CSV report bundle to {output_dir}")
+        return str(output_dir)
+
+    output_path = output_dir / "report_export.json"
+    enriched_snapshot = {
+        "summary": {
+            "portfolio": snapshot["portfolio"],
+            "ledger_consistency": snapshot["ledger_report"],
+            "provider_used": snapshot["current_provider"],
+            "symbols": list(settings.market_symbols),
+            "timeframes": list(settings.market_timeframes),
+            "supported_execution_timeframes": list(settings.execution_timeframes),
+            "supported_context_timeframes": list(settings.context_timeframes),
+            "supported_structural_timeframes": list(settings.structural_timeframes),
+            "gross_vs_net": snapshot["trade_metrics"],
+            "best_setups": snapshot["performance_report"].get("best_setups", []),
+            "worst_setups": snapshot["performance_report"].get("worst_setups", []),
+            "best_symbols": snapshot["performance_by_symbol"][:3],
+            "worst_symbols": list(reversed(snapshot["performance_by_symbol"][-3:])) if snapshot["performance_by_symbol"] else [],
+            "best_timeframes": snapshot["performance_by_timeframe"][:3],
+            "worst_timeframes": list(reversed(snapshot["performance_by_timeframe"][-3:])) if snapshot["performance_by_timeframe"] else [],
+            "readiness": {
+                "ledger_result": snapshot["ledger_report"]["result"],
+                "current_provider": snapshot["current_provider"],
+                "stale_rows": [row for row in snapshot["symbol_health"] if row["is_stale"]],
+            },
+        },
+        "details": snapshot,
+    }
+    output_path.write_text(json.dumps(enriched_snapshot, ensure_ascii=True, indent=2, default=str), encoding="utf-8")
     print(f"Exported report to {output_path}")
     return str(output_path)
 
@@ -1456,9 +1655,11 @@ def main() -> int:
     risk_reward_agent = RiskRewardAgent(settings)
     cost_model_agent = CostModelAgent(settings)
     performance_learning_agent = PerformanceLearningAgent(database, settings)
+    symbol_selection_agent = SymbolSelectionAgent(settings)
     execution_simulator_agent = ExecutionSimulatorAgent(database, simulated_trade_tracker)
     audit_agent = AuditAgent()
     decision_orchestrator = DecisionOrchestrator(settings)
+    ledger_reconciler = LedgerReconciler(database, settings)
     live_paper_engine = LivePaperEngine(
         database=database,
         settings=settings,
@@ -1469,6 +1670,7 @@ def main() -> int:
         risk_reward_agent=risk_reward_agent,
         cost_model_agent=cost_model_agent,
         performance_learning_agent=performance_learning_agent,
+        symbol_selection_agent=symbol_selection_agent,
         execution_simulator_agent=execution_simulator_agent,
         audit_agent=audit_agent,
         decision_orchestrator=decision_orchestrator,
@@ -1480,6 +1682,18 @@ def main() -> int:
         market_context_agent=market_context_agent,
         simulated_trade_tracker=simulated_trade_tracker,
         performance_analyzer=performance_analyzer,
+    )
+    benchmark_engine = BenchmarkEngine(
+        database=database,
+        settings=settings,
+        backtest_engine=backtest_engine,
+    )
+    walk_forward_engine = WalkForwardEngine(
+        database=database,
+        settings=settings,
+        delta_agent=delta_agent,
+        market_context_agent=market_context_agent,
+        cost_model_agent=cost_model_agent,
     )
     had_errors = False
 
@@ -1528,7 +1742,7 @@ def main() -> int:
             return 0
 
         if args.status_report:
-            run_status_report(database, settings, performance_analyzer)
+            run_status_report(database, settings, performance_analyzer, ledger_reconciler)
             logger.info(
                 "Clean shutdown",
                 extra={"event": "shutdown", "context": {"status": "status_report_success"}},
@@ -1536,12 +1750,20 @@ def main() -> int:
             return 0
 
         if args.export_report:
-            run_export_report(database, settings, performance_analyzer)
+            run_export_report(database, settings, performance_analyzer, ledger_reconciler, args.format)
             logger.info(
                 "Clean shutdown",
                 extra={"event": "shutdown", "context": {"status": "export_report_success"}},
             )
             return 0
+
+        if args.reconcile_ledger:
+            report = run_reconcile_ledger(ledger_reconciler)
+            logger.info(
+                "Clean shutdown",
+                extra={"event": "shutdown", "context": {"status": f"reconcile_ledger_{report.result.lower()}" }},
+            )
+            return 0 if report.result == "OK" else 1
 
         if args.backtest:
             run_backtest(
@@ -1554,6 +1776,34 @@ def main() -> int:
             logger.info(
                 "Clean shutdown",
                 extra={"event": "shutdown", "context": {"status": "backtest_success"}},
+            )
+            return 0
+
+        if args.benchmark:
+            run_benchmark(
+                benchmark_engine,
+                symbols=symbols,
+                timeframes=timeframes,
+                limit=limit,
+                min_trades=min_trades,
+            )
+            logger.info(
+                "Clean shutdown",
+                extra={"event": "shutdown", "context": {"status": "benchmark_success"}},
+            )
+            return 0
+
+        if args.walk_forward:
+            run_walk_forward(
+                walk_forward_engine,
+                symbols=symbols,
+                timeframes=timeframes,
+                limit=limit,
+                train_pct=args.train_pct or 70,
+            )
+            logger.info(
+                "Clean shutdown",
+                extra={"event": "shutdown", "context": {"status": "walk_forward_success"}},
             )
             return 0
 
@@ -1679,18 +1929,26 @@ def main() -> int:
         if args.live_paper_engine:
             probes = service.diagnose_connectivity()
             binance_http_ok = all(probe.ok for probe in probes[:2]) if len(probes) >= 2 else all(probe.ok for probe in probes)
+            ledger_report = ledger_reconciler.inspect()
             logger.info(
                 "Live paper provider policy evaluated",
                 extra={
                     "event": "live_paper_provider_policy",
                     "context": {
                         "binance_http_ok": binance_http_ok,
+                        "ledger_result": ledger_report.result,
                         "allow_stale_fallback": args.allow_stale_fallback,
                         "max_loops": args.max_loops,
                         "run_minutes": args.run_minutes,
                     },
                 },
             )
+            if ledger_report.result != "OK" and args.max_loops is None:
+                print("Live paper engine blocked for long run because ledger consistency is not OK.")
+                print(f"Ledger result: {ledger_report.result}")
+                for note in ledger_report.notes:
+                    print(f"- {note}")
+                return 1
             run_live_paper_engine(
                 live_paper_engine,
                 symbols=symbols,

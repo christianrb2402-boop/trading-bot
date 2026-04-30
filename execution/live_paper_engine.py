@@ -16,6 +16,7 @@ from agents.market_context_agent import MarketContextAgent
 from agents.market_data_agent import MarketDataAgent
 from agents.performance_learning_agent import PerformanceLearningAgent
 from agents.risk_reward_agent import RiskRewardAgent
+from agents.symbol_selection_agent import SymbolSelectionAgent
 from analytics.performance_analyzer import PerformanceAnalyzer
 from config.settings import Settings
 from core.database import (
@@ -55,6 +56,7 @@ class LivePaperEngine:
         risk_reward_agent: RiskRewardAgent,
         cost_model_agent: CostModelAgent,
         performance_learning_agent: PerformanceLearningAgent,
+        symbol_selection_agent: SymbolSelectionAgent,
         execution_simulator_agent: ExecutionSimulatorAgent,
         audit_agent: AuditAgent,
         decision_orchestrator: DecisionOrchestrator,
@@ -69,6 +71,7 @@ class LivePaperEngine:
         self._risk_reward_agent = risk_reward_agent
         self._cost_model_agent = cost_model_agent
         self._performance_learning_agent = performance_learning_agent
+        self._symbol_selection_agent = symbol_selection_agent
         self._execution_simulator_agent = execution_simulator_agent
         self._audit_agent = audit_agent
         self._decision_orchestrator = decision_orchestrator
@@ -250,6 +253,11 @@ class LivePaperEngine:
 
         recent_candles = self._database.get_recent_candles(symbol=symbol, timeframe=timeframe, limit=20)
         market_context = self._market_context_agent.evaluate(symbol=symbol, timeframe=timeframe, candles=recent_candles)
+        timeframe_contexts = self._build_timeframe_contexts(
+            symbol=symbol,
+            execution_timeframe=timeframe,
+            current_context=market_context,
+        )
         self._database.insert_market_context(
             MarketContextRecord(
                 timestamp=latest_candle.close_time,
@@ -310,19 +318,16 @@ class LivePaperEngine:
             provider_used=provider_result.provider_used,
         )
 
-        projected_direction = "LONG" if str(signal["signal_type"]) == "NO_TRADE" else str(signal["signal_type"])
+        projected_direction = str(signal["signal_type"]) if str(signal["signal_type"]) in {"LONG", "SHORT"} else str(signal.get("direction", "LONG"))
         cost_snapshot = self._cost_model_agent.estimate(
             entry_price=latest_candle.close,
-            stop_loss_price=latest_candle.close * (1 - self._settings.simulated_stop_loss_pct),
             direction=projected_direction,
             position_size_usd=self._settings.simulated_position_size_usd,
+            volatility_pct=float(signal.get("volatility_pct", 0.0)),
         )
-        estimated_cost_pct = float(cost_snapshot.as_dict()["minimum_required_move_to_profit"])
         risk_reward = self._risk_reward_agent.evaluate(
             signal=signal,
-            price=latest_candle.close,
-            volatility_pct=float(signal.get("volatility_pct", 0.0)),
-            estimated_cost_pct=estimated_cost_pct,
+            cost_snapshot=cost_snapshot,
         )
         self._persist_agent_decision(
             timestamp=str(signal["timestamp"]),
@@ -333,6 +338,28 @@ class LivePaperEngine:
             confidence=risk_reward.confidence,
             inputs=risk_reward.as_dict(),
             reasoning_summary=risk_reward.reason,
+            provider_used=provider_result.provider_used,
+        )
+
+        symbol_selection = self._symbol_selection_agent.evaluate(
+            symbol=symbol,
+            timeframe=timeframe,
+            candles=recent_candles,
+            market_context=market_context,
+            gap_count=assessment.gap_count,
+            duplicate_count=assessment.duplicate_count,
+            corrupted_count=assessment.corrupted_count,
+            estimated_cost_drag_pct=float(cost_snapshot.cost_drag_pct),
+        )
+        self._persist_agent_decision(
+            timestamp=str(signal["timestamp"]),
+            agent_name="SymbolSelectionAgent",
+            symbol=symbol,
+            timeframe=timeframe,
+            decision="TRADABLE" if symbol_selection.tradable_today else "REJECT",
+            confidence=float(symbol_selection.symbol_score),
+            inputs=symbol_selection.as_dict(),
+            reasoning_summary=symbol_selection.reason,
             provider_used=provider_result.provider_used,
         )
 
@@ -358,14 +385,23 @@ class LivePaperEngine:
             AgentVote("MarketDataAgent", "OK" if stale_fallback_allowed else assessment.vote, market_data_confidence, notes_text or "validation complete"),
             AgentVote("DeltaAgent", str(signal["signal_type"]), float(signal["confidence"]), str(signal["reason"]), tuple(signal.get("risks_detected", ()))),
             AgentVote("RiskRewardAgent", risk_reward.vote, risk_reward.confidence, risk_reward.reason),
+            AgentVote("SymbolSelectionAgent", "OK" if symbol_selection.tradable_today else "REJECT", float(symbol_selection.symbol_score), symbol_selection.reason),
             AgentVote("PerformanceLearningAgent", learning.vote, abs(learning.confidence_adjustment), learning.reason),
         ]
         proposed_direction = "NO_TRADE" if str(signal["signal_type"]) == "NO_TRADE" else str(signal["signal_type"])
+        timeframe_alignment = self._decision_orchestrator.assess_timeframes(
+            symbol=symbol,
+            direction=proposed_direction if proposed_direction in {"LONG", "SHORT"} else str(signal.get("direction", "LONG")),
+            execution_timeframe=timeframe,
+            timeframe_contexts=timeframe_contexts,
+        )
         orchestrated = self._decision_orchestrator.decide(
             signal_tier=str(signal["signal_tier"]),
             proposed_direction=proposed_direction,
             votes=votes,
             current_open_positions=len(self._database.get_open_paper_positions()),
+            timeframe_alignment=timeframe_alignment,
+            symbol_selection_ok=symbol_selection.tradable_today,
         )
         self._persist_agent_decision(
             timestamp=str(signal["timestamp"]),
@@ -374,7 +410,7 @@ class LivePaperEngine:
             timeframe=timeframe,
             decision=orchestrated.final_decision,
             confidence=orchestrated.final_confidence,
-            inputs={"votes": [vote.as_dict() for vote in votes]},
+            inputs={"votes": [vote.as_dict() for vote in votes], "timeframe_alignment": timeframe_alignment.as_dict()},
             reasoning_summary=orchestrated.explanation,
             provider_used=provider_result.provider_used,
         )
@@ -391,8 +427,24 @@ class LivePaperEngine:
 
         signal["agent_votes"] = [vote.as_dict() for vote in votes]
         signal["risk_reward_snapshot"] = risk_reward.as_dict()
+        signal["cost_snapshot"] = cost_snapshot.as_dict()
+        signal["timeframe_alignment"] = timeframe_alignment.timeframe_alignment
+        signal["dominant_trend_timeframe"] = timeframe_alignment.dominant_trend_timeframe
+        signal["execution_timeframe"] = timeframe_alignment.execution_timeframe
+        signal["context_timeframe_votes"] = timeframe_alignment.context_timeframe_votes
+        signal["structural_bias"] = timeframe_alignment.structural_bias
+        signal["alignment_score"] = timeframe_alignment.alignment_score
+        signal["contradiction_score"] = timeframe_alignment.contradiction_score
+        signal["final_timeframe_reason"] = timeframe_alignment.final_timeframe_reason
+        signal["symbol_score"] = symbol_selection.symbol_score
+        signal["liquidity_score"] = symbol_selection.liquidity_score
+        signal["volatility_score"] = symbol_selection.volatility_score
+        signal["spread_score"] = symbol_selection.spread_score
+        signal["data_quality_score"] = symbol_selection.data_quality_score
+        signal["institutional_proxy_score"] = symbol_selection.institutional_proxy_score
+        signal["tradable_today"] = symbol_selection.tradable_today
         signal["explanation"] = audit.summary
-        signal["decision_type"] = orchestrated.final_decision
+        signal["decision_type"] = orchestrated.decision_type
         signal["signal_type"] = "NONE" if not orchestrated.approved else orchestrated.final_decision
         signal["leverage_simulated"] = self._settings.simulated_default_leverage
 
@@ -447,7 +499,28 @@ class LivePaperEngine:
                 },
             },
         )
-        return 6, int(execution_result.cycle_result.opened), int(execution_result.cycle_result.closed)
+        return 7, int(execution_result.cycle_result.opened), int(execution_result.cycle_result.closed)
+
+    def _build_timeframe_contexts(
+        self,
+        *,
+        symbol: str,
+        execution_timeframe: str,
+        current_context: dict[str, object],
+    ) -> dict[str, dict[str, object]]:
+        contexts: dict[str, dict[str, object]] = {execution_timeframe: current_context}
+        for timeframe in (*self._settings.context_timeframes, *self._settings.structural_timeframes):
+            if timeframe == execution_timeframe:
+                continue
+            candles = self._database.get_recent_candles(symbol=symbol, timeframe=timeframe, limit=20)
+            if len(candles) < 5:
+                continue
+            contexts[timeframe] = self._market_context_agent.evaluate(
+                symbol=symbol,
+                timeframe=timeframe,
+                candles=candles,
+            )
+        return contexts
 
     def _persist_agent_decision(
         self,

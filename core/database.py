@@ -1055,6 +1055,50 @@ class Database:
                 ON paper_equity_curve (timestamp DESC)
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS benchmark_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    benchmark_name TEXT NOT NULL,
+                    symbols TEXT NOT NULL,
+                    timeframes TEXT NOT NULL,
+                    trade_count INTEGER NOT NULL,
+                    winrate REAL NOT NULL,
+                    max_drawdown REAL NOT NULL,
+                    profit_factor REAL NOT NULL,
+                    average_trade REAL NOT NULL,
+                    total_net_pnl REAL NOT NULL,
+                    total_cost REAL NOT NULL,
+                    sharpe_simple REAL NOT NULL,
+                    edge_vs_strategy REAL,
+                    raw_payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS walk_forward_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    train_pct REAL NOT NULL,
+                    limit_used INTEGER NOT NULL,
+                    symbols TEXT NOT NULL,
+                    timeframes TEXT NOT NULL,
+                    selected_relaxation REAL NOT NULL,
+                    train_trade_count INTEGER NOT NULL,
+                    test_trade_count INTEGER NOT NULL,
+                    train_net_pnl REAL NOT NULL,
+                    test_net_pnl REAL NOT NULL,
+                    train_winrate REAL NOT NULL,
+                    test_winrate REAL NOT NULL,
+                    survived_out_of_sample INTEGER NOT NULL,
+                    raw_payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
 
     def insert_candles(self, candles: Sequence["Candle"]) -> InsertResult:
         inserted = 0
@@ -2192,6 +2236,16 @@ class Database:
             "total_slippage_paid": round(float(row["total_slippage_paid"] or 0.0), 6),
             "total_spread_paid": round(float(row["total_spread_paid"] or 0.0), 6),
             "total_funding_cost": round(float(row["total_funding_cost"] or 0.0), 6),
+            "gross_win_net_loss": max(gross_wins - wins, 0),
+            "average_cost_per_trade": round(
+                (
+                    float(row["total_fees_paid"] or 0.0)
+                    + float(row["total_slippage_paid"] or 0.0)
+                    + float(row["total_spread_paid"] or 0.0)
+                    + float(row["total_funding_cost"] or 0.0)
+                ) / max(closed_trades, 1),
+                6,
+            ) if closed_trades else 0.0,
         }
 
     def list_candle_counts(self) -> list[dict[str, Any]]:
@@ -2232,6 +2286,22 @@ class Database:
         with self.connection() as conn:
             row = conn.execute("SELECT COUNT(*) AS total FROM paper_positions WHERE status = 'OPEN'").fetchone()
         return int(row["total"] or 0)
+
+    def get_recent_benchmark_results(self, limit: int = 10) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM benchmark_results ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_recent_walk_forward_results(self, limit: int = 10) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM walk_forward_results ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def get_recent_signals(self, limit: int = 10) -> list[dict[str, Any]]:
         with self.connection() as conn:

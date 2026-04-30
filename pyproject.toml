@@ -12,3 +12,6 @@ dependencies = []
 
 [tool.setuptools]
 py-modules = ["main"]
+
+[tool.setuptools.packages.find]
+include = ["agents*", "analytics*", "config*", "core*", "data*", "execution*", "risk*"]

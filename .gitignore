@@ -1,5 +1,8 @@
 .env
 .venv/
+venv/
+build/
+*.egg-info/
 __pycache__/
 .pytest_cache/
 *.pyc
@@ -9,5 +12,6 @@ __pycache__/
 *.db-journal
 *.sqlite
 *.sqlite3
+logs/
 logs/*.log
 runtime/

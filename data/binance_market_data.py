@@ -27,6 +27,18 @@ class Candle:
     close: float
     volume: float
     close_time: str
+    provider: str = "BINANCE"
+
+
+@dataclass(slots=True, frozen=True)
+class BinanceConnectivityProbe:
+    name: str
+    endpoint: str
+    ok: bool
+    latency_ms: float
+    interpretation: str
+    error_message: str | None = None
+    response_preview: str | None = None
 
 
 class BinanceMarketDataService:
@@ -46,6 +58,21 @@ class BinanceMarketDataService:
             return self._fetch_ohlcv_batch(symbol=symbol, timeframe=timeframe, limit=limit)
 
         return self.fetch_ohlcv_history(symbol=symbol, timeframe=timeframe, total_limit=limit)
+
+    def diagnose_connectivity(self) -> list[BinanceConnectivityProbe]:
+        return [
+            self._probe_http(name="server_time", path="/api/v3/time"),
+            self._probe_http(
+                name="btcusdt_klines_1m",
+                path="/api/v3/klines",
+                params={"symbol": "BTCUSDT", "interval": "1m", "limit": 5},
+            ),
+            self._probe_http(
+                name="ethusdt_klines_1m",
+                path="/api/v3/klines",
+                params={"symbol": "ETHUSDT", "interval": "1m", "limit": 5},
+            ),
+        ]
 
     def fetch_latest_closed_candles(self, symbol: str, timeframe: str, limit: int = 2) -> list[Candle]:
         batch_limit = max(limit + 2, 4)
@@ -145,6 +172,34 @@ class BinanceMarketDataService:
             },
         )
         return candles
+
+    def _probe_http(self, *, name: str, path: str, params: dict[str, str | int] | None = None) -> BinanceConnectivityProbe:
+        query = urlencode(params or {})
+        url = f"{self._base_url}{path}" if not query else f"{self._base_url}{path}?{query}"
+        request = Request(url, headers={"User-Agent": "multiagent-trading-system/0.1"})
+        started_at = time.perf_counter()
+        try:
+            with urlopen(request, timeout=self._timeout) as response:
+                payload = response.read().decode("utf-8")
+            latency_ms = round((time.perf_counter() - started_at) * 1000, 2)
+            return BinanceConnectivityProbe(
+                name=name,
+                endpoint=url,
+                ok=True,
+                latency_ms=latency_ms,
+                interpretation="BINANCE_HTTP_OK",
+                response_preview=payload[:240],
+            )
+        except Exception as exc:
+            latency_ms = round((time.perf_counter() - started_at) * 1000, 2)
+            return BinanceConnectivityProbe(
+                name=name,
+                endpoint=url,
+                ok=False,
+                latency_ms=latency_ms,
+                interpretation="BINANCE_HTTP_FAIL",
+                error_message=str(exc),
+            )
 
     def _get_json(self, path: str, params: dict[str, str | int]) -> list[list]:
         query = urlencode(params)

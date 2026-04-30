@@ -20,8 +20,11 @@ class Settings:
     binance_timeout_seconds: int
     market_symbols: tuple[str, ...]
     market_timeframe: str
+    market_timeframes: tuple[str, ...]
     binance_klines_limit: int
     delta_k_threshold: float
+    delta_weak_threshold_factor: float
+    delta_strong_threshold_factor: float
     delta_test_windows: tuple[int, ...]
     signal_evaluation_windows: tuple[int, ...]
     delta_optimization_thresholds: tuple[float, ...]
@@ -34,6 +37,28 @@ class Settings:
     binance_retry_delay_seconds: int
     continuous_loop_seconds: int
     simulated_trade_exit_candles: int
+    simulated_initial_capital: float
+    simulated_position_size_usd: float
+    simulated_fee_pct: float
+    simulated_slippage_pct: float
+    simulated_spread_pct: float
+    simulated_stop_loss_pct: float
+    simulated_take_profit_pct: float
+    simulated_max_hold_candles: int
+    simulated_market_type: str
+    simulated_default_leverage: float
+    simulated_max_leverage: float
+    simulated_funding_rate_estimate: float
+    max_position_pct_of_capital: float
+    max_open_positions: int
+    max_daily_simulated_loss_pct: float
+    min_reward_risk_ratio: float
+    allow_weak_signals: bool
+    allow_medium_signals: bool
+    allow_strong_signals: bool
+    aggressiveness_level: str
+    performance_learning_min_sample: int
+    backtest_min_trades: int
 
 
 def _load_env_file(env_file: Path) -> None:
@@ -66,7 +91,7 @@ def _resolve_path(raw_value: str, default_path: Path) -> Path:
 def _parse_symbols(raw_symbols: str) -> tuple[str, ...]:
     symbols = tuple(symbol.strip().upper() for symbol in raw_symbols.split(",") if symbol.strip())
     if not symbols:
-        return ("BTCUSDT", "ETHUSDT")
+        return ("BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT")
     return symbols
 
 
@@ -84,6 +109,24 @@ def _parse_float_values(raw_values: str) -> tuple[float, ...]:
     return values
 
 
+def _parse_timeframes(raw_timeframes: str) -> tuple[str, ...]:
+    timeframes = tuple(item.strip() for item in raw_timeframes.split(",") if item.strip())
+    if not timeframes:
+        return ("1m",)
+    return timeframes
+
+
+def _parse_bool(raw_value: str, default: bool) -> bool:
+    normalized = raw_value.strip().lower()
+    if not normalized:
+        return default
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
 def load_settings() -> Settings:
     _load_env_file(ENV_FILE)
 
@@ -95,6 +138,8 @@ def load_settings() -> Settings:
         os.getenv("LOGS_DIR", "logs"),
         ROOT_DIR / "logs",
     )
+    market_timeframes = _parse_timeframes(os.getenv("MARKET_TIMEFRAMES", "1m,5m,15m"))
+    market_timeframe = os.getenv("MARKET_TIMEFRAME", market_timeframes[0] if market_timeframes else "1m")
 
     return Settings(
         app_name=os.getenv("APP_NAME", "multiagent-trading-system"),
@@ -104,10 +149,13 @@ def load_settings() -> Settings:
         logs_dir=logs_dir,
         binance_base_url=os.getenv("BINANCE_BASE_URL", "https://api.binance.com").rstrip("/"),
         binance_timeout_seconds=int(os.getenv("BINANCE_TIMEOUT_SECONDS", "10")),
-        market_symbols=_parse_symbols(os.getenv("MARKET_SYMBOLS", "BTCUSDT,ETHUSDT")),
-        market_timeframe=os.getenv("MARKET_TIMEFRAME", "1m"),
+        market_symbols=_parse_symbols(os.getenv("MARKET_SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT")),
+        market_timeframe=market_timeframe,
+        market_timeframes=market_timeframes,
         binance_klines_limit=int(os.getenv("BINANCE_KLINES_LIMIT", "5")),
         delta_k_threshold=float(os.getenv("DELTA_K_THRESHOLD", "0.5")),
+        delta_weak_threshold_factor=float(os.getenv("DELTA_WEAK_THRESHOLD_FACTOR", "0.1")),
+        delta_strong_threshold_factor=float(os.getenv("DELTA_STRONG_THRESHOLD_FACTOR", "2.0")),
         delta_test_windows=_parse_windows(os.getenv("DELTA_TEST_WINDOWS", "10,20,50")),
         signal_evaluation_windows=_parse_windows(os.getenv("SIGNAL_EVALUATION_WINDOWS", "5,10,15")),
         delta_optimization_thresholds=_parse_float_values(
@@ -122,4 +170,26 @@ def load_settings() -> Settings:
         binance_retry_delay_seconds=int(os.getenv("BINANCE_RETRY_DELAY_SECONDS", "2")),
         continuous_loop_seconds=int(os.getenv("CONTINUOUS_LOOP_SECONDS", "60")),
         simulated_trade_exit_candles=int(os.getenv("SIMULATED_TRADE_EXIT_CANDLES", "5")),
+        simulated_initial_capital=float(os.getenv("SIMULATED_INITIAL_CAPITAL", "1000")),
+        simulated_position_size_usd=float(os.getenv("SIMULATED_POSITION_SIZE_USD", "100")),
+        simulated_fee_pct=float(os.getenv("SIMULATED_FEE_PCT", "0.001")),
+        simulated_slippage_pct=float(os.getenv("SIMULATED_SLIPPAGE_PCT", "0.0005")),
+        simulated_spread_pct=float(os.getenv("SIMULATED_SPREAD_PCT", "0.0002")),
+        simulated_stop_loss_pct=float(os.getenv("SIMULATED_STOP_LOSS_PCT", "0.005")),
+        simulated_take_profit_pct=float(os.getenv("SIMULATED_TAKE_PROFIT_PCT", "0.01")),
+        simulated_max_hold_candles=int(os.getenv("SIMULATED_MAX_HOLD_CANDLES", "15")),
+        simulated_market_type=os.getenv("SIMULATED_MARKET_TYPE", "SPOT").upper(),
+        simulated_default_leverage=float(os.getenv("SIMULATED_DEFAULT_LEVERAGE", "1")),
+        simulated_max_leverage=float(os.getenv("SIMULATED_MAX_LEVERAGE", "3")),
+        simulated_funding_rate_estimate=float(os.getenv("SIMULATED_FUNDING_RATE_ESTIMATE", "0.0")),
+        max_position_pct_of_capital=float(os.getenv("MAX_POSITION_PCT_OF_CAPITAL", "0.1")),
+        max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "5")),
+        max_daily_simulated_loss_pct=float(os.getenv("MAX_DAILY_SIMULATED_LOSS_PCT", "0.03")),
+        min_reward_risk_ratio=float(os.getenv("MIN_REWARD_RISK_RATIO", "1.5")),
+        allow_weak_signals=_parse_bool(os.getenv("ALLOW_WEAK_SIGNALS", "true"), True),
+        allow_medium_signals=_parse_bool(os.getenv("ALLOW_MEDIUM_SIGNALS", "true"), True),
+        allow_strong_signals=_parse_bool(os.getenv("ALLOW_STRONG_SIGNALS", "true"), True),
+        aggressiveness_level=os.getenv("AGGRESSIVENESS_LEVEL", "BALANCED").upper(),
+        performance_learning_min_sample=int(os.getenv("PERFORMANCE_LEARNING_MIN_SAMPLE", "10")),
+        backtest_min_trades=int(os.getenv("BACKTEST_MIN_TRADES", "100")),
     )

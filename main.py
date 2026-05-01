@@ -18,6 +18,7 @@ from agents.delta_agent import DeltaAgent
 from agents.execution_simulator_agent import ExecutionSimulatorAgent
 from agents.market_data_agent import MarketDataAgent
 from agents.market_context_agent import MarketContextAgent
+from agents.net_profitability_gate import NetProfitabilityGate
 from agents.performance_learning_agent import PerformanceLearningAgent
 from agents.risk_reward_agent import RiskRewardAgent
 from agents.signal_evaluator import SignalEvaluator
@@ -65,6 +66,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--export-report", action="store_true", help="Exporta un reporte auditable en JSON")
     parser.add_argument("--diagnose-connectivity", action="store_true", help="Prueba conectividad HTTP real hacia Binance")
     parser.add_argument("--readiness-check", action="store_true", help="Evalua si el sistema esta listo para correr live paper largo")
+    parser.add_argument("--quick-audit", action="store_true", help="Ejecuta una auditoria operativa corta sin trading real")
+    parser.add_argument("--preflight-live-paper", action="store_true", help="Bloquea o aprueba una corrida live paper antes de dejarla mas tiempo")
     parser.add_argument("--symbols", nargs="+", help="Lista de simbolos, ejemplo BTCUSDT ETHUSDT")
     parser.add_argument("--timeframes", help="Lista separada por comas, ejemplo 1m,5m,15m")
     parser.add_argument("--timeframe", help="Timeframe, ejemplo 1m")
@@ -676,17 +679,20 @@ def run_readiness_check(
     database: Database,
     service: BinanceMarketDataService,
     market_data_agent: MarketDataAgent,
+    ledger_reconciler: LedgerReconciler,
     symbols: tuple[str, ...],
-    timeframe: str,
+    timeframes: tuple[str, ...],
 ) -> ReadinessReport:
     probes = service.diagnose_connectivity()
+    ledger_report = ledger_reconciler.inspect()
     report = build_readiness_report(
         settings=settings,
         database=database,
         market_data_agent=market_data_agent,
         probes=probes,
         symbols=symbols,
-        timeframe=timeframe,
+        timeframes=timeframes,
+        ledger_result=ledger_report.result,
     )
 
     print("Readiness Check")
@@ -701,21 +707,20 @@ def run_readiness_check(
     print(f"- Can run without blocking: {'YES' if report.can_run_without_blocking else 'NO'}")
     print(f"- API keys required: {'YES' if report.api_keys_required else 'NO'}")
     print(f"- Real trading enabled: {'YES' if report.real_trading_enabled else 'NO'}")
+    print(f"- Can run short paper: {'YES' if report.can_run_short_paper else 'NO'}")
+    print(f"- Can run long paper: {'YES' if report.can_run_long_paper else 'NO'}")
     print(f"- Symbols with history: {list(report.symbols_with_history)}")
     print(f"- Missing symbols: {list(report.missing_symbols)}")
     print(f"- Stale symbols: {list(report.stale_symbols)}")
     print(f"- Current mode recommended: {report.current_mode_recommended}")
+    print(f"- Short-run reason: {report.short_run_reason}")
+    print(f"- Long-run reason: {report.long_run_reason}")
+    print(f"- Ledger result: {ledger_report.result}")
 
     print("Symbol health:")
-    for symbol in symbols:
-        health = inspect_symbol_health(
-            database=database,
-            market_data_agent=market_data_agent,
-            symbol=symbol,
-            timeframe=timeframe,
-        )
+    for health in report.symbol_health:
         print(
-            f"- {symbol} {timeframe}: has_history={health.has_history} "
+            f"- {health.symbol} {health.timeframe}: has_history={health.has_history} "
             f"latest_close={health.latest_close_time} age={format_age_seconds(health.age_seconds)} "
             f"stale={health.is_stale} gaps={health.gap_count} provider={health.latest_provider} note={health.note}"
         )
@@ -729,11 +734,203 @@ def run_readiness_check(
     return report
 
 
+def assess_cost_validation(
+    settings: Settings,
+    trade_metrics: dict[str, object],
+) -> dict[str, object]:
+    average_required_move = float(trade_metrics.get("average_required_move_to_break_even", 0.0) or 0.0)
+    gross_win_net_loss = int(trade_metrics.get("gross_win_net_loss", 0) or 0)
+    total_pnl = float(trade_metrics.get("total_pnl", 0.0) or 0.0)
+    total_gross_pnl = float(trade_metrics.get("total_gross_pnl", 0.0) or 0.0)
+    average_cost_per_trade = float(trade_metrics.get("average_cost_per_trade", 0.0) or 0.0)
+    closed_trades = int(trade_metrics.get("closed_trades", 0) or 0)
+    target_take_profit_pct = settings.simulated_take_profit_pct * 100
+    cost_coverage_config_ok = settings.min_cost_coverage_multiple >= 2.5
+    required_move_ok = average_required_move <= max(target_take_profit_pct * 0.55, 0.15)
+    gross_vs_net_ok = gross_win_net_loss == 0
+    historical_net_ok = total_pnl > 0 if closed_trades else False
+    cost_validation_ok = bool(cost_coverage_config_ok and required_move_ok and gross_vs_net_ok)
+    reasons: list[str] = []
+    if not cost_coverage_config_ok:
+        reasons.append("MIN_COST_COVERAGE_MULTIPLE is below the required 2.5x")
+    if not required_move_ok:
+        reasons.append(
+            f"average required move to break even is {round(average_required_move, 6)}%, too high versus take profit target {round(target_take_profit_pct, 6)}%"
+        )
+    if not gross_vs_net_ok:
+        reasons.append(f"{gross_win_net_loss} trades won gross but lost net after costs")
+    if not historical_net_ok:
+        reasons.append("historical final net pnl remains non-positive")
+    if not reasons:
+        reasons.append("net profitability gate and historical cost drag look acceptable")
+    return {
+        "cost_validation_ok": cost_validation_ok,
+        "historical_net_ok": historical_net_ok,
+        "total_gross_pnl": total_gross_pnl,
+        "total_net_pnl": total_pnl,
+        "average_cost_per_trade": average_cost_per_trade,
+        "average_required_move_to_break_even": average_required_move,
+        "gross_win_net_loss": gross_win_net_loss,
+        "reasons": reasons,
+    }
+
+
+def run_preflight_live_paper(
+    *,
+    settings: Settings,
+    database: Database,
+    service: BinanceMarketDataService,
+    market_data_agent: MarketDataAgent,
+    ledger_reconciler: LedgerReconciler,
+    symbols: tuple[str, ...],
+    timeframes: tuple[str, ...],
+    allow_stale_fallback: bool,
+    print_report: bool = True,
+) -> dict[str, object]:
+    probes = service.diagnose_connectivity()
+    ledger_report = ledger_reconciler.inspect()
+    readiness = build_readiness_report(
+        settings=settings,
+        database=database,
+        market_data_agent=market_data_agent,
+        probes=probes,
+        symbols=symbols,
+        timeframes=timeframes,
+        ledger_result=ledger_report.result,
+    )
+    trade_metrics = database.get_simulated_trade_metrics()
+    cost_validation = assess_cost_validation(settings, trade_metrics)
+    orphan_positions = int(ledger_report.orphan_positions)
+    inconsistent_open_trades = max(0, int(ledger_report.open_simulated_trades_count) - int(ledger_report.open_positions_count))
+    stale_blocked = any(item.is_stale for item in readiness.symbol_health if item.timeframe in settings.execution_timeframes) and not allow_stale_fallback
+
+    blockers: list[str] = []
+    if not readiness.binance_reachable:
+        blockers.append("Binance HTTP is not usable")
+    if not readiness.fresh_data_available:
+        blockers.append("fresh BTCUSDT/ETHUSDT execution data is not available")
+    if ledger_report.result != "OK":
+        blockers.append(f"ledger result is {ledger_report.result}")
+    if orphan_positions:
+        blockers.append(f"{orphan_positions} orphan paper positions detected")
+    if inconsistent_open_trades:
+        blockers.append(f"{inconsistent_open_trades} open simulated trades are not mirrored in paper positions")
+    if stale_blocked:
+        blockers.append("stale fallback would be required but --allow-stale-fallback was not passed")
+    if not cost_validation["cost_validation_ok"]:
+        blockers.append("cost validation failed")
+
+    short_ok = readiness.can_run_short_paper and ledger_report.result == "OK" and not inconsistent_open_trades and not orphan_positions
+    long_ok = readiness.can_run_long_paper and not stale_blocked and not blockers and bool(cost_validation["historical_net_ok"])
+    reason = "preflight passed" if long_ok else "; ".join(blockers or [readiness.long_run_reason])
+
+    result = {
+        "safe_to_run_short_paper": short_ok,
+        "safe_to_run_long_paper": long_ok,
+        "strategy_net_profitable": bool(float(trade_metrics.get("total_pnl", 0.0) or 0.0) > 0),
+        "reason": reason,
+        "readiness": readiness,
+        "ledger_report": ledger_report,
+        "cost_validation": cost_validation,
+    }
+
+    if print_report:
+        print("Preflight Live Paper")
+        print(f"SAFE_TO_RUN_SHORT_PAPER: {'YES' if short_ok else 'NO'}")
+        print(f"SAFE_TO_RUN_LONG_PAPER: {'YES' if long_ok else 'NO'}")
+        print(f"STRATEGY_NET_PROFITABLE: {'YES' if result['strategy_net_profitable'] else 'NO'}")
+        print("Reason:")
+        print(f"- {reason}")
+        print(f"- Binance reachable: {'YES' if readiness.binance_reachable else 'NO'}")
+        print(f"- Fresh data available: {'YES' if readiness.fresh_data_available else 'NO'}")
+        print(f"- Ledger result: {ledger_report.result}")
+        print(f"- Cost validation OK: {'YES' if cost_validation['cost_validation_ok'] else 'NO'}")
+        for item in cost_validation["reasons"]:
+            print(f"- {item}")
+    return result
+
+
+def run_quick_audit(
+    *,
+    settings: Settings,
+    database: Database,
+    service: BinanceMarketDataService,
+    market_data_agent: MarketDataAgent,
+    ledger_reconciler: LedgerReconciler,
+    performance_analyzer: PerformanceAnalyzer,
+    symbols: tuple[str, ...],
+    timeframes: tuple[str, ...],
+) -> dict[str, object]:
+    probes = run_diagnose_connectivity(service)
+    ledger_report = run_reconcile_ledger(ledger_reconciler)
+    readiness = build_readiness_report(
+        settings=settings,
+        database=database,
+        market_data_agent=market_data_agent,
+        probes=probes,
+        symbols=symbols,
+        timeframes=timeframes,
+        ledger_result=ledger_report.result,
+    )
+    trade_metrics = database.get_simulated_trade_metrics()
+    cost_validation = assess_cost_validation(settings, trade_metrics)
+    performance_report = performance_analyzer.refresh()
+    recent_trades = database.get_recent_simulated_trades(limit=5)
+    recent_rejected = database.get_recent_rejected_signals(limit=5)
+
+    safe_short = readiness.can_run_short_paper and ledger_report.result == "OK"
+    safe_long = readiness.can_run_long_paper and cost_validation["cost_validation_ok"] and cost_validation["historical_net_ok"]
+    strategy_net_profitable = bool(float(trade_metrics.get("total_pnl", 0.0) or 0.0) > 0)
+    reasons = list(readiness.reasons) + list(cost_validation["reasons"])
+
+    print("Quick Audit")
+    print(f"SAFE_TO_RUN_SHORT_PAPER: {'YES' if safe_short else 'NO'}")
+    print(f"SAFE_TO_RUN_LONG_PAPER: {'YES' if safe_long else 'NO'}")
+    print(f"STRATEGY_NET_PROFITABLE: {'YES' if strategy_net_profitable else 'NO'}")
+    print("Reason:")
+    for reason in reasons:
+        print(f"- {reason}")
+    print("Cost validation:")
+    print(f"- total_gross_pnl={cost_validation['total_gross_pnl']}")
+    print(f"- total_net_pnl={cost_validation['total_net_pnl']}")
+    print(f"- average_cost_per_trade={cost_validation['average_cost_per_trade']}")
+    print(f"- average_required_move_to_break_even={cost_validation['average_required_move_to_break_even']}%")
+    print(f"- gross_win_net_loss={cost_validation['gross_win_net_loss']}")
+    print("Recent trades:")
+    if recent_trades:
+        for trade in recent_trades:
+            print(
+                f"- [{trade.id}] {trade.symbol} {trade.timeframe} outcome={trade.outcome} "
+                f"gross={trade.gross_pnl} final_net={trade.final_net_pnl_after_all_costs or trade.net_pnl or trade.pnl}"
+            )
+    else:
+        print("- none")
+    print("Recent rejections:")
+    if recent_rejected:
+        for row in recent_rejected:
+            print(f"- [{row['id']}] {row['symbol']} {row['timeframe']} {row['reason']}")
+    else:
+        print("- none")
+
+    return {
+        "safe_to_run_short_paper": safe_short,
+        "safe_to_run_long_paper": safe_long,
+        "strategy_net_profitable": strategy_net_profitable,
+        "reason": "; ".join(reasons),
+        "performance_report": performance_report,
+        "trade_metrics": trade_metrics,
+        "readiness": readiness,
+        "ledger_report": ledger_report,
+        "cost_validation": cost_validation,
+    }
+
+
 def build_status_snapshot(
     database: Database,
     settings: Settings,
     performance_analyzer: PerformanceAnalyzer,
     ledger_reconciler: LedgerReconciler,
+    service: BinanceMarketDataService,
 ) -> dict[str, object]:
     performance_report = performance_analyzer.refresh()
     candle_counts = database.list_candle_counts()
@@ -757,8 +954,18 @@ def build_status_snapshot(
     recent_walk_forward = database.get_recent_walk_forward_results(limit=10)
     latest_decisions_by_agent = database.get_latest_agent_decisions_by_agent()
     ledger_report = ledger_reconciler.inspect()
-    current_provider = recent_market_snapshots[0]["provider_used"] if recent_market_snapshots else "UNKNOWN"
     market_data_agent = MarketDataAgent()
+    probes = service.diagnose_connectivity()
+    readiness_report = build_readiness_report(
+        settings=settings,
+        database=database,
+        market_data_agent=market_data_agent,
+        probes=probes,
+        symbols=settings.market_symbols,
+        timeframes=settings.market_timeframes,
+        ledger_result=ledger_report.result,
+    )
+    current_provider = recent_market_snapshots[0]["provider_used"] if recent_market_snapshots else "UNKNOWN"
     symbol_health: list[dict[str, object]] = []
     for symbol in settings.market_symbols:
         for timeframe in settings.market_timeframes:
@@ -812,6 +1019,17 @@ def build_status_snapshot(
         "symbol_health": symbol_health,
         "latest_decisions_by_agent": latest_decisions_by_agent,
         "ledger_report": ledger_report.as_dict(),
+        "readiness_report": {
+            "ready_for_live_paper": readiness_report.ready_for_live_paper,
+            "binance_reachable": readiness_report.binance_reachable,
+            "fresh_data_available": readiness_report.fresh_data_available,
+            "can_run_short_paper": readiness_report.can_run_short_paper,
+            "can_run_long_paper": readiness_report.can_run_long_paper,
+            "current_mode_recommended": readiness_report.current_mode_recommended,
+            "short_run_reason": readiness_report.short_run_reason,
+            "long_run_reason": readiness_report.long_run_reason,
+            "reasons": list(readiness_report.reasons),
+        },
     }
 
 
@@ -820,8 +1038,9 @@ def run_status_report(
     settings: Settings,
     performance_analyzer: PerformanceAnalyzer,
     ledger_reconciler: LedgerReconciler,
+    service: BinanceMarketDataService,
 ) -> None:
-    snapshot = build_status_snapshot(database, settings, performance_analyzer, ledger_reconciler)
+    snapshot = build_status_snapshot(database, settings, performance_analyzer, ledger_reconciler, service)
     performance_report = snapshot["performance_report"]
     candle_counts = snapshot["candle_counts"]
     signal_counts = snapshot["signal_counts"]
@@ -845,10 +1064,21 @@ def run_status_report(
     symbol_health = snapshot["symbol_health"]
     latest_decisions_by_agent = snapshot["latest_decisions_by_agent"]
     ledger_report = snapshot["ledger_report"]
+    readiness_report = snapshot["readiness_report"]
 
     print("Status Report")
     print(f"Database path: {snapshot['database_path']}")
     print(f"Current provider: {snapshot['current_provider']}")
+    print("")
+
+    print("Readiness snapshot:")
+    print(f"- Binance reachable: {'YES' if readiness_report['binance_reachable'] else 'NO'}")
+    print(f"- Fresh data available: {'YES' if readiness_report['fresh_data_available'] else 'NO'}")
+    print(f"- Can run short paper: {'YES' if readiness_report['can_run_short_paper'] else 'NO'}")
+    print(f"- Can run long paper: {'YES' if readiness_report['can_run_long_paper'] else 'NO'}")
+    print(f"- Current mode recommended: {readiness_report['current_mode_recommended']}")
+    print(f"- Short-run reason: {readiness_report['short_run_reason']}")
+    print(f"- Long-run reason: {readiness_report['long_run_reason']}")
     print("")
 
     print("Candles by symbol/timeframe:")
@@ -1009,15 +1239,20 @@ def run_status_report(
     print(f"- gross winrate: {trade_metrics['gross_winrate']}%")
     print(f"- net winrate: {trade_metrics['winrate']}%")
     print(f"- gross pnl total: {trade_metrics['total_gross_pnl']}")
+    print(f"- net pnl before funding total: {trade_metrics['total_net_pnl_before_funding']}")
+    print(f"- final net pnl after all costs: {trade_metrics['total_pnl']}")
     print(f"- average net pnl: {trade_metrics['average_pnl']}")
     print(f"- average net pnl pct: {trade_metrics['average_pnl_pct']}%")
-    print(f"- total net pnl: {trade_metrics['total_pnl']}")
     print(f"- total fees paid: {trade_metrics['total_fees_paid']}")
     print(f"- total slippage paid: {trade_metrics['total_slippage_paid']}")
     print(f"- total spread paid: {trade_metrics['total_spread_paid']}")
     print(f"- total funding estimate: {trade_metrics['total_funding_cost']}")
+    print(f"- total cost drag: {trade_metrics['total_cost_drag']}")
     print(f"- gross_win_net_loss: {trade_metrics['gross_win_net_loss']}")
+    print(f"- breakeven count: {trade_metrics['breakeven_count']}")
     print(f"- average cost per trade: {trade_metrics['average_cost_per_trade']}")
+    print(f"- average required move to break even: {trade_metrics['average_required_move_to_break_even']}%")
+    print(f"- breakeven winrate approx: {trade_metrics['breakeven_winrate_approx']}%")
     print("")
 
     print("Performance learning summary:")
@@ -1155,8 +1390,10 @@ def run_status_report(
             print(
                 f"- [{trade.id}] {trade.symbol} {trade.timeframe} {trade.status} {trade.direction} "
                 f"outcome={trade.outcome} entry={trade.entry_price} exit={trade.exit_price} gross_pnl={trade.gross_pnl} "
-                f"net_pnl={trade.net_pnl or trade.pnl} net_pnl_pct={trade.net_pnl_pct or trade.pnl_pct} "
+                f"net_before_funding={trade.net_pnl_before_funding} final_net={trade.final_net_pnl_after_all_costs or trade.net_pnl or trade.pnl} "
+                f"final_net_pct={trade.final_net_pnl_after_all_costs_pct or trade.net_pnl_pct or trade.pnl_pct} "
                 f"fees={trade.total_fees} slippage={trade.slippage_cost} spread={trade.spread_cost} "
+                f"funding={trade.funding_cost_estimate} cost_drag={trade.total_cost_drag} "
                 f"provider={trade.provider_used} market_type={trade.market_type} "
                 f"duration_seconds={trade.duration_seconds} "
                 f"mfe={trade.max_favorable_excursion} mae={trade.max_adverse_excursion} "
@@ -1219,11 +1456,61 @@ def run_export_report(
     settings: Settings,
     performance_analyzer: PerformanceAnalyzer,
     ledger_reconciler: LedgerReconciler,
+    service: BinanceMarketDataService,
     export_format: str,
 ) -> str:
-    snapshot = build_status_snapshot(database, settings, performance_analyzer, ledger_reconciler)
+    snapshot = build_status_snapshot(database, settings, performance_analyzer, ledger_reconciler, service)
     output_dir = settings.sqlite_path.parent
     if export_format == "csv":
+        trade_metrics = snapshot["trade_metrics"]
+        cost_analysis_rows = [
+            {
+                "closed_trades": trade_metrics["closed_trades"],
+                "gross_winrate": trade_metrics["gross_winrate"],
+                "net_winrate": trade_metrics["winrate"],
+                "total_gross_pnl": trade_metrics["total_gross_pnl"],
+                "total_net_pnl_before_funding": trade_metrics["total_net_pnl_before_funding"],
+                "final_net_pnl_after_all_costs": trade_metrics["total_pnl"],
+                "total_fees_paid": trade_metrics["total_fees_paid"],
+                "total_slippage_paid": trade_metrics["total_slippage_paid"],
+                "total_spread_paid": trade_metrics["total_spread_paid"],
+                "total_funding_cost": trade_metrics["total_funding_cost"],
+                "total_cost_drag": trade_metrics["total_cost_drag"],
+                "average_cost_per_trade": trade_metrics["average_cost_per_trade"],
+                "average_required_move_to_break_even": trade_metrics["average_required_move_to_break_even"],
+                "breakeven_winrate_approx": trade_metrics["breakeven_winrate_approx"],
+                "gross_win_net_loss": trade_metrics["gross_win_net_loss"],
+            }
+        ]
+        readiness_rows = []
+        for row in snapshot["symbol_health"]:
+            readiness_rows.append(
+                {
+                    "symbol": row["symbol"],
+                    "timeframe": row["timeframe"],
+                    "has_history": row["has_history"],
+                    "latest_close_time": row["latest_close_time"],
+                    "latest_provider": row["latest_provider"],
+                    "age_seconds": row["age_seconds"],
+                    "is_stale": row["is_stale"],
+                    "gap_count": row["gap_count"],
+                    "is_valid": row["is_valid"],
+                    "note": row["note"],
+                    "can_run_short_paper": snapshot["readiness_report"]["can_run_short_paper"],
+                    "can_run_long_paper": snapshot["readiness_report"]["can_run_long_paper"],
+                    "current_mode_recommended": snapshot["readiness_report"]["current_mode_recommended"],
+                }
+            )
+        profitability_rows = [
+            {
+                "strategy_net_profitable": float(trade_metrics["total_pnl"]) > 0,
+                "gross_winrate": trade_metrics["gross_winrate"],
+                "net_winrate": trade_metrics["winrate"],
+                "gross_win_net_loss": trade_metrics["gross_win_net_loss"],
+                "average_cost_per_trade": trade_metrics["average_cost_per_trade"],
+                "average_required_move_to_break_even": trade_metrics["average_required_move_to_break_even"],
+            }
+        ]
         csv_targets = {
             "trades.csv": snapshot["recent_trades"],
             "decisions.csv": snapshot["recent_decisions"],
@@ -1231,6 +1518,11 @@ def run_export_report(
             "portfolio.csv": [snapshot["portfolio"]] if snapshot["portfolio"] else [],
             "errors.csv": snapshot["recent_errors"],
             "benchmark.csv": snapshot["recent_benchmarks"],
+            "rejected_trades.csv": snapshot["recent_rejected_signals"],
+            "cost_analysis.csv": cost_analysis_rows,
+            "readiness.csv": readiness_rows,
+            "net_profitability_summary.csv": profitability_rows,
+            "recent_agent_decisions.csv": snapshot["recent_decisions"],
         }
         for filename, rows in csv_targets.items():
             path = output_dir / filename
@@ -1258,16 +1550,20 @@ def run_export_report(
             "supported_context_timeframes": list(settings.context_timeframes),
             "supported_structural_timeframes": list(settings.structural_timeframes),
             "gross_vs_net": snapshot["trade_metrics"],
+            "readiness": snapshot["readiness_report"],
             "best_setups": snapshot["performance_report"].get("best_setups", []),
             "worst_setups": snapshot["performance_report"].get("worst_setups", []),
             "best_symbols": snapshot["performance_by_symbol"][:3],
             "worst_symbols": list(reversed(snapshot["performance_by_symbol"][-3:])) if snapshot["performance_by_symbol"] else [],
             "best_timeframes": snapshot["performance_by_timeframe"][:3],
             "worst_timeframes": list(reversed(snapshot["performance_by_timeframe"][-3:])) if snapshot["performance_by_timeframe"] else [],
-            "readiness": {
-                "ledger_result": snapshot["ledger_report"]["result"],
-                "current_provider": snapshot["current_provider"],
-                "stale_rows": [row for row in snapshot["symbol_health"] if row["is_stale"]],
+            "cost_analysis": {
+                "gross_winrate": snapshot["trade_metrics"]["gross_winrate"],
+                "net_winrate": snapshot["trade_metrics"]["winrate"],
+                "gross_win_net_loss": snapshot["trade_metrics"]["gross_win_net_loss"],
+                "average_cost_per_trade": snapshot["trade_metrics"]["average_cost_per_trade"],
+                "average_required_move_to_break_even": snapshot["trade_metrics"]["average_required_move_to_break_even"],
+                "breakeven_winrate_approx": snapshot["trade_metrics"]["breakeven_winrate_approx"],
             },
         },
         "details": snapshot,
@@ -1654,6 +1950,7 @@ def main() -> int:
     market_data_agent = MarketDataAgent()
     risk_reward_agent = RiskRewardAgent(settings)
     cost_model_agent = CostModelAgent(settings)
+    net_profitability_gate = NetProfitabilityGate(settings)
     performance_learning_agent = PerformanceLearningAgent(database, settings)
     symbol_selection_agent = SymbolSelectionAgent(settings)
     execution_simulator_agent = ExecutionSimulatorAgent(database, simulated_trade_tracker)
@@ -1670,6 +1967,7 @@ def main() -> int:
         risk_reward_agent=risk_reward_agent,
         cost_model_agent=cost_model_agent,
         performance_learning_agent=performance_learning_agent,
+        net_profitability_gate=net_profitability_gate,
         symbol_selection_agent=symbol_selection_agent,
         execution_simulator_agent=execution_simulator_agent,
         audit_agent=audit_agent,
@@ -1678,8 +1976,11 @@ def main() -> int:
     )
     backtest_engine = BacktestEngine(
         database=database,
+        settings=settings,
         delta_agent=delta_agent,
         market_context_agent=market_context_agent,
+        cost_model_agent=cost_model_agent,
+        net_profitability_gate=net_profitability_gate,
         simulated_trade_tracker=simulated_trade_tracker,
         performance_analyzer=performance_analyzer,
     )
@@ -1694,6 +1995,7 @@ def main() -> int:
         delta_agent=delta_agent,
         market_context_agent=market_context_agent,
         cost_model_agent=cost_model_agent,
+        net_profitability_gate=net_profitability_gate,
     )
     had_errors = False
 
@@ -1732,8 +2034,9 @@ def main() -> int:
                 database=database,
                 service=service,
                 market_data_agent=market_data_agent,
+                ledger_reconciler=ledger_reconciler,
                 symbols=symbols,
-                timeframe=timeframe,
+                timeframes=timeframes,
             )
             logger.info(
                 "Clean shutdown",
@@ -1741,8 +2044,43 @@ def main() -> int:
             )
             return 0
 
+        if args.quick_audit:
+            audit_result = run_quick_audit(
+                settings=settings,
+                database=database,
+                service=service,
+                market_data_agent=market_data_agent,
+                ledger_reconciler=ledger_reconciler,
+                performance_analyzer=performance_analyzer,
+                symbols=symbols,
+                timeframes=timeframes,
+            )
+            logger.info(
+                "Clean shutdown",
+                extra={"event": "shutdown", "context": {"status": "quick_audit_success", "safe_short": audit_result["safe_to_run_short_paper"], "safe_long": audit_result["safe_to_run_long_paper"]}},
+            )
+            return 0
+
+        if args.preflight_live_paper:
+            preflight = run_preflight_live_paper(
+                settings=settings,
+                database=database,
+                service=service,
+                market_data_agent=market_data_agent,
+                ledger_reconciler=ledger_reconciler,
+                symbols=symbols,
+                timeframes=timeframes,
+                allow_stale_fallback=args.allow_stale_fallback,
+                print_report=True,
+            )
+            logger.info(
+                "Clean shutdown",
+                extra={"event": "shutdown", "context": {"status": "preflight_live_paper_success", "safe_short": preflight["safe_to_run_short_paper"], "safe_long": preflight["safe_to_run_long_paper"]}},
+            )
+            return 0 if preflight["safe_to_run_short_paper"] else 1
+
         if args.status_report:
-            run_status_report(database, settings, performance_analyzer, ledger_reconciler)
+            run_status_report(database, settings, performance_analyzer, ledger_reconciler, service)
             logger.info(
                 "Clean shutdown",
                 extra={"event": "shutdown", "context": {"status": "status_report_success"}},
@@ -1750,7 +2088,7 @@ def main() -> int:
             return 0
 
         if args.export_report:
-            run_export_report(database, settings, performance_analyzer, ledger_reconciler, args.format)
+            run_export_report(database, settings, performance_analyzer, ledger_reconciler, service, args.format)
             logger.info(
                 "Clean shutdown",
                 extra={"event": "shutdown", "context": {"status": "export_report_success"}},
@@ -1949,6 +2287,22 @@ def main() -> int:
                 for note in ledger_report.notes:
                     print(f"- {note}")
                 return 1
+            if args.max_loops is None:
+                preflight = run_preflight_live_paper(
+                    settings=settings,
+                    database=database,
+                    service=service,
+                    market_data_agent=market_data_agent,
+                    ledger_reconciler=ledger_reconciler,
+                    symbols=symbols,
+                    timeframes=timeframes,
+                    allow_stale_fallback=args.allow_stale_fallback,
+                    print_report=True,
+                )
+                if not preflight["safe_to_run_long_paper"]:
+                    print("Live paper engine blocked for long run by preflight.")
+                    print(f"Reason: {preflight['reason']}")
+                    return 1
             run_live_paper_engine(
                 live_paper_engine,
                 symbols=symbols,

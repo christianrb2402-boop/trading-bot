@@ -1,6 +1,6 @@
 # Runbook Local Windows
 
-Este runbook asume que el bot se ejecutara en una computadora fija Windows, sin VPN, con conectividad HTTP real hacia Binance y siempre en modo simulado.
+Este runbook asume una computadora fija Windows, sin VPN, con conectividad HTTP real hacia Binance. Todo sigue en modo paper trading.
 
 ## 1. Actualizar repo
 
@@ -39,8 +39,6 @@ python main.py --init-only
 
 ## 6. Cargar historia fresca
 
-Ejecutar por timeframe:
-
 ```bat
 python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 1m --limit 1000
 python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 5m --limit 1000
@@ -51,7 +49,20 @@ python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT 
 python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 1d --limit 1000
 ```
 
-## 7. Validar estado operativo
+## 7. Auditoria operativa corta
+
+```bat
+python main.py --quick-audit
+python main.py --preflight-live-paper
+```
+
+Objetivo:
+- confirmar conectividad Binance
+- confirmar data fresca
+- confirmar que el ledger este OK
+- bloquear corridas largas si el edge neto no esta claro
+
+## 8. Validar estado operativo
 
 ```bat
 python main.py --readiness-check
@@ -59,40 +70,42 @@ python main.py --reconcile-ledger
 python main.py --status-report
 ```
 
-Objetivo:
-- Confirmar `READY_FOR_LIVE_PAPER`
-- Confirmar `Ledger Consistency Check: OK`
-- Ver si la data esta fresca o stale
-- Ver simbolos faltantes o con gaps
+Revisar especialmente:
+- `SAFE_TO_RUN_SHORT_PAPER`
+- `SAFE_TO_RUN_LONG_PAPER`
+- `Ledger Consistency Check: OK`
+- `Current provider: BINANCE`
+- `Latest candle status`
 
-## 8. Ejecutar benchmark de investigacion
-
-Importante para PowerShell o CMD:
-- cuando uses `--timeframes`, pasa la lista entre comillas
+## 9. Benchmark de investigacion
 
 ```bat
 python main.py --benchmark --limit 5000 --timeframes "1m,5m,15m,30m,1h,4h,1d"
 python main.py --walk-forward --limit 10000 --train-pct 70 --timeframes "1m,5m,15m,30m,1h,4h,1d"
 ```
 
-## 9. Ejecutar prueba corta de live paper
+Nota:
+- en PowerShell o CMD, dejar `--timeframes` entre comillas
+
+## 10. Prueba corta de live paper
 
 ```bat
 python main.py --live-paper-engine --max-loops 5
 ```
 
-## 10. Ejecutar prueba por tiempo
+## 11. Prueba de 60 minutos
 
 ```bat
 python main.py --live-paper-engine --run-minutes 60
 ```
 
 Solo correr esto si:
-- `--diagnose-connectivity` dice `BINANCE_HTTP_USABLE: YES`
-- `--readiness-check` recomienda `LIVE_BINANCE`
-- `--reconcile-ledger` devuelve `result=OK`
+- `python main.py --diagnose-connectivity` devuelve `BINANCE_HTTP_USABLE: YES`
+- `python main.py --quick-audit` no marca bloqueo operativo grave
+- `python main.py --preflight-live-paper` deja `SAFE_TO_RUN_LONG_PAPER: YES`
+- `python main.py --reconcile-ledger` devuelve `result=OK`
 
-## 11. Exportar reporte auditable
+## 12. Exportar auditoria
 
 ```bat
 python main.py --export-report
@@ -107,33 +120,33 @@ Archivos esperados:
 - `runtime\portfolio.csv`
 - `runtime\errors.csv`
 - `runtime\benchmark.csv`
+- `runtime\rejected_trades.csv`
+- `runtime\cost_analysis.csv`
+- `runtime\readiness.csv`
+- `runtime\net_profitability_summary.csv`
+- `runtime\recent_agent_decisions.csv`
 
-## 12. Politica de seguridad
+## 13. Politica de seguridad
 
 - No activar trading real.
 - No agregar API keys privadas.
 - No conectar cuentas reales.
 - No usar ordenes reales.
 - No usar servicios pagos.
-- Si Binance falla, usar fallback local solo como emergencia o validacion acotada.
-- No declarar rentable una estrategia que no cubre fees, slippage y spread.
+- No declarar rentable una estrategia que pierde despues de fees, slippage y spread.
 
-## 13. Orden recomendado de uso diario
+## 14. Orden recomendado diario
 
 1. `python main.py --diagnose-connectivity`
 2. `python main.py --init-only`
-3. `python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 1m --limit 1000`
-4. `python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 5m --limit 1000`
-5. `python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 15m --limit 1000`
-6. `python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 30m --limit 1000`
-7. `python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 1h --limit 1000`
-8. `python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 4h --limit 1000`
-9. `python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 1d --limit 1000`
-10. `python main.py --readiness-check`
-11. `python main.py --reconcile-ledger`
-12. `python main.py --status-report`
-13. `python main.py --benchmark --limit 5000 --timeframes "1m,5m,15m,30m,1h,4h,1d"`
-14. `python main.py --walk-forward --limit 10000 --train-pct 70 --timeframes "1m,5m,15m,30m,1h,4h,1d"`
-15. `python main.py --live-paper-engine --max-loops 5`
-16. `python main.py --live-paper-engine --run-minutes 60`
-17. `python main.py --export-report`
+3. cargar historia para `1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`
+4. `python main.py --quick-audit`
+5. `python main.py --preflight-live-paper`
+6. `python main.py --readiness-check`
+7. `python main.py --reconcile-ledger`
+8. `python main.py --status-report`
+9. `python main.py --benchmark --limit 5000 --timeframes "1m,5m,15m,30m,1h,4h,1d"`
+10. `python main.py --walk-forward --limit 10000 --train-pct 70 --timeframes "1m,5m,15m,30m,1h,4h,1d"`
+11. `python main.py --live-paper-engine --max-loops 5`
+12. `python main.py --live-paper-engine --run-minutes 60`
+13. `python main.py --export-report`

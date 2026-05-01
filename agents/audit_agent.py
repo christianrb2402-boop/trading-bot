@@ -26,10 +26,18 @@ class AuditAgent:
         *,
         final_decision: str,
         approved: bool,
+        direction: str,
+        timeframe: str,
+        setup: str,
+        confidence: float,
         signal_reason: str,
         risk_reason: str,
+        net_gate_reason: str,
         learning_reason: str,
         cost_snapshot: dict[str, object],
+        expected_move_pct: float,
+        invalidation_price: float,
+        close_condition: str,
         committee_notes: Sequence[str],
     ) -> AuditExplanation:
         cost_notes = (
@@ -38,13 +46,23 @@ class AuditAgent:
             f"slippage_cost={cost_snapshot.get('slippage_cost')}",
             f"spread_cost={cost_snapshot.get('spread_cost')}",
             f"funding_cost_estimate={cost_snapshot.get('funding_cost_estimate')}",
+            f"total_estimated_costs={cost_snapshot.get('total_estimated_costs')}",
+            f"minimum_profitable_move_pct={cost_snapshot.get('minimum_profitable_move_pct')}",
+            f"expected_net_reward_risk={cost_snapshot.get('expected_net_reward_risk')}",
         )
-        risk_notes = (risk_reason, learning_reason)
+        risk_notes = (risk_reason, net_gate_reason, learning_reason)
         summary = (
-            f"{final_decision} approved for paper execution because {signal_reason}. "
-            f"Risk/reward review: {risk_reason}. Learning memory: {learning_reason}."
+            f"{final_decision} approved for paper execution. direction={direction} timeframe={timeframe} setup={setup} "
+            f"confidence={round(confidence, 4)} expected_move_pct={round(expected_move_pct, 4)} "
+            f"invalidation_price={round(invalidation_price, 6)} close_condition={close_condition}. "
+            f"Signal view: {signal_reason}. Risk/reward review: {risk_reason}. Net profitability gate: {net_gate_reason}. "
+            f"Learning memory: {learning_reason}."
             if approved
-            else f"{final_decision} rejected. Signal view: {signal_reason}. Risk/reward review: {risk_reason}. Learning memory: {learning_reason}."
+            else f"{final_decision} rejected. direction={direction} timeframe={timeframe} setup={setup} "
+            f"confidence={round(confidence, 4)} expected_move_pct={round(expected_move_pct, 4)} "
+            f"invalidation_price={round(invalidation_price, 6)} close_condition={close_condition}. "
+            f"Signal view: {signal_reason}. Risk/reward review: {risk_reason}. Net profitability gate: {net_gate_reason}. "
+            f"Learning memory: {learning_reason}."
         )
         return AuditExplanation(
             summary=summary,

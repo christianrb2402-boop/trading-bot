@@ -184,13 +184,17 @@ class SimulatedTradeRecord:
     funding_cost_estimate: float | None = None
     notional_exposure: float | None = None
     gross_pnl: float | None = None
+    net_pnl_before_funding: float | None = None
     net_pnl: float | None = None
     net_pnl_pct: float | None = None
+    final_net_pnl_after_all_costs: float | None = None
+    final_net_pnl_after_all_costs_pct: float | None = None
     fees_open: float | None = None
     fees_close: float | None = None
     total_fees: float | None = None
     slippage_cost: float | None = None
     spread_cost: float | None = None
+    total_cost_drag: float | None = None
     break_even_price: float | None = None
     minimum_required_move_to_profit: float | None = None
     entry_context: str | None = None
@@ -689,6 +693,12 @@ class Database:
             self._ensure_column(
                 conn=conn,
                 table_name="simulated_trades",
+                column_name="net_pnl_before_funding",
+                column_sql="REAL",
+            )
+            self._ensure_column(
+                conn=conn,
+                table_name="simulated_trades",
                 column_name="net_pnl",
                 column_sql="REAL",
             )
@@ -696,6 +706,18 @@ class Database:
                 conn=conn,
                 table_name="simulated_trades",
                 column_name="net_pnl_pct",
+                column_sql="REAL",
+            )
+            self._ensure_column(
+                conn=conn,
+                table_name="simulated_trades",
+                column_name="final_net_pnl_after_all_costs",
+                column_sql="REAL",
+            )
+            self._ensure_column(
+                conn=conn,
+                table_name="simulated_trades",
+                column_name="final_net_pnl_after_all_costs_pct",
                 column_sql="REAL",
             )
             self._ensure_column(
@@ -726,6 +748,12 @@ class Database:
                 conn=conn,
                 table_name="simulated_trades",
                 column_name="spread_cost",
+                column_sql="REAL DEFAULT 0",
+            )
+            self._ensure_column(
+                conn=conn,
+                table_name="simulated_trades",
+                column_name="total_cost_drag",
                 column_sql="REAL DEFAULT 0",
             )
             self._ensure_column(
@@ -1640,17 +1668,36 @@ class Database:
         return len(records)
 
     def reset_backtest_state(self) -> None:
+        timestamp = datetime.now(timezone.utc).isoformat()
         with self.connection() as conn:
             conn.execute("DELETE FROM signals_log")
             conn.execute("DELETE FROM rejected_signals_log")
             conn.execute("DELETE FROM agent_decisions")
             conn.execute("DELETE FROM market_context")
+            conn.execute("DELETE FROM market_snapshots")
             conn.execute("DELETE FROM simulated_trades")
             conn.execute("DELETE FROM strategy_insights")
+            conn.execute("DELETE FROM paper_positions")
+            conn.execute("DELETE FROM paper_orders")
+            conn.execute("DELETE FROM paper_trade_ledger")
+            conn.execute("DELETE FROM paper_equity_curve")
+            conn.execute("DELETE FROM paper_portfolio")
             conn.execute(
                 """
                 DELETE FROM sqlite_sequence
-                WHERE name IN ('signals_log', 'rejected_signals_log', 'agent_decisions', 'market_context', 'simulated_trades', 'strategy_insights')
+                WHERE name IN (
+                    'signals_log',
+                    'rejected_signals_log',
+                    'agent_decisions',
+                    'market_context',
+                    'market_snapshots',
+                    'simulated_trades',
+                    'strategy_insights',
+                    'paper_positions',
+                    'paper_orders',
+                    'paper_trade_ledger',
+                    'paper_equity_curve'
+                )
                 """
             )
 
@@ -1701,13 +1748,17 @@ class Database:
                     COALESCE(funding_cost_estimate, 0) AS funding_cost_estimate,
                     notional_exposure,
                     gross_pnl,
+                    net_pnl_before_funding,
                     net_pnl,
                     net_pnl_pct,
+                    final_net_pnl_after_all_costs,
+                    final_net_pnl_after_all_costs_pct,
                     COALESCE(fees_open, 0) AS fees_open,
                     COALESCE(fees_close, 0) AS fees_close,
                     COALESCE(total_fees, fees_paid, 0) AS total_fees,
                     COALESCE(slippage_cost, 0) AS slippage_cost,
                     COALESCE(spread_cost, 0) AS spread_cost,
+                    COALESCE(total_cost_drag, COALESCE(total_fees, fees_paid, 0) + COALESCE(slippage_cost, 0) + COALESCE(spread_cost, 0) + COALESCE(funding_cost_estimate, 0)) AS total_cost_drag,
                     break_even_price,
                     minimum_required_move_to_profit,
                     entry_context,
@@ -1773,13 +1824,17 @@ class Database:
                     COALESCE(funding_cost_estimate, 0) AS funding_cost_estimate,
                     notional_exposure,
                     gross_pnl,
+                    net_pnl_before_funding,
                     net_pnl,
                     net_pnl_pct,
+                    final_net_pnl_after_all_costs,
+                    final_net_pnl_after_all_costs_pct,
                     COALESCE(fees_open, 0) AS fees_open,
                     COALESCE(fees_close, 0) AS fees_close,
                     COALESCE(total_fees, fees_paid, 0) AS total_fees,
                     COALESCE(slippage_cost, 0) AS slippage_cost,
                     COALESCE(spread_cost, 0) AS spread_cost,
+                    COALESCE(total_cost_drag, COALESCE(total_fees, fees_paid, 0) + COALESCE(slippage_cost, 0) + COALESCE(spread_cost, 0) + COALESCE(funding_cost_estimate, 0)) AS total_cost_drag,
                     break_even_price,
                     minimum_required_move_to_profit,
                     entry_context,
@@ -1948,13 +2003,17 @@ class Database:
         max_adverse_excursion: float,
         reason_exit: str,
         gross_pnl: float | None = None,
+        net_pnl_before_funding: float | None = None,
         net_pnl: float | None = None,
         net_pnl_pct: float | None = None,
+        final_net_pnl_after_all_costs: float | None = None,
+        final_net_pnl_after_all_costs_pct: float | None = None,
         fees_close: float | None = None,
         total_fees: float | None = None,
         slippage_cost: float | None = None,
         spread_cost: float | None = None,
         funding_cost_estimate: float | None = None,
+        total_cost_drag: float | None = None,
         exit_context: str | None = None,
         cost_snapshot: str | None = None,
     ) -> None:
@@ -1970,13 +2029,17 @@ class Database:
                     pnl = ?,
                     pnl_pct = ?,
                     gross_pnl = COALESCE(?, gross_pnl),
+                    net_pnl_before_funding = COALESCE(?, net_pnl_before_funding, ?),
                     net_pnl = COALESCE(?, ?),
                     net_pnl_pct = COALESCE(?, ?),
+                    final_net_pnl_after_all_costs = COALESCE(?, final_net_pnl_after_all_costs, ?, ?),
+                    final_net_pnl_after_all_costs_pct = COALESCE(?, final_net_pnl_after_all_costs_pct, ?, ?),
                     fees_close = COALESCE(?, fees_close),
                     total_fees = COALESCE(?, ?),
                     slippage_cost = COALESCE(?, slippage_cost),
                     spread_cost = COALESCE(?, spread_cost),
                     funding_cost_estimate = COALESCE(?, funding_cost_estimate),
+                    total_cost_drag = COALESCE(?, total_cost_drag, COALESCE(?, 0) + COALESCE(?, 0) + COALESCE(?, 0) + COALESCE(?, 0)),
                     outcome = ?,
                     duration_seconds = ?,
                     max_favorable_excursion = ?,
@@ -1996,13 +2059,26 @@ class Database:
                     pnl,
                     pnl_pct,
                     gross_pnl,
+                    net_pnl_before_funding,
+                    pnl,
                     net_pnl,
                     pnl,
+                    net_pnl_pct,
+                    pnl_pct,
+                    final_net_pnl_after_all_costs,
+                    net_pnl,
+                    pnl,
+                    final_net_pnl_after_all_costs_pct,
                     net_pnl_pct,
                     pnl_pct,
                     fees_close,
                     total_fees,
                     fees_paid,
+                    slippage_cost,
+                    spread_cost,
+                    funding_cost_estimate,
+                    total_cost_drag,
+                    total_fees,
                     slippage_cost,
                     spread_cost,
                     funding_cost_estimate,
@@ -2100,13 +2176,17 @@ class Database:
                 COALESCE(funding_cost_estimate, 0) AS funding_cost_estimate,
                 notional_exposure,
                 gross_pnl,
+                net_pnl_before_funding,
                 net_pnl,
                 net_pnl_pct,
+                final_net_pnl_after_all_costs,
+                final_net_pnl_after_all_costs_pct,
                 COALESCE(fees_open, 0) AS fees_open,
                 COALESCE(fees_close, 0) AS fees_close,
                 COALESCE(total_fees, fees_paid, 0) AS total_fees,
                 COALESCE(slippage_cost, 0) AS slippage_cost,
                 COALESCE(spread_cost, 0) AS spread_cost,
+                COALESCE(total_cost_drag, COALESCE(total_fees, fees_paid, 0) + COALESCE(slippage_cost, 0) + COALESCE(spread_cost, 0) + COALESCE(funding_cost_estimate, 0)) AS total_cost_drag,
                 break_even_price,
                 minimum_required_move_to_profit,
                 entry_context,
@@ -2174,13 +2254,17 @@ class Database:
                     COALESCE(funding_cost_estimate, 0) AS funding_cost_estimate,
                     notional_exposure,
                     gross_pnl,
+                    net_pnl_before_funding,
                     net_pnl,
                     net_pnl_pct,
+                    final_net_pnl_after_all_costs,
+                    final_net_pnl_after_all_costs_pct,
                     COALESCE(fees_open, 0) AS fees_open,
                     COALESCE(fees_close, 0) AS fees_close,
                     COALESCE(total_fees, fees_paid, 0) AS total_fees,
                     COALESCE(slippage_cost, 0) AS slippage_cost,
                     COALESCE(spread_cost, 0) AS spread_cost,
+                    COALESCE(total_cost_drag, COALESCE(total_fees, fees_paid, 0) + COALESCE(slippage_cost, 0) + COALESCE(spread_cost, 0) + COALESCE(funding_cost_estimate, 0)) AS total_cost_drag,
                     break_even_price,
                     minimum_required_move_to_profit,
                     entry_context,
@@ -2202,16 +2286,23 @@ class Database:
                 """
                 SELECT
                     COUNT(*) AS closed_trades,
-                    SUM(CASE WHEN outcome = 'WIN' THEN 1 ELSE 0 END) AS wins,
+                    SUM(CASE WHEN outcome IN ('WIN_NET', 'WIN') THEN 1 ELSE 0 END) AS wins,
+                    SUM(CASE WHEN outcome IN ('BREAKEVEN_NET', 'BREAKEVEN') THEN 1 ELSE 0 END) AS breakeven_count,
+                    SUM(CASE WHEN outcome IN ('WIN_GROSS_ONLY_NET_LOSS', 'GROSS_WIN_NET_LOSS') THEN 1 ELSE 0 END) AS gross_win_net_loss_count,
                     SUM(CASE WHEN COALESCE(gross_pnl, pnl, 0) > 0 THEN 1 ELSE 0 END) AS gross_wins,
                     SUM(COALESCE(gross_pnl, pnl, 0)) AS total_gross_pnl,
-                    AVG(COALESCE(net_pnl, pnl, 0)) AS average_pnl,
-                    SUM(COALESCE(net_pnl, pnl, 0)) AS total_pnl,
-                    AVG(COALESCE(net_pnl_pct, pnl_pct, 0)) AS average_pnl_pct,
+                    AVG(COALESCE(net_pnl_before_funding, net_pnl, pnl, 0)) AS average_net_pnl_before_funding,
+                    SUM(COALESCE(net_pnl_before_funding, net_pnl, pnl, 0)) AS total_net_pnl_before_funding,
+                    AVG(COALESCE(final_net_pnl_after_all_costs, net_pnl, pnl, 0)) AS average_pnl,
+                    SUM(COALESCE(final_net_pnl_after_all_costs, net_pnl, pnl, 0)) AS total_pnl,
+                    AVG(COALESCE(final_net_pnl_after_all_costs_pct, net_pnl_pct, pnl_pct, 0)) AS average_pnl_pct,
                     SUM(COALESCE(total_fees, fees_paid, 0)) AS total_fees_paid,
                     SUM(COALESCE(slippage_cost, 0)) AS total_slippage_paid,
                     SUM(COALESCE(spread_cost, 0)) AS total_spread_paid,
-                    SUM(COALESCE(funding_cost_estimate, 0)) AS total_funding_cost
+                    SUM(COALESCE(funding_cost_estimate, 0)) AS total_funding_cost,
+                    AVG(COALESCE(minimum_required_move_to_profit, 0)) AS average_required_move_to_break_even,
+                    AVG(CASE WHEN COALESCE(gross_pnl, pnl, 0) > 0 THEN COALESCE(gross_pnl, pnl, 0) END) AS average_gross_win,
+                    AVG(CASE WHEN COALESCE(final_net_pnl_after_all_costs, net_pnl, pnl, 0) < 0 THEN ABS(COALESCE(final_net_pnl_after_all_costs, net_pnl, pnl, 0)) END) AS average_net_loss
                 FROM simulated_trades
                 WHERE COALESCE(status, 'OPEN') <> 'OPEN'
                 """
@@ -2219,33 +2310,50 @@ class Database:
 
         closed_trades = int(row["closed_trades"] or 0)
         wins = int(row["wins"] or 0)
+        breakeven_count = int(row["breakeven_count"] or 0)
+        gross_win_net_loss_count = int(row["gross_win_net_loss_count"] or 0)
         gross_wins = int(row["gross_wins"] or 0)
         winrate = round((wins / closed_trades) * 100, 2) if closed_trades else 0.0
         gross_winrate = round((gross_wins / closed_trades) * 100, 2) if closed_trades else 0.0
+        total_fees_paid = float(row["total_fees_paid"] or 0.0)
+        total_slippage_paid = float(row["total_slippage_paid"] or 0.0)
+        total_spread_paid = float(row["total_spread_paid"] or 0.0)
+        total_funding_cost = float(row["total_funding_cost"] or 0.0)
+        total_cost_drag = total_fees_paid + total_slippage_paid + total_spread_paid + total_funding_cost
+        average_gross_win = float(row["average_gross_win"] or 0.0)
+        average_net_loss = float(row["average_net_loss"] or 0.0)
+        if average_gross_win > 0 and average_net_loss > 0:
+            breakeven_winrate = round((average_net_loss / (average_gross_win + average_net_loss)) * 100, 2)
+        elif average_gross_win > 0:
+            breakeven_winrate = 0.0
+        else:
+            breakeven_winrate = 100.0 if closed_trades else 0.0
         return {
             "closed_trades": closed_trades,
             "wins": wins,
             "winrate": winrate,
+            "net_wins": wins,
             "gross_wins": gross_wins,
             "gross_winrate": gross_winrate,
             "total_gross_pnl": round(float(row["total_gross_pnl"] or 0.0), 6),
+            "average_net_pnl_before_funding": round(float(row["average_net_pnl_before_funding"] or 0.0), 6),
+            "total_net_pnl_before_funding": round(float(row["total_net_pnl_before_funding"] or 0.0), 6),
             "average_pnl": round(float(row["average_pnl"] or 0.0), 6),
             "total_pnl": round(float(row["total_pnl"] or 0.0), 6),
             "average_pnl_pct": round(float(row["average_pnl_pct"] or 0.0), 6),
-            "total_fees_paid": round(float(row["total_fees_paid"] or 0.0), 6),
-            "total_slippage_paid": round(float(row["total_slippage_paid"] or 0.0), 6),
-            "total_spread_paid": round(float(row["total_spread_paid"] or 0.0), 6),
-            "total_funding_cost": round(float(row["total_funding_cost"] or 0.0), 6),
-            "gross_win_net_loss": max(gross_wins - wins, 0),
+            "total_fees_paid": round(total_fees_paid, 6),
+            "total_slippage_paid": round(total_slippage_paid, 6),
+            "total_spread_paid": round(total_spread_paid, 6),
+            "total_funding_cost": round(total_funding_cost, 6),
+            "total_cost_drag": round(total_cost_drag, 6),
+            "gross_win_net_loss": gross_win_net_loss_count,
+            "breakeven_count": breakeven_count,
             "average_cost_per_trade": round(
-                (
-                    float(row["total_fees_paid"] or 0.0)
-                    + float(row["total_slippage_paid"] or 0.0)
-                    + float(row["total_spread_paid"] or 0.0)
-                    + float(row["total_funding_cost"] or 0.0)
-                ) / max(closed_trades, 1),
+                total_cost_drag / max(closed_trades, 1),
                 6,
             ) if closed_trades else 0.0,
+            "average_required_move_to_break_even": round(float(row["average_required_move_to_break_even"] or 0.0), 6),
+            "breakeven_winrate_approx": breakeven_winrate,
         }
 
     def list_candle_counts(self) -> list[dict[str, Any]]:
@@ -2665,9 +2773,9 @@ class Database:
                 SELECT
                     symbol,
                     COUNT(*) AS trade_count,
-                    SUM(CASE WHEN outcome = 'WIN' THEN 1 ELSE 0 END) AS wins,
-                    AVG(COALESCE(net_pnl, pnl, 0)) AS average_net_pnl,
-                    SUM(COALESCE(net_pnl, pnl, 0)) AS total_net_pnl
+                    SUM(CASE WHEN outcome IN ('WIN_NET', 'WIN') THEN 1 ELSE 0 END) AS wins,
+                    AVG(COALESCE(final_net_pnl_after_all_costs, net_pnl, pnl, 0)) AS average_net_pnl,
+                    SUM(COALESCE(final_net_pnl_after_all_costs, net_pnl, pnl, 0)) AS total_net_pnl
                 FROM simulated_trades
                 WHERE COALESCE(status, 'OPEN') <> 'OPEN'
                 GROUP BY symbol
@@ -2683,9 +2791,9 @@ class Database:
                 SELECT
                     COALESCE(timeframe, '1m') AS timeframe,
                     COUNT(*) AS trade_count,
-                    SUM(CASE WHEN outcome = 'WIN' THEN 1 ELSE 0 END) AS wins,
-                    AVG(COALESCE(net_pnl, pnl, 0)) AS average_net_pnl,
-                    SUM(COALESCE(net_pnl, pnl, 0)) AS total_net_pnl
+                    SUM(CASE WHEN outcome IN ('WIN_NET', 'WIN') THEN 1 ELSE 0 END) AS wins,
+                    AVG(COALESCE(final_net_pnl_after_all_costs, net_pnl, pnl, 0)) AS average_net_pnl,
+                    SUM(COALESCE(final_net_pnl_after_all_costs, net_pnl, pnl, 0)) AS total_net_pnl
                 FROM simulated_trades
                 WHERE COALESCE(status, 'OPEN') <> 'OPEN'
                 GROUP BY COALESCE(timeframe, '1m')
@@ -2736,8 +2844,8 @@ class Database:
                 """
                 SELECT
                     COUNT(*) AS total,
-                    SUM(CASE WHEN COALESCE(pnl, 0) > 0 THEN 1 ELSE 0 END) AS wins,
-                    AVG(COALESCE(pnl_pct, 0)) AS average_pnl_pct
+                    SUM(CASE WHEN COALESCE(final_net_pnl_after_all_costs, net_pnl, pnl, 0) > 0 THEN 1 ELSE 0 END) AS wins,
+                    AVG(COALESCE(final_net_pnl_after_all_costs_pct, net_pnl_pct, pnl_pct, 0)) AS average_pnl_pct
                 FROM simulated_trades
                 WHERE COALESCE(status, 'OPEN') <> 'OPEN'
                   AND COALESCE(setup_signature, '') = ?
@@ -2828,13 +2936,17 @@ class Database:
             funding_cost_estimate=row["funding_cost_estimate"],
             notional_exposure=row["notional_exposure"],
             gross_pnl=row["gross_pnl"],
+            net_pnl_before_funding=row["net_pnl_before_funding"],
             net_pnl=row["net_pnl"],
             net_pnl_pct=row["net_pnl_pct"],
+            final_net_pnl_after_all_costs=row["final_net_pnl_after_all_costs"],
+            final_net_pnl_after_all_costs_pct=row["final_net_pnl_after_all_costs_pct"],
             fees_open=row["fees_open"],
             fees_close=row["fees_close"],
             total_fees=row["total_fees"],
             slippage_cost=row["slippage_cost"],
             spread_cost=row["spread_cost"],
+            total_cost_drag=row["total_cost_drag"],
             break_even_price=row["break_even_price"],
             minimum_required_move_to_profit=row["minimum_required_move_to_profit"],
             entry_context=row["entry_context"],
@@ -2884,11 +2996,15 @@ class Database:
                 leverage_simulated = COALESCE(leverage_simulated, 1),
                 funding_rate_estimate = COALESCE(funding_rate_estimate, 0),
                 funding_cost_estimate = COALESCE(funding_cost_estimate, 0),
+                net_pnl_before_funding = COALESCE(net_pnl_before_funding, net_pnl, pnl, 0),
                 fees_open = COALESCE(fees_open, 0),
                 fees_close = COALESCE(fees_close, 0),
                 total_fees = COALESCE(total_fees, fees_paid, 0),
                 slippage_cost = COALESCE(slippage_cost, 0),
                 spread_cost = COALESCE(spread_cost, 0),
+                final_net_pnl_after_all_costs = COALESCE(final_net_pnl_after_all_costs, net_pnl, pnl, 0),
+                final_net_pnl_after_all_costs_pct = COALESCE(final_net_pnl_after_all_costs_pct, net_pnl_pct, pnl_pct, 0),
+                total_cost_drag = COALESCE(total_cost_drag, total_fees, 0) + COALESCE(slippage_cost, 0) + COALESCE(spread_cost, 0) + COALESCE(funding_cost_estimate, 0),
                 slippage_pct = COALESCE(slippage_pct, 0),
                 created_at = COALESCE(created_at, ?),
                 updated_at = COALESCE(updated_at, ?)

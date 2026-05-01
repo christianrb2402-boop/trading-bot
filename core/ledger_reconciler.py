@@ -254,7 +254,9 @@ class LedgerReconciler:
                     pnl = COALESCE(pnl, 0),
                     net_pnl_pct = COALESCE(net_pnl_pct, 0),
                     pnl_pct = COALESCE(pnl_pct, 0),
-                    outcome = COALESCE(outcome, 'BREAKEVEN'),
+                    final_net_pnl_after_all_costs = COALESCE(final_net_pnl_after_all_costs, net_pnl, pnl, 0),
+                    final_net_pnl_after_all_costs_pct = COALESCE(final_net_pnl_after_all_costs_pct, net_pnl_pct, pnl_pct, 0),
+                    outcome = COALESCE(outcome, 'BREAKEVEN_NET'),
                     reason_exit = COALESCE(reason_exit, 'Reconciled duplicate setup'),
                     updated_at = ?
                 WHERE id = ?

@@ -63,6 +63,7 @@ class Settings:
     min_reward_risk_ratio: float
     min_net_reward_risk_ratio: float
     min_expected_net_edge_pct: float
+    min_cost_coverage_multiple: float
     max_cost_drag_pct: float
     allow_weak_signals: bool
     allow_medium_signals: bool
@@ -226,6 +227,7 @@ def load_settings() -> Settings:
         min_reward_risk_ratio=float(os.getenv("MIN_REWARD_RISK_RATIO", "1.5")),
         min_net_reward_risk_ratio=float(os.getenv("MIN_NET_REWARD_RISK_RATIO", "1.5")),
         min_expected_net_edge_pct=float(os.getenv("MIN_EXPECTED_NET_EDGE_PCT", "0.15")),
+        min_cost_coverage_multiple=float(os.getenv("MIN_COST_COVERAGE_MULTIPLE", "2.5")),
         max_cost_drag_pct=float(os.getenv("MAX_COST_DRAG_PCT", "0.35")),
         allow_weak_signals=_parse_bool(os.getenv("ALLOW_WEAK_SIGNALS", "true"), True),
         allow_medium_signals=_parse_bool(os.getenv("ALLOW_MEDIUM_SIGNALS", "true"), True),

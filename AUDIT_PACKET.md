@@ -6,9 +6,10 @@
 - No real trading was added.
 - No API keys are required.
 - No private order execution exists.
-- Multi-timeframe research, benchmark, walk-forward and ledger reconciliation are implemented.
-- The current Codex environment still cannot reach Binance HTTP and is not ready for a long live-paper run.
-- The strategy is still losing after fees, slippage and spread.
+- The new `NetProfitabilityGate` blocks trades that do not clearly cover costs.
+- The ledger is currently reconciled and consistent.
+- The current Codex environment is still not suitable for a long live-paper run because Binance HTTP fails here and local data is stale.
+- The strategy still does not have net-positive proof after costs.
 
 ## A. Architecture Summary
 
@@ -28,6 +29,7 @@
 - `SymbolSelectionAgent`
 - `RiskRewardAgent`
 - `CostModelAgent`
+- `NetProfitabilityGate`
 - `PerformanceLearningAgent`
 - `ExecutionSimulatorAgent`
 - `DecisionOrchestrator`
@@ -47,19 +49,23 @@
 ### Database / memory layer
 
 - SQLite at `runtime/market_data.db`
-- Candles, signals, rejections, context, decisions, simulated trades, portfolio, equity, benchmarks, walk-forward results and errors persisted
+- Candles, signals, rejected signals, context, decisions, simulated trades, portfolio, equity, benchmark, walk-forward and errors are persisted
 
 ### Reporting layer
 
 - `python main.py --status-report`
 - `python main.py --export-report`
 - `python main.py --export-report --format csv`
+- `python main.py --quick-audit`
+- `python main.py --preflight-live-paper`
 
 ## B. Current Commands Available
 
 - `python main.py --init-only`
 - `python main.py --diagnose-connectivity`
 - `python main.py --readiness-check`
+- `python main.py --quick-audit`
+- `python main.py --preflight-live-paper`
 - `python main.py --reconcile-ledger`
 - `python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 1m --limit 1000`
 - `python main.py --backtest --limit 5000 --timeframes "1m,5m,15m,30m,1h,4h,1d" --min-trades 100`
@@ -84,6 +90,32 @@ PowerShell note:
 - Important output:
   - SQLite initialized successfully
 
+### `python main.py --quick-audit`
+
+- Status: PASSED
+- Important output:
+  - `SAFE_TO_RUN_SHORT_PAPER: NO`
+  - `SAFE_TO_RUN_LONG_PAPER: NO`
+  - `STRATEGY_NET_PROFITABLE: NO`
+- Main reasons:
+  - Binance HTTP probes fail in this environment
+  - local BTCUSDT and ETHUSDT candles are stale
+  - `BNBUSDT`, `SOLUSDT`, `XRPUSDT` have no local history
+  - severe gaps exist in required timeframes
+  - historical final net pnl remains non-positive
+
+### `python main.py --preflight-live-paper`
+
+- Status: BLOCKED CORRECTLY
+- Process exit code:
+  - `1`
+- Important output:
+  - `SAFE_TO_RUN_SHORT_PAPER: NO`
+  - `SAFE_TO_RUN_LONG_PAPER: NO`
+  - `STRATEGY_NET_PROFITABLE: NO`
+- Main reason:
+  - Binance HTTP is not usable here, fresh data is unavailable and stale fallback was not explicitly allowed
+
 ### `python main.py --diagnose-connectivity`
 
 - Status: PASSED as a command
@@ -107,106 +139,25 @@ PowerShell note:
   - `equity_check=0.0`
   - `result=OK`
 
-### `python main.py --status-report`
-
-- Status: PASSED
-- Important output after final reconciliation:
-  - `Current provider: LOCAL_SQLITE`
-  - `Ledger Consistency Check: OK`
-  - `Signals by symbol: BTCUSDT=2335, ETHUSDT=2335`
-  - `Closed simulated trades: 159`
-  - `Net winrate: 5.03%`
-  - `Total net pnl: -59.309828`
-
-### `python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 1m --limit 1000`
-
-- Status: FAILED
-- Important output:
-  - `successful_symbols=[]`
-  - `failed_symbols=['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT']`
-  - `candles_inserted=0`
-- Error:
-  - `Error consultando Binance: <urlopen error [WinError 10061] ...>`
-- Probable file:
-  - `data/binance_market_data.py`
-- Recommendation:
-  - run this command on the fixed Windows machine without VPN
-
-### `python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 5m --limit 1000`
-
-- Status: FAILED
-- Error:
-  - `WinError 10061`
-
-### `python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 15m --limit 1000`
-
-- Status: FAILED
-- Error:
-  - `WinError 10061`
-
-### `python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 30m --limit 1000`
-
-- Status: FAILED
-- Error:
-  - `WinError 10061`
-
-### `python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 1h --limit 1000`
-
-- Status: FAILED
-- Error:
-  - `WinError 10061`
-
-### `python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 4h --limit 1000`
-
-- Status: FAILED
-- Error:
-  - `WinError 10061`
-
-### `python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 1d --limit 1000`
-
-- Status: FAILED
-- Error:
-  - `WinError 10061`
-
-### `python main.py --readiness-check`
-
-- Status: PASSED as a command
-- Result:
-  - `READY_FOR_LIVE_PAPER: NO`
-  - `Current mode recommended: DO_NOT_RUN_LONG`
-- Important output:
-  - Binance reachable: `NO`
-  - Fresh data available: `NO`
-  - Missing symbols: `BNBUSDT`, `SOLUSDT`, `XRPUSDT`
-  - Stale symbols: `BTCUSDT`, `ETHUSDT`
-
-### `python main.py --backtest --limit 5000 --timeframes "1m,5m,15m,30m,1h,4h,1d" --min-trades 100`
-
-- Status: PASSED
-- Important output:
-  - `Events processed: 4670`
-  - `Trades opened: 159`
-  - `Trades closed: 159`
-  - `Winrate: 5.03%`
-  - `Total pnl: -59.309828`
-
 ### `python main.py --benchmark --limit 5000 --timeframes "1m,5m,15m,30m,1h,4h,1d"`
 
 - Status: PASSED
 - Important output:
-  - `BOT_STRATEGY trades=156 winrate=4.49% net_pnl=-59.431848`
-  - `BUY_AND_HOLD net_pnl=-12.278755`
-  - `RANDOM_ENTRY net_pnl=-50.544552`
+  - `BOT_STRATEGY trades=0 winrate=0.0% net_pnl=0.0`
+  - `BUY_AND_HOLD net_pnl=-28.418214`
+  - `RANDOM_ENTRY net_pnl=-5.6261`
   - `TREND_FOLLOWING_BASELINE net_pnl=-63.769936`
   - `NO_TRADE net_pnl=0.0`
+- Interpretation:
+  - the new cost-aware gate is strict enough to suppress trading under stale, poor-quality local conditions
 
-### `python main.py --walk-forward --limit 10000 --train-pct 70`
+### `python main.py --walk-forward --limit 10000 --train-pct 70 --timeframes "1m,5m,15m,30m,1h,4h,1d"`
 
 - Status: PASSED
 - Important output:
-  - `Selected relaxation: 0.3`
-  - `Train net_pnl: -26.166546`
-  - `Test net_pnl: -7.17661`
+  - `Selected relaxation: 1.0`
+  - `Train trades: 0 net_pnl=0.0`
+  - `Test trades: 0 net_pnl=0.0`
   - `Survived out of sample: False`
 
 ### `python main.py --live-paper-engine --max-loops 5`
@@ -214,12 +165,21 @@ PowerShell note:
 - Status: PASSED
 - Important output:
   - `Loops completed: 5`
-  - `Decisions persisted: 595`
+  - `Decisions persisted: 665`
   - `Trades opened: 0`
   - `Trades closed: 0`
 - Interpretation:
   - bounded fallback execution is safe
-  - no fresh live Binance data was used here
+  - the engine is refusing weak or stale setups instead of forcing activity
+
+### `python main.py --status-report`
+
+- Status: PASSED
+- Important output:
+  - `Current provider: LOCAL_SQLITE`
+  - `Ledger Consistency Check: OK`
+  - `SAFE_TO_RUN_LONG_PAPER: NO`
+  - `closed simulated trades: 0`
 
 ### `python main.py --export-report`
 
@@ -231,62 +191,51 @@ PowerShell note:
 
 - Status: PASSED
 - Important output:
-  - exported CSV bundle to `runtime`
+  - exported CSV bundle successfully
 
 ## D. Current Results
 
-- Candles total:
+- Candles:
   - `BTCUSDT 1m=1011`
   - `ETHUSDT 1m=1011`
-  - materialized higher timeframes only for BTC/ETH
-- Signals total:
-  - `BTCUSDT=2335`
-  - `ETHUSDT=2335`
+  - higher timeframes materialized only for BTCUSDT and ETHUSDT
 - Decisions total:
-  - `4670`
-- Simulated trades total:
-  - `159`
+  - `3986`
 - Open positions:
   - `0`
-- Closed positions:
-  - `159`
-- Gross winrate:
-  - `7.55%`
-- Net winrate:
-  - `5.03%`
-- Gross pnl:
-  - `-16.388537`
-- Net pnl:
-  - `-59.309828`
-- Fees:
-  - `31.791287`
-- Slippage:
-  - `7.95`
-- Spread:
-  - `3.18`
+- Open simulated trades:
+  - `0`
+- Closed simulated trades:
+  - `0`
+- Current simulated equity:
+  - `1000.0`
+- Total fees:
+  - `0.0`
+- Total slippage:
+  - `0.0`
+- Total spread:
+  - `0.0`
 - Funding estimate:
   - `0.0`
-- Current simulated equity:
-  - `940.690172`
 
 Interpretation:
-- The strategy is losing.
-- It is losing after all modeled costs.
-- It is not ready for profitability claims.
+- The current database snapshot after benchmark resets and reconciliation ends flat, not profitable.
+- This does not prove the strategy is good.
+- It proves the new gating is refusing low-quality trades under bad data conditions.
 
 ## E. Data Health
 
 ### Fixed Windows machine
 
-- Operator validation says Binance HTTP is usable.
-- This is the intended runtime target.
+- Binance HTTP is reported usable there by direct Python tests.
+- That machine is still the intended target for longer live-paper validation.
 
 ### Current Codex environment
 
-- Current provider used in validation: `LOCAL_SQLITE`
+- Provider used in validation: `LOCAL_SQLITE`
 - Binance connectivity status: FAIL
 - Fallback status: working
-- Stale data status: YES for intraday timeframes
+- Stale data status: YES
 - Missing symbols: `BNBUSDT`, `SOLUSDT`, `XRPUSDT`
 - Data gaps: YES
 - Valid enough for long live-paper execution here: `NO`
@@ -298,34 +247,35 @@ Interpretation:
 - Private order execution exists? `NO`
 - System is safe for paper simulation? `YES`
 - System is ready for long live-paper run in current Codex environment? `NO`
-- System is prepared for validation on the fixed Windows machine? `YES`
+- System is prepared for fixed-Windows validation? `YES`
 
 ## G. Remaining Risks
 
 - Binance HTTP is still blocked in the current Codex environment.
 - Local historical dataset is incomplete and stale here.
 - Symbol coverage is still missing for `BNBUSDT`, `SOLUSDT`, `XRPUSDT`.
-- Strategy performance is clearly negative after costs.
-- Overfitting risk remains high because out-of-sample walk-forward failed.
+- Severe time gaps exist in the local BTCUSDT and ETHUSDT datasets.
+- The strategy still lacks net-positive proof after costs.
+- Walk-forward did not survive out of sample.
 - No dashboard yet.
 - No macro/news context sources yet.
-- Full live committee logic is strongest in `live_paper_engine`; historical engines still need future harmonization if we want exact committee parity later.
-- If `--timeframes` is not quoted in PowerShell, values like `1d` can be distorted.
 
 ## H. Tomorrow's Recommended Next Step
 
 1. Go to the fixed Windows machine without VPN.
 2. Run `python main.py --diagnose-connectivity`.
-3. Load fresh history for `1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`.
-4. Run `python main.py --readiness-check`.
-5. Run `python main.py --reconcile-ledger`.
-6. Run `python main.py --benchmark --limit 5000 --timeframes "1m,5m,15m,30m,1h,4h,1d"`.
-7. Only if readiness recommends `LIVE_BINANCE`, run `python main.py --live-paper-engine --run-minutes 60`.
+3. Run `python main.py --quick-audit`.
+4. Run `python main.py --preflight-live-paper`.
+5. Load fresh history for `1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`.
+6. Run `python main.py --readiness-check`.
+7. Run `python main.py --reconcile-ledger`.
+8. Only if preflight and readiness both approve, run `python main.py --live-paper-engine --run-minutes 60`.
 
 ## Bottom Line
 
 - Safe to continue tomorrow: `YES`
 - Safe to start real trading: `NO`
 - Safe to run bounded paper validation: `YES`
+- Strategy net profitable today: `NO`
 - Ready for 60-minute live paper in the current Codex environment: `NO`
-- Potentially ready for 60-minute live paper on the fixed Windows machine after connectivity, history load and readiness all pass there: `YES`
+- Potentially ready for 60-minute live paper on the fixed Windows machine after connectivity, history load, readiness and preflight all pass there: `YES`

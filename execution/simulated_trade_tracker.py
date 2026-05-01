@@ -204,16 +204,42 @@ class SimulatedTradeTracker:
                 drawdown=0.0,
             )
 
-        wins = sum(1 for trade in closed_trades if (trade.net_pnl or trade.pnl or 0.0) > 0)
+        wins = sum(
+            1
+            for trade in closed_trades
+            if (
+                trade.final_net_pnl_after_all_costs
+                if trade.final_net_pnl_after_all_costs is not None
+                else (trade.net_pnl if trade.net_pnl is not None else (trade.pnl or 0.0))
+            ) > 0
+        )
         cumulative = 0.0
         peak = 0.0
         max_drawdown = 0.0
         for trade in closed_trades:
-            cumulative += trade.net_pnl if trade.net_pnl is not None else (trade.pnl or 0.0)
+            cumulative += (
+                trade.final_net_pnl_after_all_costs
+                if trade.final_net_pnl_after_all_costs is not None
+                else (trade.net_pnl if trade.net_pnl is not None else (trade.pnl or 0.0))
+            )
             peak = max(peak, cumulative)
             max_drawdown = min(max_drawdown, cumulative - peak)
-        average_pnl = sum((trade.net_pnl if trade.net_pnl is not None else (trade.pnl or 0.0)) for trade in closed_trades) / len(closed_trades)
-        average_pnl_pct = sum((trade.net_pnl_pct if trade.net_pnl_pct is not None else (trade.pnl_pct or 0.0)) for trade in closed_trades) / len(closed_trades)
+        average_pnl = sum(
+            (
+                trade.final_net_pnl_after_all_costs
+                if trade.final_net_pnl_after_all_costs is not None
+                else (trade.net_pnl if trade.net_pnl is not None else (trade.pnl or 0.0))
+            )
+            for trade in closed_trades
+        ) / len(closed_trades)
+        average_pnl_pct = sum(
+            (
+                trade.final_net_pnl_after_all_costs_pct
+                if trade.final_net_pnl_after_all_costs_pct is not None
+                else (trade.net_pnl_pct if trade.net_pnl_pct is not None else (trade.pnl_pct or 0.0))
+            )
+            for trade in closed_trades
+        ) / len(closed_trades)
         return SimulatedTradeStats(
             symbol=symbol,
             total_trades=len(open_trades) + len(closed_trades),
@@ -475,8 +501,10 @@ class SimulatedTradeTracker:
             gross_pnl = (trade.entry_price - exit_price) * quantity
         else:
             gross_pnl = (exit_price - trade.entry_price) * quantity
-        net_pnl = gross_pnl - total_fees - (trade.slippage_cost or 0.0) - (trade.spread_cost or 0.0) - (trade.funding_cost_estimate or 0.0)
-        net_pnl_pct = (net_pnl / self._position_size_usd) * 100 if self._position_size_usd else 0.0
+        net_pnl_before_funding = gross_pnl - total_fees - (trade.slippage_cost or 0.0) - (trade.spread_cost or 0.0)
+        final_net_pnl = net_pnl_before_funding - (trade.funding_cost_estimate or 0.0)
+        final_net_pnl_pct = (final_net_pnl / self._position_size_usd) * 100 if self._position_size_usd else 0.0
+        total_cost_drag = total_fees + (trade.slippage_cost or 0.0) + (trade.spread_cost or 0.0) + (trade.funding_cost_estimate or 0.0)
 
         entry_dt = datetime.fromisoformat(trade.entry_time)
         exit_dt = datetime.fromisoformat(exit_time)
@@ -509,14 +537,14 @@ class SimulatedTradeTracker:
             max_favorable_excursion = max((((candle.high - trade.entry_price) / trade.entry_price) * 100) for candle in path_candles)
             max_adverse_excursion = min((((candle.low - trade.entry_price) / trade.entry_price) * 100) for candle in path_candles)
 
-        if net_pnl > 0:
-            outcome = "WIN"
-        elif gross_pnl > 0 and net_pnl <= 0:
-            outcome = "GROSS_WIN_NET_LOSS"
-        elif net_pnl < 0:
-            outcome = "LOSS"
+        if final_net_pnl > 0:
+            outcome = "WIN_NET"
+        elif gross_pnl > 0 and final_net_pnl < 0:
+            outcome = "WIN_GROSS_ONLY_NET_LOSS"
+        elif final_net_pnl < 0:
+            outcome = "LOSS_NET"
         else:
-            outcome = "BREAKEVEN"
+            outcome = "BREAKEVEN_NET"
 
         self._database.close_simulated_trade(
             trade_id=trade.id,
@@ -524,30 +552,36 @@ class SimulatedTradeTracker:
             exit_time=exit_time,
             exit_price=round(exit_price, 6),
             fees_paid=round(total_fees, 6),
-            pnl=round(net_pnl, 6),
-            pnl_pct=round(net_pnl_pct, 6),
+            pnl=round(final_net_pnl, 6),
+            pnl_pct=round(final_net_pnl_pct, 6),
             outcome=outcome,
             duration_seconds=duration_seconds,
             max_favorable_excursion=round(max_favorable_excursion, 6),
             max_adverse_excursion=round(max_adverse_excursion, 6),
             reason_exit=reason_exit,
             gross_pnl=round(gross_pnl, 6),
-            net_pnl=round(net_pnl, 6),
-            net_pnl_pct=round(net_pnl_pct, 6),
+            net_pnl_before_funding=round(net_pnl_before_funding, 6),
+            net_pnl=round(final_net_pnl, 6),
+            net_pnl_pct=round(final_net_pnl_pct, 6),
+            final_net_pnl_after_all_costs=round(final_net_pnl, 6),
+            final_net_pnl_after_all_costs_pct=round(final_net_pnl_pct, 6),
             fees_close=round(fees_close, 6),
             total_fees=round(total_fees, 6),
             slippage_cost=round(trade.slippage_cost or 0.0, 6),
             spread_cost=round(trade.spread_cost or 0.0, 6),
             funding_cost_estimate=round(trade.funding_cost_estimate or 0.0, 6),
+            total_cost_drag=round(total_cost_drag, 6),
             exit_context=json.dumps(exit_context or {}, ensure_ascii=True),
             cost_snapshot=json.dumps(
                 {
                     "gross_pnl": round(gross_pnl, 6),
-                    "net_pnl": round(net_pnl, 6),
+                    "net_pnl_before_funding": round(net_pnl_before_funding, 6),
+                    "final_net_pnl_after_all_costs": round(final_net_pnl, 6),
                     "total_fees": round(total_fees, 6),
                     "slippage_cost": round(trade.slippage_cost or 0.0, 6),
                     "spread_cost": round(trade.spread_cost or 0.0, 6),
                     "funding_cost_estimate": round(trade.funding_cost_estimate or 0.0, 6),
+                    "total_cost_drag": round(total_cost_drag, 6),
                 },
                 ensure_ascii=True,
             ),
@@ -564,8 +598,10 @@ class SimulatedTradeTracker:
                     "entry_price": trade.entry_price,
                     "exit_price": round(exit_price, 6),
                     "gross_pnl": round(gross_pnl, 6),
-                    "net_pnl": round(net_pnl, 6),
-                    "net_pnl_pct": round(net_pnl_pct, 6),
+                    "net_pnl_before_funding": round(net_pnl_before_funding, 6),
+                    "final_net_pnl_after_all_costs": round(final_net_pnl, 6),
+                    "final_net_pnl_after_all_costs_pct": round(final_net_pnl_pct, 6),
+                    "total_cost_drag": round(total_cost_drag, 6),
                     "outcome": outcome,
                     "duration_seconds": duration_seconds,
                     "max_favorable_excursion": round(max_favorable_excursion, 6),

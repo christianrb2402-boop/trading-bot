@@ -37,11 +37,14 @@ class PerformanceAnalyzer:
 
     def _build_report(self, closed_trades: Sequence[SimulatedTradeRecord]) -> dict[str, object]:
         total_trades = len(closed_trades)
-        wins = sum(1 for trade in closed_trades if trade.outcome == "WIN")
-        losses = sum(1 for trade in closed_trades if trade.outcome in {"LOSS", "GROSS_WIN_NET_LOSS"})
-        breakeven = sum(1 for trade in closed_trades if trade.outcome == "BREAKEVEN")
-        gross_win_net_loss = sum(1 for trade in closed_trades if trade.outcome == "GROSS_WIN_NET_LOSS")
-        average_pnl = sum((trade.pnl or 0.0) for trade in closed_trades) / total_trades if total_trades else 0.0
+        wins = sum(1 for trade in closed_trades if trade.outcome in {"WIN_NET", "WIN"})
+        losses = sum(1 for trade in closed_trades if trade.outcome in {"LOSS_NET", "LOSS", "WIN_GROSS_ONLY_NET_LOSS", "GROSS_WIN_NET_LOSS"})
+        breakeven = sum(1 for trade in closed_trades if trade.outcome in {"BREAKEVEN_NET", "BREAKEVEN"})
+        gross_win_net_loss = sum(1 for trade in closed_trades if trade.outcome in {"WIN_GROSS_ONLY_NET_LOSS", "GROSS_WIN_NET_LOSS"})
+        average_pnl = sum(
+            (trade.final_net_pnl_after_all_costs if trade.final_net_pnl_after_all_costs is not None else (trade.net_pnl or trade.pnl or 0.0))
+            for trade in closed_trades
+        ) / total_trades if total_trades else 0.0
         best_setups = self._aggregate_by_key(closed_trades, key_name="setup_signature")
         trend_performance = self._aggregate_by_key(closed_trades, key_name="entry_trend")
         volatility_performance = self._aggregate_by_key(closed_trades, key_name="entry_volatility_bucket")
@@ -94,9 +97,15 @@ class PerformanceAnalyzer:
 
         rows: list[SetupPerformance] = []
         for key_value, group in grouped.items():
-            wins = sum(1 for trade in group if trade.outcome == "WIN")
-            average_pnl = sum((trade.pnl or 0.0) for trade in group) / len(group)
-            average_pnl_pct = sum((trade.pnl_pct or 0.0) for trade in group) / len(group)
+            wins = sum(1 for trade in group if trade.outcome in {"WIN_NET", "WIN"})
+            average_pnl = sum(
+                (trade.final_net_pnl_after_all_costs if trade.final_net_pnl_after_all_costs is not None else (trade.net_pnl or trade.pnl or 0.0))
+                for trade in group
+            ) / len(group)
+            average_pnl_pct = sum(
+                (trade.final_net_pnl_after_all_costs_pct if trade.final_net_pnl_after_all_costs_pct is not None else (trade.net_pnl_pct or trade.pnl_pct or 0.0))
+                for trade in group
+            ) / len(group)
             rows.append(
                 SetupPerformance(
                     setup_key=key_value,

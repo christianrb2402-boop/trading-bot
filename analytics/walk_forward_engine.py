@@ -8,6 +8,7 @@ from typing import Sequence
 from agents.cost_model_agent import CostModelAgent
 from agents.delta_agent import DeltaAgent
 from agents.market_context_agent import MarketContextAgent
+from agents.net_profitability_gate import NetProfitabilityGate
 from config.settings import Settings
 from core.database import Database, StoredCandle
 
@@ -47,12 +48,14 @@ class WalkForwardEngine:
         delta_agent: DeltaAgent,
         market_context_agent: MarketContextAgent,
         cost_model_agent: CostModelAgent,
+        net_profitability_gate: NetProfitabilityGate,
     ) -> None:
         self._database = database
         self._settings = settings
         self._delta_agent = delta_agent
         self._market_context_agent = market_context_agent
         self._cost_model_agent = cost_model_agent
+        self._net_profitability_gate = net_profitability_gate
 
     def run(
         self,
@@ -145,9 +148,14 @@ class WalkForwardEngine:
                 position_size_usd=self._settings.simulated_position_size_usd,
                 volatility_pct=float(signal.get("volatility_pct", 0.0)),
             )
+            gate = self._net_profitability_gate.evaluate(signal=signal, cost_snapshot=cost)
+            if not gate.approved:
+                index += 1
+                continue
             exit_index = min(len(candles) - 1, index + self._settings.simulated_max_hold_candles)
             exit_candle = candles[exit_index]
-            pnl_pct = self._trade_return_pct(current.close, exit_candle.close, str(signal["signal_type"])) - float(cost.minimum_profitable_move_pct)
+            raw_move_pct = self._trade_return_pct(current.close, exit_candle.close, str(signal["signal_type"]))
+            pnl_pct = raw_move_pct - float(cost.minimum_profitable_move_pct) - float(cost.funding_rate_estimate)
             trade_count += 1
             net_pnl += pnl_pct
             wins += 1 if pnl_pct > 0 else 0

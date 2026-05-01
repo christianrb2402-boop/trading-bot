@@ -14,6 +14,7 @@ from agents.delta_agent import DeltaAgent
 from agents.execution_simulator_agent import ExecutionSimulatorAgent
 from agents.market_context_agent import MarketContextAgent
 from agents.market_data_agent import MarketDataAgent
+from agents.net_profitability_gate import NetProfitabilityGate
 from agents.performance_learning_agent import PerformanceLearningAgent
 from agents.risk_reward_agent import RiskRewardAgent
 from agents.symbol_selection_agent import SymbolSelectionAgent
@@ -56,6 +57,7 @@ class LivePaperEngine:
         risk_reward_agent: RiskRewardAgent,
         cost_model_agent: CostModelAgent,
         performance_learning_agent: PerformanceLearningAgent,
+        net_profitability_gate: NetProfitabilityGate,
         symbol_selection_agent: SymbolSelectionAgent,
         execution_simulator_agent: ExecutionSimulatorAgent,
         audit_agent: AuditAgent,
@@ -71,6 +73,7 @@ class LivePaperEngine:
         self._risk_reward_agent = risk_reward_agent
         self._cost_model_agent = cost_model_agent
         self._performance_learning_agent = performance_learning_agent
+        self._net_profitability_gate = net_profitability_gate
         self._symbol_selection_agent = symbol_selection_agent
         self._execution_simulator_agent = execution_simulator_agent
         self._audit_agent = audit_agent
@@ -340,6 +343,18 @@ class LivePaperEngine:
             reasoning_summary=risk_reward.reason,
             provider_used=provider_result.provider_used,
         )
+        net_gate = self._net_profitability_gate.evaluate(signal=signal, cost_snapshot=cost_snapshot)
+        self._persist_agent_decision(
+            timestamp=str(signal["timestamp"]),
+            agent_name="NetProfitabilityGate",
+            symbol=symbol,
+            timeframe=timeframe,
+            decision=net_gate.vote,
+            confidence=net_gate.confidence,
+            inputs=net_gate.as_dict(),
+            reasoning_summary=net_gate.reason,
+            provider_used=provider_result.provider_used,
+        )
 
         symbol_selection = self._symbol_selection_agent.evaluate(
             symbol=symbol,
@@ -385,6 +400,7 @@ class LivePaperEngine:
             AgentVote("MarketDataAgent", "OK" if stale_fallback_allowed else assessment.vote, market_data_confidence, notes_text or "validation complete"),
             AgentVote("DeltaAgent", str(signal["signal_type"]), float(signal["confidence"]), str(signal["reason"]), tuple(signal.get("risks_detected", ()))),
             AgentVote("RiskRewardAgent", risk_reward.vote, risk_reward.confidence, risk_reward.reason),
+            AgentVote("NetProfitabilityGate", net_gate.vote, net_gate.confidence, net_gate.reason, net_gate.rejection_reasons),
             AgentVote("SymbolSelectionAgent", "OK" if symbol_selection.tradable_today else "REJECT", float(symbol_selection.symbol_score), symbol_selection.reason),
             AgentVote("PerformanceLearningAgent", learning.vote, abs(learning.confidence_adjustment), learning.reason),
         ]
@@ -418,16 +434,25 @@ class LivePaperEngine:
         audit = self._audit_agent.explain_entry(
             final_decision=orchestrated.final_decision,
             approved=orchestrated.approved,
+            direction=str(signal.get("direction", signal["signal_type"])),
+            timeframe=timeframe,
+            setup=str(signal.get("setup_signature", "UNKNOWN")),
+            confidence=orchestrated.final_confidence,
             signal_reason=str(signal["reason"]),
             risk_reason=risk_reward.reason,
+            net_gate_reason=net_gate.reason,
             learning_reason=learning.reason,
             cost_snapshot=cost_snapshot.as_dict(),
+            expected_move_pct=float(net_gate.expected_move_pct),
+            invalidation_price=float(net_gate.invalidation_price),
+            close_condition=str(net_gate.close_condition),
             committee_notes=orchestrated.committee_notes,
         )
 
         signal["agent_votes"] = [vote.as_dict() for vote in votes]
         signal["risk_reward_snapshot"] = risk_reward.as_dict()
         signal["cost_snapshot"] = cost_snapshot.as_dict()
+        signal["net_profitability_gate"] = net_gate.as_dict()
         signal["timeframe_alignment"] = timeframe_alignment.timeframe_alignment
         signal["dominant_trend_timeframe"] = timeframe_alignment.dominant_trend_timeframe
         signal["execution_timeframe"] = timeframe_alignment.execution_timeframe
@@ -447,6 +472,15 @@ class LivePaperEngine:
         signal["decision_type"] = orchestrated.decision_type
         signal["signal_type"] = "NONE" if not orchestrated.approved else orchestrated.final_decision
         signal["leverage_simulated"] = self._settings.simulated_default_leverage
+        signal["expected_move_pct"] = net_gate.expected_move_pct
+        signal["expected_move_value"] = net_gate.expected_move_value
+        signal["expected_net_edge_pct"] = net_gate.expected_net_edge_pct
+        signal["expected_net_edge_value"] = net_gate.expected_net_edge_value
+        signal["break_even_price"] = net_gate.break_even_price
+        signal["minimum_required_move_pct"] = net_gate.minimum_required_move_pct
+        signal["cost_coverage_multiple"] = net_gate.cost_coverage_multiple
+        signal["close_condition"] = net_gate.close_condition
+        signal["invalidation_price"] = net_gate.invalidation_price
 
         self._handle_live_exit_overrides(symbol=symbol, timeframe=timeframe, latest_candle=latest_candle, market_context=market_context)
         execution_result = self._execution_simulator_agent.process_cycle(
@@ -499,7 +533,7 @@ class LivePaperEngine:
                 },
             },
         )
-        return 7, int(execution_result.cycle_result.opened), int(execution_result.cycle_result.closed)
+        return 8, int(execution_result.cycle_result.opened), int(execution_result.cycle_result.closed)
 
     def _build_timeframe_contexts(
         self,

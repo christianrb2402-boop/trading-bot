@@ -8,7 +8,10 @@ from typing import Sequence
 
 from agents.delta_agent import DeltaAgent
 from agents.market_context_agent import MarketContextAgent
+from agents.net_profitability_gate import NetProfitabilityGate
+from agents.cost_model_agent import CostModelAgent
 from analytics.performance_analyzer import PerformanceAnalyzer
+from config.settings import Settings
 from core.database import (
     AgentDecisionRecord,
     Database,
@@ -59,14 +62,20 @@ class BacktestEngine:
         self,
         *,
         database: Database,
+        settings: Settings,
         delta_agent: DeltaAgent,
         market_context_agent: MarketContextAgent,
+        cost_model_agent: CostModelAgent,
+        net_profitability_gate: NetProfitabilityGate,
         simulated_trade_tracker: SimulatedTradeTracker,
         performance_analyzer: PerformanceAnalyzer,
     ) -> None:
         self._database = database
+        self._settings = settings
         self._delta_agent = delta_agent
         self._market_context_agent = market_context_agent
+        self._cost_model_agent = cost_model_agent
+        self._net_profitability_gate = net_profitability_gate
         self._simulated_trade_tracker = simulated_trade_tracker
         self._performance_analyzer = performance_analyzer
 
@@ -170,6 +179,27 @@ class BacktestEngine:
                 market_context=market_context,
                 relaxation_factor=relaxation_factor,
             )
+            if str(signal["signal_type"]) in {"LONG", "SHORT"}:
+                cost_snapshot = self._cost_model_agent.estimate(
+                    entry_price=current_candle.close,
+                    direction=str(signal["signal_type"]),
+                    position_size_usd=self._settings.simulated_position_size_usd,
+                    volatility_pct=float(signal.get("volatility_pct", 0.0)),
+                )
+                net_gate = self._net_profitability_gate.evaluate(signal=signal, cost_snapshot=cost_snapshot)
+                signal["cost_snapshot"] = cost_snapshot.as_dict()
+                signal["net_profitability_gate"] = net_gate.as_dict()
+                signal["expected_move_pct"] = net_gate.expected_move_pct
+                signal["expected_net_edge_pct"] = net_gate.expected_net_edge_pct
+                signal["cost_coverage_multiple"] = net_gate.cost_coverage_multiple
+                signal["invalidation_price"] = net_gate.invalidation_price
+                signal["close_condition"] = net_gate.close_condition
+                if not net_gate.approved:
+                    self._log_rejected_signal(signal=signal, rejection_reason=net_gate.reason)
+                    signal["signal_type"] = "NONE"
+                    signal["decision_type"] = "NO_TRADE"
+                    signal["reason"] = net_gate.reason
+                    signal["explanation"] = net_gate.reason
             signal_id = self._database.insert_signal_log(
                 SignalLogRecord(
                     symbol=event.symbol,

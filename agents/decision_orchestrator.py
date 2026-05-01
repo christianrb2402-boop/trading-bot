@@ -187,7 +187,7 @@ class DecisionOrchestrator:
         if signal_tier == "STRONG" and not self._settings.allow_strong_signals:
             return self._reject("Rejected because strong signals are disabled.", notes, timeframe_alignment)
 
-        for agent_name in ("MarketDataAgent", "RiskRewardAgent", "SymbolSelectionAgent"):
+        for agent_name in ("MarketDataAgent", "RiskRewardAgent", "NetProfitabilityGate", "SymbolSelectionAgent"):
             vote = vote_map.get(agent_name)
             if vote and vote.vote == "REJECT":
                 return self._reject(vote.reason, notes, timeframe_alignment)

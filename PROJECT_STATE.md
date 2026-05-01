@@ -7,8 +7,8 @@
 - Do not enable real-money trading.
 - Do not require private API keys.
 - Use public Binance HTTP market data when reachable.
-- Fall back to local SQLite only as an emergency or bounded validation path.
-- Force every paper trade to justify costs before opening.
+- Use `LOCAL_SQLITE` only as safe fallback or bounded validation mode.
+- Reject trades that do not show a clear expected net edge after costs.
 
 ## Implemented Modules
 
@@ -26,6 +26,7 @@
 - `agents/symbol_selection_agent.py`
 - `agents/risk_reward_agent.py`
 - `agents/cost_model_agent.py`
+- `agents/net_profitability_gate.py`
 - `agents/performance_learning_agent.py`
 - `agents/execution_simulator_agent.py`
 - `agents/decision_orchestrator.py`
@@ -48,6 +49,7 @@
 - `SymbolSelectionAgent`
 - `RiskRewardAgent`
 - `CostModelAgent`
+- `NetProfitabilityGate`
 - `PerformanceLearningAgent`
 - `ExecutionSimulatorAgent`
 - `DecisionOrchestrator`
@@ -59,6 +61,8 @@
 - `python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 1m --limit 1000`
 - `python main.py --diagnose-connectivity`
 - `python main.py --readiness-check`
+- `python main.py --quick-audit`
+- `python main.py --preflight-live-paper`
 - `python main.py --reconcile-ledger`
 - `python main.py --backtest --limit 5000 --timeframes "1m,5m,15m,30m,1h,4h,1d" --min-trades 100`
 - `python main.py --benchmark --limit 5000 --timeframes "1m,5m,15m,30m,1h,4h,1d"`
@@ -79,8 +83,7 @@
 - `STRUCTURAL_TIMEFRAMES=1w,1M`
 
 PowerShell note:
-- For CLI runs using `--timeframes`, quote the value.
-- Example: `--timeframes "1m,5m,15m,30m,1h,4h,1d"`
+- quote `--timeframes` values, for example `--timeframes "1m,5m,15m,30m,1h,4h,1d"`
 
 ## Active Symbol Universe
 
@@ -90,7 +93,7 @@ PowerShell note:
   - `BNBUSDT`
   - `SOLUSDT`
   - `XRPUSDT`
-- Watchlist prepared but disabled by default:
+- Watchlist prepared but disabled:
   - `DOGEUSDT`
   - `ADAUSDT`
   - `AVAXUSDT`
@@ -125,102 +128,85 @@ PowerShell note:
 
 ## What Is Working
 
-- SQLite initialization and safe schema migration.
+- SQLite initialization and safe migrations.
+- Real HTTP connectivity diagnosis against Binance endpoints.
 - Historical backtest with no future leakage.
 - Benchmark mode against multiple baselines.
 - Walk-forward split with out-of-sample evaluation.
-- Cost-aware simulated trades with gross and net PnL separated.
-- Ledger reconciliation and consistency reporting.
-- Duplicate setup rejection by `symbol/timeframe/direction/entry_time/setup_signature`.
-- Multi-timeframe context storage and reporting.
-- Connectivity diagnosis based on real HTTP requests, not `nslookup`.
-- Readiness evaluation for long live-paper execution.
-- Safe bounded live-paper execution with fallback logic.
+- Ledger reconciliation with explicit `OK/WARNING/FAIL`.
+- Multi-timeframe market context storage.
+- Duplicate setup rejection using `symbol/timeframe/direction/entry_time/setup_signature`.
+- Gross and net trade accounting separated.
+- Net profitability gate before paper entries.
+- Quick audit and preflight gates before longer live-paper runs.
 - JSON and CSV export reports.
-- Windows runbook and `.bat` launchers for local operation.
 
 ## What Is Not Working
 
 - Fresh Binance HTTP access is still failing in the current Codex environment.
-- `--load-history` cannot fetch fresh candles from Binance in the current Codex environment.
-- Current local data is stale and gap-prone.
-- `BNBUSDT`, `SOLUSDT` and `XRPUSDT` still have no local history in SQLite here.
-- The strategy remains clearly negative after costs.
+- `--load-history` cannot fetch fresh candles from Binance in this environment.
+- Local data here is stale and contains severe gaps.
+- `BNBUSDT`, `SOLUSDT` and `XRPUSDT` have no local history here.
+- The strategy has no current net-positive evidence after costs.
 
 ## Current Data Source Status
 
 ### Fixed Windows target machine
 
-- Operator validation confirms:
-  - `https://api.binance.com/api/v3/time` responds correctly
-  - `https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=5` responds correctly
-- Interpretation:
-  - Binance is usable there by HTTP
-  - `nslookup` failure alone is not a fatal signal
+- Operator validation confirms Binance HTTP responds there.
+- That machine is the intended live-paper runtime target.
 
 ### Current Codex environment
 
 - Latest validated status:
-  - `--diagnose-connectivity` returned `BINANCE_HTTP_USABLE: NO`
-  - HTTP calls failed with `WinError 10061`
-- Interpretation:
-  - This environment is not suitable for fresh Binance ingestion right now
-  - Bounded validation is using `LOCAL_SQLITE`
+  - `BINANCE_HTTP_USABLE: NO`
+  - errors: `WinError 10061`
+- Current provider for bounded validation:
+  - `LOCAL_SQLITE`
 
 ## Current Runtime Reality
 
-- Backtest is running from historical SQLite replay.
-- Current live-paper bounded validation is using `LOCAL_SQLITE`.
-- Current latest market snapshots are stale for `1m`, `5m`, `15m`, `30m`, `1h`, `4h`.
-- `1d` materialized context can appear valid structurally, but the underlying local dataset is still stale overall.
-- Fallback is safe and auditable, but not suitable for a long fresh live-paper run here.
+- Backtest, benchmark and walk-forward are running from local historical replay.
+- Bounded `--live-paper-engine --max-loops 5` is running safely in fallback mode here.
+- Current local candles for BTCUSDT and ETHUSDT are about `51h32m` old in the latest status snapshot.
+- Higher timeframes are materialized only for BTCUSDT and ETHUSDT here.
+- `BNBUSDT`, `SOLUSDT` and `XRPUSDT` are missing local history across configured timeframes.
 
 ## Current Readiness Level
 
 - In the current Codex environment:
   - `READY_FOR_LIVE_PAPER: NO`
+  - `SAFE_TO_RUN_SHORT_PAPER: NO`
+  - `SAFE_TO_RUN_LONG_PAPER: NO`
   - recommended mode: `DO_NOT_RUN_LONG`
 - Ledger status after final reconciliation:
   - `Ledger Consistency Check: OK`
-- On the fixed Windows machine:
-  - readiness is still not assumed until `--diagnose-connectivity`, `--load-history` and `--readiness-check` pass there
 
 ## Latest Validation Snapshot
 
 - `--init-only`: passed
-- `--diagnose-connectivity`: passed as command, result `BINANCE_HTTP_USABLE: NO` here
-- `--reconcile-ledger`: passed, final result `OK`
+- `--quick-audit`: passed
+- `--preflight-live-paper`: blocked correctly, returned unsafe
+- `--diagnose-connectivity`: passed as command, result `BINANCE_HTTP_USABLE: NO`
+- `--reconcile-ledger`: passed, result `OK`
 - `--status-report`: passed
-- `--load-history` for `1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`: all failed here with `WinError 10061`
-- `--readiness-check`: passed as command, result `READY_FOR_LIVE_PAPER: NO`
-- `--backtest --limit 5000 --timeframes "1m,5m,15m,30m,1h,4h,1d" --min-trades 100`: passed
+- `--load-history` in this environment: still fails with `WinError 10061`
 - `--benchmark --limit 5000 --timeframes "1m,5m,15m,30m,1h,4h,1d"`: passed
-- `--walk-forward --limit 10000 --train-pct 70`: passed
+- `--walk-forward --limit 10000 --train-pct 70 --timeframes "1m,5m,15m,30m,1h,4h,1d"`: passed
 - `--live-paper-engine --max-loops 5`: passed in bounded fallback mode
 - `--export-report`: passed
 - `--export-report --format csv`: passed
 
 ## Current Performance Reality
 
-- The strategy is losing after costs.
-- Latest reconciled backtest state:
-  - `closed trades: 159`
-  - `gross winrate: 7.55%`
-  - `net winrate: 5.03%`
-  - `gross pnl total: -16.388537`
-  - `total net pnl: -59.309828`
-  - `fees: 31.791287`
-  - `slippage: 7.95`
-  - `spread: 3.18`
-- Benchmark result:
-  - `BOT_STRATEGY total_net_pnl: -59.431848`
-  - `BUY_AND_HOLD total_net_pnl: -12.278755`
-  - `RANDOM_ENTRY total_net_pnl: -50.544552`
-  - `NO_TRADE total_net_pnl: 0.0`
-- Walk-forward result:
-  - `selected_relaxation: 0.3`
-  - `test_net_pnl: -7.17661`
-  - `survived_out_of_sample: False`
+- The strategy cannot be considered profitable.
+- With the latest strict cost-aware gate on this local stale dataset:
+  - `benchmark BOT_STRATEGY trades: 0`
+  - `benchmark BOT_STRATEGY net_pnl: 0.0`
+  - `walk-forward train trades: 0`
+  - `walk-forward test trades: 0`
+- This is not a success signal.
+- It means the gate is now strict enough to refuse low-quality setups under bad data conditions.
 
 ## Known Limitations
 
@@ -230,20 +216,20 @@ PowerShell note:
 - No dashboard.
 - No paid data sources.
 - No macro/news feeds yet.
-- Local history is incomplete here.
-- Current local history contains gaps and stale segments.
-- Strategy quality is still poor after costs.
-- Backtest and benchmark currently use the enhanced Delta engine and cost filters, but the full live committee hierarchy is still strongest in `live_paper_engine`.
-- On PowerShell, unquoted `--timeframes` can distort values like `1d`; commands should quote the timeframe list.
+- Local history here is incomplete and stale.
+- Current historical sample is too weak to justify a long run here.
+- The strategy still lacks net-positive validation after costs on the current dataset.
 
 ## Next Recommended Step
 
 1. Move to the fixed Windows machine without VPN.
 2. Run `python main.py --diagnose-connectivity`.
-3. Load fresh history for `1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`.
-4. Run `python main.py --readiness-check`.
-5. Run `python main.py --reconcile-ledger`.
-6. Only if readiness recommends `LIVE_BINANCE`, run `python main.py --live-paper-engine --run-minutes 60`.
+3. Run `python main.py --quick-audit`.
+4. Run `python main.py --preflight-live-paper`.
+5. Load fresh history for `1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`.
+6. Run `python main.py --readiness-check`.
+7. Run `python main.py --reconcile-ledger`.
+8. Only if preflight and readiness both approve, run `python main.py --live-paper-engine --run-minutes 60`.
 
 ## Operating Principle
 

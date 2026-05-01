@@ -1,6 +1,6 @@
 # Multi-Agent Trading System
 
-Sistema de investigacion para cripto en modo 100% paper trading. El proyecto consume datos publicos, analiza contexto multi-timeframe, genera decisiones multiagente, simula trades con costos y persiste todo en SQLite para auditoria.
+Sistema de investigacion cripto en modo 100% paper trading. Consume datos publicos, genera contexto multi-timeframe, decide con varios agentes, filtra por costos netos y persiste todo en SQLite para auditoria.
 
 Estado de referencia:
 - Arquitectura y estado operativo: [PROJECT_STATE.md](C:\Users\chris\OneDrive\Documentos\New%20project\PROJECT_STATE.md)
@@ -9,30 +9,28 @@ Estado de referencia:
 
 ## Alcance actual
 
-- Paper trading solamente.
-- Sin trading real.
-- Sin API keys privadas.
-- Sin ordenes reales.
-- Sin servicios pagos.
-- Binance publico como fuente primaria cuando HTTP responde.
-- `LOCAL_SQLITE` como fallback de emergencia o validacion acotada.
+- Paper trading solamente
+- Sin trading real
+- Sin API keys privadas
+- Sin ordenes reales
+- Sin servicios pagos
+- Binance publico como fuente primaria cuando HTTP responde
+- `LOCAL_SQLITE` como fallback seguro y auditable
 
 ## Timeframes soportados
 
-- Mercado general: `1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`
-- Ejecucion paper: `1m`, `5m`, `15m`
+- Mercado: `1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`
+- Ejecucion: `1m`, `5m`, `15m`
 - Contexto: `30m`, `1h`, `4h`, `1d`
 - Estructural preparado: `1w`, `1M`
 
-Nota para PowerShell en Windows:
-- Cuando uses `--timeframes`, pasa el valor entre comillas.
-- Ejemplo correcto: `python main.py --backtest --timeframes "1m,5m,15m,30m,1h,4h,1d" --limit 5000`
-- Sin comillas, PowerShell puede interpretar `1d` de forma inesperada.
+Nota para PowerShell:
+- usar `--timeframes "1m,5m,15m,30m,1h,4h,1d"`
 
 ## Universo actual
 
-- Core activo: `BTCUSDT`, `ETHUSDT`, `BNBUSDT`, `SOLUSDT`, `XRPUSDT`
-- Watchlist preparada pero apagada por defecto:
+- Core: `BTCUSDT`, `ETHUSDT`, `BNBUSDT`, `SOLUSDT`, `XRPUSDT`
+- Watchlist preparada pero desactivada:
   `DOGEUSDT`, `ADAUSDT`, `AVAXUSDT`, `LINKUSDT`, `LTCUSDT`, `DOTUSDT`, `MATICUSDT`, `TRXUSDT`, `BCHUSDT`, `NEARUSDT`, `ARBUSDT`, `OPUSDT`
 
 ## Modulos principales
@@ -49,6 +47,7 @@ Nota para PowerShell en Windows:
 - [agents/symbol_selection_agent.py](C:\Users\chris\OneDrive\Documentos\New%20project\agents\symbol_selection_agent.py)
 - [agents/risk_reward_agent.py](C:\Users\chris\OneDrive\Documentos\New%20project\agents\risk_reward_agent.py)
 - [agents/cost_model_agent.py](C:\Users\chris\OneDrive\Documentos\New%20project\agents\cost_model_agent.py)
+- [agents/net_profitability_gate.py](C:\Users\chris\OneDrive\Documentos\New%20project\agents\net_profitability_gate.py)
 - [agents/decision_orchestrator.py](C:\Users\chris\OneDrive\Documentos\New%20project\agents\decision_orchestrator.py)
 - [analytics/backtest_engine.py](C:\Users\chris\OneDrive\Documentos\New%20project\analytics\backtest_engine.py)
 - [analytics/benchmark_engine.py](C:\Users\chris\OneDrive\Documentos\New%20project\analytics\benchmark_engine.py)
@@ -56,106 +55,39 @@ Nota para PowerShell en Windows:
 - [execution/live_paper_engine.py](C:\Users\chris\OneDrive\Documentos\New%20project\execution\live_paper_engine.py)
 - [execution/simulated_trade_tracker.py](C:\Users\chris\OneDrive\Documentos\New%20project\execution\simulated_trade_tracker.py)
 
-## Configuracion
+## Variables clave
 
-1. Crear o activar entorno virtual.
-2. Copiar `.env.example` a `.env`.
-3. Ajustar si hace falta.
-
-Variables claves:
-- `CORE_SYMBOLS`
-- `WATCHLIST_SYMBOLS`
-- `ENABLE_WATCHLIST`
-- `MARKET_TIMEFRAMES`
-- `EXECUTION_TIMEFRAMES`
-- `CONTEXT_TIMEFRAMES`
-- `STRUCTURAL_TIMEFRAMES`
 - `MIN_NET_REWARD_RISK_RATIO`
 - `MIN_EXPECTED_NET_EDGE_PCT`
+- `MIN_COST_COVERAGE_MULTIPLE`
 - `MAX_COST_DRAG_PCT`
 - `SIMULATED_MAKER_FEE_PCT`
 - `SIMULATED_TAKER_FEE_PCT`
 - `SIMULATED_SLIPPAGE_PCT`
 - `SIMULATED_SPREAD_PCT`
+- `MARKET_TIMEFRAMES`
+- `EXECUTION_TIMEFRAMES`
+- `CONTEXT_TIMEFRAMES`
+- `STRUCTURAL_TIMEFRAMES`
 - `AGGRESSIVENESS_LEVEL`
 
 ## Comandos principales
 
-Inicializar SQLite:
-
 ```bash
 python main.py --init-only
-```
-
-Diagnosticar Binance por HTTP real:
-
-```bash
 python main.py --diagnose-connectivity
-```
-
-Ver si el entorno actual esta listo para live paper:
-
-```bash
 python main.py --readiness-check
-```
-
-Reconciliar ledger y exposicion:
-
-```bash
+python main.py --quick-audit
+python main.py --preflight-live-paper
 python main.py --reconcile-ledger
-```
-
-Cargar historia desde Binance:
-
-```bash
 python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 1m --limit 1000
-```
-
-Backtest historico multi-timeframe:
-
-```bash
 python main.py --backtest --limit 5000 --timeframes "1m,5m,15m,30m,1h,4h,1d" --min-trades 100
-```
-
-Benchmark contra baselines:
-
-```bash
 python main.py --benchmark --limit 5000 --timeframes "1m,5m,15m,30m,1h,4h,1d"
-```
-
-Walk-forward:
-
-```bash
 python main.py --walk-forward --limit 10000 --train-pct 70 --timeframes "1m,5m,15m,30m,1h,4h,1d"
-```
-
-Live paper engine acotado:
-
-```bash
 python main.py --live-paper-engine --max-loops 5
-```
-
-Live paper largo:
-
-```bash
 python main.py --live-paper-engine --run-minutes 60
-```
-
-Estado operativo:
-
-```bash
 python main.py --status-report
-```
-
-Exportar reporte JSON:
-
-```bash
 python main.py --export-report
-```
-
-Exportar CSVs:
-
-```bash
 python main.py --export-report --format csv
 ```
 
@@ -163,36 +95,45 @@ python main.py --export-report --format csv
 
 1. Consume o materializa velas multi-timeframe.
 2. Detecta gaps, duplicados y velas corruptas.
-3. Calcula contexto de mercado y clasifica regimen.
-4. Genera senales Delta por tier: `STRONG`, `MEDIUM`, `WEAK`, `REJECTED`.
-5. Evalua seleccion de simbolo, riesgo/recompensa y costos netos.
-6. Usa un comite con orquestacion de decision.
-7. Simula trades y costos en un ledger paper.
-8. Reconcili­a cash, equity, exposicion y posiciones.
-9. Aprende de resultados historicos y guarda insights.
-10. Exporta reportes auditables.
+3. Calcula contexto de mercado y regimen.
+4. Genera decisiones Delta por tier.
+5. Filtra por seleccion de simbolo, riesgo/recompensa y costos.
+6. Aplica `NetProfitabilityGate` antes de abrir cualquier paper trade.
+7. Usa un comite multiagente para aprobar o rechazar.
+8. Simula trades y costos en un ledger paper.
+9. Reconcili­a cash, equity, exposicion y posiciones.
+10. Exporta reportes JSON y CSV auditables.
 
 ## Estado real actual
 
 - El sistema sigue siendo seguro para simulacion.
-- En este entorno de trabajo actual Binance sigue fallando por HTTP con `WinError 10061`.
-- Por eso aqui el proveedor actual recomendado es `LOCAL_SQLITE`.
-- La data local esta incompleta y stale para varios timeframes y simbolos.
-- La estrategia sigue perdiendo despues de fees, slippage y spread.
+- En este entorno actual Binance falla por HTTP con `WinError 10061`.
+- Aqui el proveedor actual es `LOCAL_SQLITE`.
+- La data local esta stale y con gaps severos en varios timeframes.
+- `BNBUSDT`, `SOLUSDT` y `XRPUSDT` no tienen historia local util aqui.
+- El ledger final queda `OK` despues de `--reconcile-ledger`.
+- El filtro neto nuevo esta bloqueando trades cuya expectativa no cubre claramente los costos.
+- Con el snapshot final local, el sistema termina en `NO_TRADE` casi total, lo cual es correcto dadas estas condiciones.
 
-No se debe declarar rentable mientras el `net pnl` siga siendo negativo.
+No se debe declarar rentable mientras el `final net pnl after all costs` siga sin evidencia positiva.
 
-## Validacion de duplicados y ledger
+## Politica operativa
 
-- `candles` evita duplicados por `UNIQUE(symbol, timeframe, open_time)`.
-- `simulated_trades` rechaza setups duplicados por `symbol`, `timeframe`, `direction`, `entry_time` y `setup_signature`.
-- `--reconcile-ledger` revisa:
-  - posiciones huerfanas
-  - duplicados
-  - exposure
-  - available cash
-  - realized pnl
-  - unrealized pnl
-  - equity
+- No correr largo si `--preflight-live-paper` devuelve `SAFE_TO_RUN_LONG_PAPER: NO`.
+- No abrir paper trades si el edge neto esperado no cubre costos.
+- No mezclar gross profit con net profit.
+- No permitir ledger inconsistente antes de una corrida larga.
 
-Si `Ledger Consistency Check` sale distinto de `OK`, no se debe dejar corriendo el motor live paper por tiempo largo.
+## Recomendacion para manana en la PC fija
+
+```bash
+python main.py --quick-audit
+python main.py --preflight-live-paper
+python main.py --live-paper-engine --run-minutes 60
+```
+
+Solo correr la ultima linea si las dos primeras dejan claro:
+- Binance reachable: `YES`
+- Fresh data available: `YES`
+- Ledger result: `OK`
+- `SAFE_TO_RUN_LONG_PAPER: YES`

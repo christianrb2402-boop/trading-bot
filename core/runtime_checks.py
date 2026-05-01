@@ -42,6 +42,11 @@ class ReadinessReport:
     python_runtime_ok: bool
     api_keys_required: bool
     real_trading_enabled: bool
+    can_run_short_paper: bool
+    can_run_long_paper: bool
+    short_run_reason: str
+    long_run_reason: str
+    symbol_health: tuple[SymbolHealth, ...]
     reasons: tuple[str, ...]
 
 
@@ -132,21 +137,29 @@ def build_readiness_report(
     market_data_agent: MarketDataAgent,
     probes: Sequence[BinanceConnectivityProbe],
     symbols: Sequence[str],
-    timeframe: str,
+    timeframes: Sequence[str],
+    ledger_result: str = "UNKNOWN",
 ) -> ReadinessReport:
     sqlite_ok = True
     database_exists = settings.sqlite_path.exists()
     python_runtime_ok = True
     binance_reachable = all(probe.ok for probe in probes[:2]) if len(probes) >= 2 else all(probe.ok for probe in probes)
 
-    symbol_health = [inspect_symbol_health(database=database, market_data_agent=market_data_agent, symbol=symbol, timeframe=timeframe) for symbol in symbols]
+    symbol_health = [
+        inspect_symbol_health(database=database, market_data_agent=market_data_agent, symbol=symbol, timeframe=timeframe)
+        for symbol in symbols
+        for timeframe in timeframes
+    ]
     required_symbols = {"BTCUSDT", "ETHUSDT"}
-    required_health = [item for item in symbol_health if item.symbol in required_symbols]
-    fresh_data_available = bool(required_health) and all(item.has_history and not item.is_stale for item in required_health)
+    required_health = [item for item in symbol_health if item.symbol in required_symbols and item.timeframe in {"1m", "5m", "15m"}]
+    fresh_data_available = bool(required_health) and all(item.has_history and not item.is_stale and item.is_valid for item in required_health)
 
-    symbols_with_history = tuple(item.symbol for item in symbol_health if item.has_history)
-    missing_symbols = tuple(item.symbol for item in symbol_health if not item.has_history)
-    stale_symbols = tuple(item.symbol for item in symbol_health if item.has_history and item.is_stale)
+    symbols_with_history = tuple(sorted({item.symbol for item in symbol_health if item.has_history}))
+    missing_symbols = tuple(sorted({item.symbol for item in symbol_health if not item.has_history}))
+    stale_symbols = tuple(sorted({item.symbol for item in symbol_health if item.has_history and item.is_stale}))
+    stale_rows = [item for item in symbol_health if item.has_history and item.is_stale]
+    severe_gap_rows = [item for item in symbol_health if item.gap_count >= 3]
+    insufficient_history_rows = [item for item in symbol_health if not item.has_history]
 
     reasons: list[str] = []
     if not database_exists:
@@ -159,8 +172,15 @@ def build_readiness_report(
         reasons.append(f"Configured symbols without local history: {', '.join(missing_symbols)}")
     if stale_symbols:
         reasons.append(f"Symbols with stale local data: {', '.join(stale_symbols)}")
+    if severe_gap_rows:
+        reasons.append(
+            "Severe gaps detected in: "
+            + ", ".join(f"{item.symbol} {item.timeframe} ({item.gap_count} gaps)" for item in severe_gap_rows[:10])
+        )
+    if ledger_result != "OK":
+        reasons.append(f"Ledger consistency is {ledger_result}")
 
-    if binance_reachable and database_exists:
+    if binance_reachable and database_exists and fresh_data_available and not severe_gap_rows and ledger_result == "OK":
         current_mode = "LIVE_BINANCE"
     elif not binance_reachable and symbols_with_history and not stale_symbols:
         current_mode = "LOCAL_SQLITE_FALLBACK"
@@ -175,8 +195,41 @@ def build_readiness_report(
         and binance_reachable
         and fresh_data_available
         and not missing_symbols
+        and not severe_gap_rows
+        and ledger_result == "OK"
         and current_mode == "LIVE_BINANCE"
     )
+    can_run_short_paper = bool(
+        python_runtime_ok
+        and sqlite_ok
+        and database_exists
+        and (binance_reachable or bool(symbols_with_history))
+        and ledger_result == "OK"
+        and not severe_gap_rows
+    )
+    can_run_long_paper = ready_for_live_paper and not stale_rows and not insufficient_history_rows
+
+    if can_run_short_paper:
+        short_run_reason = "short paper run is allowed because the runtime, SQLite and ledger are healthy enough for bounded execution"
+    else:
+        short_run_reason = "short paper run is blocked because Binance/local data, SQLite or ledger checks failed"
+    if can_run_long_paper:
+        long_run_reason = "long paper run is allowed because Binance is reachable, execution timeframes are fresh, history exists and ledger is consistent"
+    else:
+        blockers: list[str] = []
+        if not binance_reachable:
+            blockers.append("Binance HTTP is not usable")
+        if stale_rows:
+            blockers.append("stale candles exist in required timeframes")
+        if insufficient_history_rows:
+            blockers.append("one or more configured symbols/timeframes have no history")
+        if severe_gap_rows:
+            blockers.append("severe candle gaps were detected")
+        if ledger_result != "OK":
+            blockers.append(f"ledger result is {ledger_result}")
+        if not blockers:
+            blockers.append("freshness or readiness evidence is insufficient")
+        long_run_reason = "; ".join(blockers)
 
     if ready_for_live_paper:
         reasons.append("Environment is ready for live paper with Binance primary data")
@@ -199,5 +252,10 @@ def build_readiness_report(
         python_runtime_ok=python_runtime_ok,
         api_keys_required=False,
         real_trading_enabled=False,
+        can_run_short_paper=can_run_short_paper,
+        can_run_long_paper=can_run_long_paper,
+        short_run_reason=short_run_reason,
+        long_run_reason=long_run_reason,
+        symbol_health=tuple(symbol_health),
         reasons=tuple(reasons),
     )

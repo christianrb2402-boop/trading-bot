@@ -278,7 +278,8 @@ class SimulatedTradeTracker:
                 take_profit = entry_price * (1 + take_profit_pct)
 
         leverage_simulated = float(signal.get("leverage_simulated", self._default_leverage))
-        notional_exposure = self._position_size_usd * leverage_simulated
+        position_size_usd = max(float(signal.get("position_size_usd", self._position_size_usd) or self._position_size_usd), 1.0)
+        notional_exposure = position_size_usd * leverage_simulated
         quantity = notional_exposure / entry_price if entry_price else 0.0
         cost_snapshot = signal.get("cost_snapshot", {})
         fees_open = float(cost_snapshot.get("fees_open", notional_exposure * self._fee_pct))
@@ -332,7 +333,7 @@ class SimulatedTradeTracker:
             provider_used=str(signal.get("provider_used", latest_candle.provider)),
             market_type=self._market_type,
             leverage_simulated=leverage_simulated,
-            margin_used=self._position_size_usd,
+            margin_used=position_size_usd,
             liquidation_price_estimate=round(liquidation_price_estimate, 6),
             funding_rate_estimate=self._funding_rate_estimate,
             funding_cost_estimate=round(funding_cost_estimate, 6),
@@ -356,6 +357,8 @@ class SimulatedTradeTracker:
             agent_votes=json.dumps(signal.get("agent_votes", []), ensure_ascii=True),
             risk_reward_snapshot=json.dumps(signal.get("risk_reward_snapshot", {}), ensure_ascii=True),
             cost_snapshot=json.dumps(cost_snapshot, ensure_ascii=True),
+            paper_mode=str(signal.get("paper_mode", "OBSERVE_ONLY")),
+            exploratory_trade=str(signal.get("paper_mode", "OBSERVE_ONLY")) == "PAPER_EXPLORATION",
         )
         logger.info(
             "Simulated trade opened",
@@ -503,7 +506,8 @@ class SimulatedTradeTracker:
             gross_pnl = (exit_price - trade.entry_price) * quantity
         net_pnl_before_funding = gross_pnl - total_fees - (trade.slippage_cost or 0.0) - (trade.spread_cost or 0.0)
         final_net_pnl = net_pnl_before_funding - (trade.funding_cost_estimate or 0.0)
-        final_net_pnl_pct = (final_net_pnl / self._position_size_usd) * 100 if self._position_size_usd else 0.0
+        margin_used = trade.margin_used or self._position_size_usd
+        final_net_pnl_pct = (final_net_pnl / margin_used) * 100 if margin_used else 0.0
         total_cost_drag = total_fees + (trade.slippage_cost or 0.0) + (trade.spread_cost or 0.0) + (trade.funding_cost_estimate or 0.0)
 
         entry_dt = datetime.fromisoformat(trade.entry_time)

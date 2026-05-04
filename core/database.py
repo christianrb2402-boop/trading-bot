@@ -102,6 +102,18 @@ class RejectedSignalRecord:
     context_payload: str
     thresholds_failed: str
     timestamp: str
+    rejected_by_agent: str | None = None
+    rejected_stage: str | None = None
+    expected_move_pct: float = 0.0
+    total_cost_pct: float = 0.0
+    expected_net_edge_pct: float = 0.0
+    risk_reward_ratio: float = 0.0
+    cost_coverage_multiple: float = 0.0
+    multi_timeframe_conflict: bool = False
+    market_regime: str = "UNKNOWN"
+    selected_strategy: str = "UNKNOWN"
+    paper_mode: str = "OBSERVE_ONLY"
+    would_trade_if_exploration_enabled: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -208,6 +220,15 @@ class BrainDecisionRecord:
     approved: bool
     reason: str
     raw_payload: str
+    provider_used: str = "UNKNOWN"
+    paper_mode: str = "OBSERVE_ONLY"
+    rejected_by_agent: str | None = None
+    rejected_stage: str | None = None
+    outcome_label: str | None = None
+    expected_move_pct: float = 0.0
+    total_cost_pct: float = 0.0
+    multi_timeframe_conflict: bool = False
+    would_trade_if_exploration_enabled: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -229,6 +250,10 @@ class ProviderStatusRecord:
     latency_ms: float
     last_success_at: str | None
     last_error: str | None
+    last_error_at: str | None = None
+    source_type: str = "LIVE"
+    is_current_live_provider: bool = False
+    raw_payload: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -339,6 +364,8 @@ class SimulatedTradeRecord:
     agent_votes: str | None = None
     risk_reward_snapshot: str | None = None
     cost_snapshot: str | None = None
+    paper_mode: str | None = None
+    exploratory_trade: int | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -585,11 +612,35 @@ class Database:
                     reason TEXT NOT NULL,
                     context_payload TEXT NOT NULL,
                     thresholds_failed TEXT NOT NULL,
+                    rejected_by_agent TEXT,
+                    rejected_stage TEXT,
+                    expected_move_pct REAL NOT NULL DEFAULT 0,
+                    total_cost_pct REAL NOT NULL DEFAULT 0,
+                    expected_net_edge_pct REAL NOT NULL DEFAULT 0,
+                    risk_reward_ratio REAL NOT NULL DEFAULT 0,
+                    cost_coverage_multiple REAL NOT NULL DEFAULT 0,
+                    multi_timeframe_conflict INTEGER NOT NULL DEFAULT 0,
+                    market_regime TEXT NOT NULL DEFAULT 'UNKNOWN',
+                    selected_strategy TEXT NOT NULL DEFAULT 'UNKNOWN',
+                    paper_mode TEXT NOT NULL DEFAULT 'OBSERVE_ONLY',
+                    would_trade_if_exploration_enabled INTEGER NOT NULL DEFAULT 0,
                     timestamp TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 )
                 """
             )
+            self._ensure_column(conn=conn, table_name="rejected_signals_log", column_name="rejected_by_agent", column_sql="TEXT")
+            self._ensure_column(conn=conn, table_name="rejected_signals_log", column_name="rejected_stage", column_sql="TEXT")
+            self._ensure_column(conn=conn, table_name="rejected_signals_log", column_name="expected_move_pct", column_sql="REAL NOT NULL DEFAULT 0")
+            self._ensure_column(conn=conn, table_name="rejected_signals_log", column_name="total_cost_pct", column_sql="REAL NOT NULL DEFAULT 0")
+            self._ensure_column(conn=conn, table_name="rejected_signals_log", column_name="expected_net_edge_pct", column_sql="REAL NOT NULL DEFAULT 0")
+            self._ensure_column(conn=conn, table_name="rejected_signals_log", column_name="risk_reward_ratio", column_sql="REAL NOT NULL DEFAULT 0")
+            self._ensure_column(conn=conn, table_name="rejected_signals_log", column_name="cost_coverage_multiple", column_sql="REAL NOT NULL DEFAULT 0")
+            self._ensure_column(conn=conn, table_name="rejected_signals_log", column_name="multi_timeframe_conflict", column_sql="INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn=conn, table_name="rejected_signals_log", column_name="market_regime", column_sql="TEXT NOT NULL DEFAULT 'UNKNOWN'")
+            self._ensure_column(conn=conn, table_name="rejected_signals_log", column_name="selected_strategy", column_sql="TEXT NOT NULL DEFAULT 'UNKNOWN'")
+            self._ensure_column(conn=conn, table_name="rejected_signals_log", column_name="paper_mode", column_sql="TEXT NOT NULL DEFAULT 'OBSERVE_ONLY'")
+            self._ensure_column(conn=conn, table_name="rejected_signals_log", column_name="would_trade_if_exploration_enabled", column_sql="INTEGER NOT NULL DEFAULT 0")
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_rejected_signals_symbol_time
@@ -935,6 +986,18 @@ class Database:
                 column_name="cost_snapshot",
                 column_sql="TEXT",
             )
+            self._ensure_column(
+                conn=conn,
+                table_name="simulated_trades",
+                column_name="paper_mode",
+                column_sql="TEXT DEFAULT 'OBSERVE_ONLY'",
+            )
+            self._ensure_column(
+                conn=conn,
+                table_name="simulated_trades",
+                column_name="exploratory_trade",
+                column_sql="INTEGER DEFAULT 0",
+            )
             self._backfill_simulated_trades(conn=conn, timestamp=timestamp)
             conn.execute(
                 """
@@ -1212,11 +1275,29 @@ class Database:
                     cost_coverage_multiple REAL NOT NULL,
                     approved INTEGER NOT NULL,
                     reason TEXT NOT NULL,
+                    provider_used TEXT NOT NULL DEFAULT 'UNKNOWN',
+                    paper_mode TEXT NOT NULL DEFAULT 'OBSERVE_ONLY',
+                    rejected_by_agent TEXT,
+                    rejected_stage TEXT,
+                    outcome_label TEXT,
+                    expected_move_pct REAL NOT NULL DEFAULT 0,
+                    total_cost_pct REAL NOT NULL DEFAULT 0,
+                    multi_timeframe_conflict INTEGER NOT NULL DEFAULT 0,
+                    would_trade_if_exploration_enabled INTEGER NOT NULL DEFAULT 0,
                     raw_payload TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 )
                 """
             )
+            self._ensure_column(conn=conn, table_name="brain_decisions", column_name="provider_used", column_sql="TEXT NOT NULL DEFAULT 'UNKNOWN'")
+            self._ensure_column(conn=conn, table_name="brain_decisions", column_name="paper_mode", column_sql="TEXT NOT NULL DEFAULT 'OBSERVE_ONLY'")
+            self._ensure_column(conn=conn, table_name="brain_decisions", column_name="rejected_by_agent", column_sql="TEXT")
+            self._ensure_column(conn=conn, table_name="brain_decisions", column_name="rejected_stage", column_sql="TEXT")
+            self._ensure_column(conn=conn, table_name="brain_decisions", column_name="outcome_label", column_sql="TEXT")
+            self._ensure_column(conn=conn, table_name="brain_decisions", column_name="expected_move_pct", column_sql="REAL NOT NULL DEFAULT 0")
+            self._ensure_column(conn=conn, table_name="brain_decisions", column_name="total_cost_pct", column_sql="REAL NOT NULL DEFAULT 0")
+            self._ensure_column(conn=conn, table_name="brain_decisions", column_name="multi_timeframe_conflict", column_sql="INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn=conn, table_name="brain_decisions", column_name="would_trade_if_exploration_enabled", column_sql="INTEGER NOT NULL DEFAULT 0")
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_brain_decisions_lookup
@@ -1248,10 +1329,18 @@ class Database:
                     latency_ms REAL NOT NULL,
                     last_success_at TEXT,
                     last_error TEXT,
+                    last_error_at TEXT,
+                    source_type TEXT NOT NULL DEFAULT 'LIVE',
+                    is_current_live_provider INTEGER NOT NULL DEFAULT 0,
+                    raw_payload TEXT,
                     created_at TEXT NOT NULL
                 )
                 """
             )
+            self._ensure_column(conn=conn, table_name="provider_status", column_name="last_error_at", column_sql="TEXT")
+            self._ensure_column(conn=conn, table_name="provider_status", column_name="source_type", column_sql="TEXT NOT NULL DEFAULT 'LIVE'")
+            self._ensure_column(conn=conn, table_name="provider_status", column_name="is_current_live_provider", column_sql="INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn=conn, table_name="provider_status", column_name="raw_payload", column_sql="TEXT")
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_provider_status_lookup
@@ -1856,9 +1945,21 @@ class Database:
                     reason,
                     context_payload,
                     thresholds_failed,
+                    rejected_by_agent,
+                    rejected_stage,
+                    expected_move_pct,
+                    total_cost_pct,
+                    expected_net_edge_pct,
+                    risk_reward_ratio,
+                    cost_coverage_multiple,
+                    multi_timeframe_conflict,
+                    market_regime,
+                    selected_strategy,
+                    paper_mode,
+                    would_trade_if_exploration_enabled,
                     timestamp,
                     created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.symbol,
@@ -1867,6 +1968,18 @@ class Database:
                     record.reason,
                     record.context_payload,
                     record.thresholds_failed,
+                    record.rejected_by_agent,
+                    record.rejected_stage,
+                    record.expected_move_pct,
+                    record.total_cost_pct,
+                    record.expected_net_edge_pct,
+                    record.risk_reward_ratio,
+                    record.cost_coverage_multiple,
+                    1 if record.multi_timeframe_conflict else 0,
+                    record.market_regime,
+                    record.selected_strategy,
+                    record.paper_mode,
+                    1 if record.would_trade_if_exploration_enabled else 0,
                     record.timestamp,
                     created_at,
                 ),
@@ -2035,8 +2148,6 @@ class Database:
             conn.execute("DELETE FROM signals_log")
             conn.execute("DELETE FROM rejected_signals_log")
             conn.execute("DELETE FROM agent_decisions")
-            conn.execute("DELETE FROM market_context")
-            conn.execute("DELETE FROM market_snapshots")
             conn.execute("DELETE FROM simulated_trades")
             conn.execute("DELETE FROM strategy_insights")
             conn.execute("DELETE FROM paper_positions")
@@ -2051,8 +2162,6 @@ class Database:
                     'signals_log',
                     'rejected_signals_log',
                     'agent_decisions',
-                    'market_context',
-                    'market_snapshots',
                     'simulated_trades',
                     'strategy_insights',
                     'paper_positions',
@@ -2127,7 +2236,9 @@ class Database:
                     exit_context,
                     agent_votes,
                     risk_reward_snapshot,
-                    cost_snapshot
+                    cost_snapshot,
+                    COALESCE(paper_mode, 'OBSERVE_ONLY') AS paper_mode,
+                    COALESCE(exploratory_trade, 0) AS exploratory_trade
                 FROM simulated_trades
                 WHERE symbol = ?
                   AND COALESCE(timeframe, '1m') = ?
@@ -2203,7 +2314,9 @@ class Database:
                     exit_context,
                     agent_votes,
                     risk_reward_snapshot,
-                    cost_snapshot
+                    cost_snapshot,
+                    COALESCE(paper_mode, 'OBSERVE_ONLY') AS paper_mode,
+                    COALESCE(exploratory_trade, 0) AS exploratory_trade
                 FROM simulated_trades
                 WHERE COALESCE(status, 'OPEN') = 'OPEN'
                 ORDER BY COALESCE(entry_time, timestamp_entry) ASC
@@ -2252,6 +2365,8 @@ class Database:
         agent_votes: str | None = None,
         risk_reward_snapshot: str | None = None,
         cost_snapshot: str | None = None,
+        paper_mode: str = "OBSERVE_ONLY",
+        exploratory_trade: bool = False,
     ) -> int:
         timestamp = datetime.now(timezone.utc).isoformat()
         with self.connection() as conn:
@@ -2297,10 +2412,12 @@ class Database:
                     agent_votes,
                     risk_reward_snapshot,
                     cost_snapshot,
+                    paper_mode,
+                    exploratory_trade,
                     created_at,
                     updated_at,
                     timestamp_entry
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     symbol,
@@ -2342,6 +2459,8 @@ class Database:
                     agent_votes,
                     risk_reward_snapshot,
                     cost_snapshot,
+                    paper_mode,
+                    1 if exploratory_trade else 0,
                     timestamp,
                     timestamp,
                     entry_time,
@@ -2555,7 +2674,9 @@ class Database:
                 exit_context,
                 agent_votes,
                 risk_reward_snapshot,
-                cost_snapshot
+                cost_snapshot,
+                COALESCE(paper_mode, 'OBSERVE_ONLY') AS paper_mode,
+                COALESCE(exploratory_trade, 0) AS exploratory_trade
             FROM simulated_trades
             WHERE COALESCE(status, 'OPEN') <> 'OPEN'
         """
@@ -2633,7 +2754,9 @@ class Database:
                     exit_context,
                     agent_votes,
                     risk_reward_snapshot,
-                    cost_snapshot
+                    cost_snapshot,
+                    COALESCE(paper_mode, 'OBSERVE_ONLY') AS paper_mode,
+                    COALESCE(exploratory_trade, 0) AS exploratory_trade
                 FROM simulated_trades
                 ORDER BY COALESCE(updated_at, created_at, COALESCE(entry_time, timestamp_entry)) DESC
                 LIMIT ?
@@ -2790,7 +2913,27 @@ class Database:
         with self.connection() as conn:
             rows = conn.execute(
                 """
-                SELECT id, symbol, timeframe, signal_tier, reason, context_payload, thresholds_failed, timestamp
+                SELECT
+                    id,
+                    symbol,
+                    timeframe,
+                    signal_tier,
+                    reason,
+                    context_payload,
+                    thresholds_failed,
+                    rejected_by_agent,
+                    rejected_stage,
+                    expected_move_pct,
+                    total_cost_pct,
+                    expected_net_edge_pct,
+                    risk_reward_ratio,
+                    cost_coverage_multiple,
+                    multi_timeframe_conflict,
+                    market_regime,
+                    selected_strategy,
+                    paper_mode,
+                    would_trade_if_exploration_enabled,
+                    timestamp
                 FROM rejected_signals_log
                 ORDER BY id DESC
                 LIMIT ?
@@ -3369,8 +3512,10 @@ class Database:
                 INSERT INTO brain_decisions (
                     timestamp, symbol, timeframe, final_decision, final_score, market_state, selected_strategy,
                     risk_mode, expected_net_edge_pct, risk_reward_ratio, cost_coverage_multiple, approved,
-                    reason, raw_payload, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    reason, provider_used, paper_mode, rejected_by_agent, rejected_stage, outcome_label,
+                    expected_move_pct, total_cost_pct, multi_timeframe_conflict, would_trade_if_exploration_enabled,
+                    raw_payload, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.timestamp,
@@ -3386,6 +3531,15 @@ class Database:
                     record.cost_coverage_multiple,
                     1 if record.approved else 0,
                     record.reason,
+                    record.provider_used,
+                    record.paper_mode,
+                    record.rejected_by_agent,
+                    record.rejected_stage,
+                    record.outcome_label,
+                    record.expected_move_pct,
+                    record.total_cost_pct,
+                    1 if record.multi_timeframe_conflict else 0,
+                    1 if record.would_trade_if_exploration_enabled else 0,
                     record.raw_payload,
                     created_at,
                 ),
@@ -3399,6 +3553,122 @@ class Database:
                 (limit,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def update_brain_decision_outcome(self, *, decision_id: int, outcome_label: str) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                """
+                UPDATE brain_decisions
+                SET outcome_label = ?
+                WHERE id = ?
+                """,
+                (outcome_label, decision_id),
+            )
+
+    def get_unevaluated_no_trade_brain_decisions(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM brain_decisions
+                WHERE final_decision = 'NO_TRADE'
+                  AND outcome_label IS NULL
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_next_candles(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        after_close_time: str,
+        limit: int,
+    ) -> list[StoredCandle]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    symbol,
+                    timeframe,
+                    open_time,
+                    open,
+                    high,
+                    low,
+                    close,
+                    volume,
+                    close_time,
+                    provider
+                FROM candles
+                WHERE symbol = ?
+                  AND timeframe = ?
+                  AND close_time > ?
+                ORDER BY close_time ASC
+                LIMIT ?
+                """,
+                (symbol, timeframe, after_close_time, limit),
+            ).fetchall()
+        return [
+            StoredCandle(
+                symbol=row["symbol"],
+                timeframe=row["timeframe"],
+                open_time=row["open_time"],
+                open=row["open"],
+                high=row["high"],
+                low=row["low"],
+                close=row["close"],
+                volume=row["volume"],
+                close_time=row["close_time"],
+                provider=row["provider"],
+            )
+            for row in rows
+        ]
+
+    def get_current_provider_summary(self) -> dict[str, Any]:
+        with self.connection() as conn:
+            current_live = conn.execute(
+                """
+                SELECT *
+                FROM provider_status
+                WHERE is_current_live_provider = 1
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            last_success = conn.execute(
+                """
+                SELECT *
+                FROM provider_status
+                WHERE status = 'OK'
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            latest_brain = conn.execute(
+                """
+                SELECT provider_used, paper_mode, timestamp
+                FROM brain_decisions
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            latest_snapshot = conn.execute(
+                """
+                SELECT provider_used, timestamp, symbol, timeframe
+                FROM market_snapshots
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return {
+            "current_live_provider": dict(current_live) if current_live else None,
+            "last_successful_provider": dict(last_success) if last_success else None,
+            "latest_brain_provider": dict(latest_brain) if latest_brain else None,
+            "latest_market_snapshot_provider": dict(latest_snapshot) if latest_snapshot else None,
+        }
 
     def insert_risk_event(self, record: RiskEventRecord) -> int:
         created_at = datetime.now(timezone.utc).isoformat()
@@ -3433,11 +3703,14 @@ class Database:
     def insert_provider_status(self, record: ProviderStatusRecord) -> int:
         created_at = datetime.now(timezone.utc).isoformat()
         with self.connection() as conn:
+            if record.is_current_live_provider:
+                conn.execute("UPDATE provider_status SET is_current_live_provider = 0")
             cursor = conn.execute(
                 """
                 INSERT INTO provider_status (
-                    timestamp, provider, status, latency_ms, last_success_at, last_error, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    timestamp, provider, status, latency_ms, last_success_at, last_error, last_error_at,
+                    source_type, is_current_live_provider, raw_payload, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.timestamp,
@@ -3446,17 +3719,27 @@ class Database:
                     record.latency_ms,
                     record.last_success_at,
                     record.last_error,
+                    record.last_error_at,
+                    record.source_type,
+                    1 if record.is_current_live_provider else 0,
+                    record.raw_payload,
                     created_at,
                 ),
             )
         return int(cursor.lastrowid)
 
-    def get_recent_provider_status(self, limit: int = 20) -> list[dict[str, Any]]:
+    def get_recent_provider_status(self, limit: int = 20, *, source_type: str | None = None) -> list[dict[str, Any]]:
         with self.connection() as conn:
-            rows = conn.execute(
-                "SELECT * FROM provider_status ORDER BY id DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+            if source_type:
+                rows = conn.execute(
+                    "SELECT * FROM provider_status WHERE source_type = ? ORDER BY id DESC LIMIT ?",
+                    (source_type, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM provider_status ORDER BY id DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
         return [dict(row) for row in rows]
 
     def insert_data_quality_event(self, record: DataQualityEventRecord) -> int:
@@ -3665,6 +3948,8 @@ class Database:
             agent_votes=row["agent_votes"],
             risk_reward_snapshot=row["risk_reward_snapshot"],
             cost_snapshot=row["cost_snapshot"],
+            paper_mode=row["paper_mode"],
+            exploratory_trade=row["exploratory_trade"],
         )
 
     @staticmethod
@@ -3717,6 +4002,8 @@ class Database:
                 final_net_pnl_after_all_costs_pct = COALESCE(final_net_pnl_after_all_costs_pct, net_pnl_pct, pnl_pct, 0),
                 total_cost_drag = COALESCE(total_cost_drag, total_fees, 0) + COALESCE(slippage_cost, 0) + COALESCE(spread_cost, 0) + COALESCE(funding_cost_estimate, 0),
                 slippage_pct = COALESCE(slippage_pct, 0),
+                paper_mode = COALESCE(paper_mode, 'OBSERVE_ONLY'),
+                exploratory_trade = COALESCE(exploratory_trade, 0),
                 created_at = COALESCE(created_at, ?),
                 updated_at = COALESCE(updated_at, ?)
             """

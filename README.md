@@ -17,6 +17,23 @@ Estado de referencia:
 - Binance publico como fuente primaria cuando HTTP responde
 - `LOCAL_SQLITE` como fallback seguro y auditable
 
+## Fase actual
+
+- `BRAIN RELIABILITY + CONTROLLED PAPER EXPLORATION CALIBRATION`
+- `TradingBrainOrchestrator` ya conserva `provider`, `market snapshots`, `paper_mode` y diagnosticos de rechazo
+- `market-watch-engine` y `autonomous-paper-engine` ya soportan `--max-loops`
+- modos operativos activos:
+  - `OBSERVE_ONLY`
+  - `PAPER_EXPLORATION`
+  - `PAPER_SELECTIVE`
+- resultado real mas reciente:
+  - provider vivo persistido: `BINANCE`
+  - ledger: `OK`
+  - paper mode final del brain: mayormente `OBSERVE_ONLY`
+  - trades exploratorios abiertos en la ultima validacion: `0`
+  - trades selectivos abiertos en la ultima validacion: `0`
+  - conclusion: el sistema ya observa y rechaza mejor, pero sigue demasiado conservador para afirmar edge neto positivo
+
 ## Timeframes soportados
 
 - Mercado: `1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`
@@ -80,12 +97,14 @@ python main.py --readiness-check
 python main.py --quick-audit
 python main.py --preflight-live-paper
 python main.py --reconcile-ledger
+python main.py --market-watch-engine --max-loops 5
+python main.py --autonomous-paper-engine --max-loops 5
 python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT --timeframe 1m --limit 1000
 python main.py --backtest --limit 5000 --timeframes "1m,5m,15m,30m,1h,4h,1d" --min-trades 100
 python main.py --benchmark --limit 5000 --timeframes "1m,5m,15m,30m,1h,4h,1d"
 python main.py --walk-forward --limit 10000 --train-pct 70 --timeframes "1m,5m,15m,30m,1h,4h,1d"
-python main.py --live-paper-engine --max-loops 5
 python main.py --live-paper-engine --run-minutes 60
+python main.py --brain-report
 python main.py --status-report
 python main.py --export-report
 python main.py --export-report --format csv
@@ -107,13 +126,20 @@ python main.py --export-report --format csv
 ## Estado real actual
 
 - El sistema sigue siendo seguro para simulacion.
-- En este entorno actual Binance falla por HTTP con `WinError 10061`.
-- Aqui el proveedor actual es `LOCAL_SQLITE`.
-- La data local esta stale y con gaps severos en varios timeframes.
-- `BNBUSDT`, `SOLUSDT` y `XRPUSDT` no tienen historia local util aqui.
-- El ledger final queda `OK` despues de `--reconcile-ledger`.
-- El filtro neto nuevo esta bloqueando trades cuya expectativa no cubre claramente los costos.
-- Con el snapshot final local, el sistema termina en `NO_TRADE` casi total, lo cual es correcto dadas estas condiciones.
+- En la ultima validacion viva el brain pudo trabajar con `BINANCE` y persistir `provider_status`, `brain_decisions`, `market_snapshots` y `rejected_signals_log`.
+- `status-report` ya puede mostrar:
+  - `Current live provider`
+  - `Last successful provider`
+  - `Provider used in latest brain decision`
+  - `Provider used in latest market snapshot`
+- `market-watch-engine --max-loops 5` y `autonomous-paper-engine --max-loops 5` pasaron.
+- El ledger final queda `OK`.
+- El filtro neto y la critica multi-timeframe siguen bloqueando la mayoria de setups.
+- En la ultima corrida autonoma:
+  - decisiones procesadas: `175`
+  - trades abiertos: `0`
+  - trades cerrados: `0`
+- El problema actual es calibracion, no arquitectura base.
 
 No se debe declarar rentable mientras el `final net pnl after all costs` siga sin evidencia positiva.
 

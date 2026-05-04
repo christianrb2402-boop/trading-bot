@@ -33,6 +33,7 @@ from core.database import (
     MarketContextRecord,
     MarketSnapshotRecord,
     ProviderStatusRecord,
+    RejectedSignalRecord,
     RiskEventRecord,
     StrategyVoteRecord,
 )
@@ -62,6 +63,7 @@ class BrainDecision:
     exit_reason: str
     provider_used: str
     data_stale: bool
+    paper_mode: str
     raw_payload: dict[str, object]
 
     def as_dict(self) -> dict[str, object]:
@@ -85,6 +87,7 @@ class BrainDecision:
             "exit_reason": self.exit_reason,
             "provider_used": self.provider_used,
             "data_stale": self.data_stale,
+            "paper_mode": self.paper_mode,
             "raw_payload": self.raw_payload,
         }
 
@@ -164,6 +167,18 @@ class TradingBrainOrchestrator:
                 latency_ms=0.0,
                 last_success_at=timestamp if provider_result.candles else None,
                 last_error=provider_result.error_message,
+                last_error_at=timestamp if provider_result.error_message else None,
+                source_type="FALLBACK" if provider_result.used_fallback else "LIVE",
+                is_current_live_provider=bool(provider_result.candles and not provider_result.used_fallback),
+                raw_payload=json.dumps(
+                    {
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "used_fallback": provider_result.used_fallback,
+                        "error_message": provider_result.error_message,
+                    },
+                    ensure_ascii=True,
+                ),
             )
         )
         assessment = self._market_data_agent.assess(
@@ -296,6 +311,10 @@ class TradingBrainOrchestrator:
         )
         best_proposal = max(proposals, key=lambda item: item.confidence)
 
+        exploration_position_size = max(
+            min(total_equity * self._settings.exploration_risk_per_trade_pct, self._settings.simulated_position_size_usd),
+            1.0,
+        )
         cost_snapshot = self._cost_model_agent.estimate(
             entry_price=recent_candles[-1].close,
             direction=best_proposal.proposed_decision if best_proposal.proposed_decision in {"LONG", "SHORT"} else "LONG",
@@ -316,14 +335,8 @@ class TradingBrainOrchestrator:
             delta_signal["direction"] = best_proposal.proposed_decision
             delta_signal["decision_type"] = best_proposal.proposed_decision
             delta_signal["confidence"] = max(float(delta_signal.get("confidence", 0.0)), best_proposal.confidence)
+        delta_signal["position_size_usd"] = min(self._settings.simulated_position_size_usd, total_equity * risk_manager.position_size_pct)
         risk_reward = self._risk_reward_agent.evaluate(signal=delta_signal, cost_snapshot=cost_snapshot)
-        net_gate = self._net_profitability_gate.evaluate(signal=delta_signal, cost_snapshot=cost_snapshot)
-        meta_learning = self._meta_learning_agent.assess(
-            symbol=symbol,
-            timeframe=timeframe,
-            strategy_name=best_proposal.strategy_name,
-            market_state=market_state.market_state,
-        )
         tf_alignment = self._decision_orchestrator.assess_timeframes(
             symbol=symbol,
             direction=best_proposal.proposed_decision if best_proposal.proposed_decision in {"LONG", "SHORT"} else direction_bias,
@@ -333,11 +346,32 @@ class TradingBrainOrchestrator:
         duplicate_setup = False
         if best_proposal.proposed_decision in {"LONG", "SHORT"}:
             duplicate_setup = self._is_duplicate_setup(symbol=symbol, timeframe=timeframe, direction=best_proposal.proposed_decision, setup_signature=best_proposal.strategy_name)
+        exploration_cost_snapshot = self._cost_model_agent.estimate(
+            entry_price=recent_candles[-1].close,
+            direction=best_proposal.proposed_decision if best_proposal.proposed_decision in {"LONG", "SHORT"} else "LONG",
+            position_size_usd=exploration_position_size,
+            volatility_pct=float(feature_snapshot.payload.get("atr_pct", 0.0)),
+            market_type=self._settings.simulated_market_type,
+        )
+        exploration_signal = dict(delta_signal)
+        exploration_signal["position_size_usd"] = exploration_position_size
+        exploration_gate = self._net_profitability_gate.evaluate(
+            signal=exploration_signal,
+            cost_snapshot=exploration_cost_snapshot,
+            risk_mode=risk_manager.risk_mode,
+            paper_mode="PAPER_EXPLORATION",
+        )
+        selective_gate = self._net_profitability_gate.evaluate(
+            signal=delta_signal,
+            cost_snapshot=cost_snapshot,
+            risk_mode=risk_manager.risk_mode,
+            paper_mode="PAPER_SELECTIVE",
+        )
         critic = self._strategy_critic_agent.critique(
             proposal=best_proposal.as_dict(),
             total_cost_pct=float(cost_snapshot.minimum_profitable_move_pct),
-            expected_net_edge_pct=float(net_gate.expected_net_edge_pct),
-            expected_net_reward_risk=float(net_gate.expected_net_reward_risk),
+            expected_net_edge_pct=float(exploration_gate.expected_net_edge_pct),
+            expected_net_reward_risk=float(exploration_gate.expected_net_reward_risk),
             timeframe_alignment=tf_alignment.timeframe_alignment,
             contradiction_score=tf_alignment.contradiction_score,
             market_state=market_state.market_state,
@@ -346,6 +380,54 @@ class TradingBrainOrchestrator:
             duplicate_setup=duplicate_setup,
             loss_streak=risk_manager.loss_streak,
             data_quality_score=symbol_selection.data_quality_score,
+        )
+        meta_learning_preview = self._meta_learning_agent.assess(
+            symbol=symbol,
+            timeframe=timeframe,
+            strategy_name=best_proposal.strategy_name,
+            market_state=market_state.market_state,
+            paper_mode="PAPER_EXPLORATION",
+        )
+        paper_mode = self._select_paper_mode(
+            observer_mode=observer_mode,
+            assessment_is_stale=assessment.is_stale and not allow_stale_fallback,
+            provider_used=provider_result.provider_used,
+            symbol_tradable=symbol_selection.tradable_today,
+            risk_manager_action=risk_manager.recommended_action,
+            market_risk_mode=market_state.recommended_risk_mode,
+            contradiction_score=tf_alignment.contradiction_score,
+            alignment_label=tf_alignment.timeframe_alignment,
+            meta_sample_strength=meta_learning_preview.sample_strength,
+            open_positions=len(self._database.get_open_paper_positions()),
+            recent_exploration_trades=self._recent_trade_count_by_mode("PAPER_EXPLORATION", hours=1),
+            recent_rejected_opportunities=self._recent_rejection_count(symbol=symbol, timeframe=timeframe),
+        )
+        meta_learning = self._meta_learning_agent.assess(
+            symbol=symbol,
+            timeframe=timeframe,
+            strategy_name=best_proposal.strategy_name,
+            market_state=market_state.market_state,
+            paper_mode=paper_mode,
+        )
+        net_gate = exploration_gate if paper_mode == "PAPER_EXPLORATION" else selective_gate if paper_mode == "PAPER_SELECTIVE" else self._net_profitability_gate.evaluate(
+            signal=delta_signal,
+            cost_snapshot=cost_snapshot,
+            risk_mode=risk_manager.risk_mode,
+            paper_mode="OBSERVE_ONLY",
+        )
+        active_cost_snapshot = exploration_cost_snapshot if paper_mode == "PAPER_EXPLORATION" else cost_snapshot
+        active_position_size = exploration_position_size if paper_mode == "PAPER_EXPLORATION" else min(self._settings.simulated_position_size_usd, total_equity * risk_manager.position_size_pct)
+        delta_signal["paper_mode"] = paper_mode
+        delta_signal["position_size_usd"] = active_position_size
+        risk_reward = self._risk_reward_agent.evaluate(signal=delta_signal, cost_snapshot=active_cost_snapshot)
+        would_trade_if_exploration_enabled = (
+            best_proposal.proposed_decision in {"LONG", "SHORT"}
+            and symbol_selection.tradable_today
+            and risk_manager.recommended_action != "BLOCK"
+            and critic.critic_decision != "REJECT"
+            and exploration_gate.approved
+            and not (assessment.is_stale and not allow_stale_fallback)
+            and not observer_mode
         )
 
         strategy_score = best_proposal.confidence
@@ -378,45 +460,73 @@ class TradingBrainOrchestrator:
 
         approved = (
             best_proposal.proposed_decision in {"LONG", "SHORT"}
+            and paper_mode != "OBSERVE_ONLY"
             and selection.primary_strategy != "NO_TRADE"
             and market_state.recommended_risk_mode != "DO_NOT_TRADE"
             and risk_manager.recommended_action != "BLOCK"
             and symbol_selection.tradable_today
             and net_gate.approved
             and critic.critic_decision != "REJECT"
-            and final_score >= self._settings.brain_min_final_score
+            and final_score >= (self._settings.brain_min_final_score * (0.85 if paper_mode == "PAPER_EXPLORATION" else 1.0))
+            and (len(self._database.get_open_paper_positions()) < self._settings.exploration_max_open_positions if paper_mode == "PAPER_EXPLORATION" else True)
+            and (self._recent_trade_count_by_mode("PAPER_EXPLORATION", hours=1) < self._settings.exploration_max_trades_per_hour if paper_mode == "PAPER_EXPLORATION" else True)
             and not (assessment.is_stale and not allow_stale_fallback)
             and not observer_mode
         )
         rejection_reason = ""
+        rejected_by_agent = ""
+        rejected_stage = ""
         if not approved:
             reasons = [
                 critic.rejection_reason or "",
                 net_gate.reason if not net_gate.approved else "",
                 risk_manager.reason if risk_manager.recommended_action == "BLOCK" else "",
                 "observer mode only" if observer_mode else "",
+                f"paper mode {paper_mode} forbids opening trades" if paper_mode == "OBSERVE_ONLY" else "",
                 "symbol not tradable today" if not symbol_selection.tradable_today else "",
-                f"final score {round(final_score, 4)} below minimum {self._settings.brain_min_final_score}" if final_score < self._settings.brain_min_final_score else "",
+                f"final score {round(final_score, 4)} below minimum {round(self._settings.brain_min_final_score * (0.85 if paper_mode == 'PAPER_EXPLORATION' else 1.0), 4)}" if final_score < (self._settings.brain_min_final_score * (0.85 if paper_mode == "PAPER_EXPLORATION" else 1.0)) else "",
+                "exploration max open positions reached" if paper_mode == "PAPER_EXPLORATION" and len(self._database.get_open_paper_positions()) >= self._settings.exploration_max_open_positions else "",
+                "exploration hourly trade cap reached" if paper_mode == "PAPER_EXPLORATION" and self._recent_trade_count_by_mode("PAPER_EXPLORATION", hours=1) >= self._settings.exploration_max_trades_per_hour else "",
             ]
             rejection_reason = "; ".join(reason for reason in reasons if reason)
+            rejected_by_agent, rejected_stage = self._classify_rejection(
+                critic=critic,
+                net_gate=net_gate,
+                risk_manager=risk_manager,
+                paper_mode=paper_mode,
+                observer_mode=observer_mode,
+                symbol_tradable=symbol_selection.tradable_today,
+                final_score=final_score,
+                threshold=(self._settings.brain_min_final_score * (0.85 if paper_mode == "PAPER_EXPLORATION" else 1.0)),
+            )
         final_decision = best_proposal.proposed_decision if approved else "NO_TRADE"
         exit_reason = net_gate.close_condition if approved else rejection_reason or "no trade"
 
         payload = {
             "provider_used": provider_result.provider_used,
+            "paper_mode": paper_mode,
+            "position_size_usd": active_position_size,
             "market_data": assessment.as_dict(),
             "features": feature_snapshot.as_dict(),
             "market_context": market_context,
             "market_state": market_state.as_dict(),
             "strategy_selection": selection.as_dict(),
             "best_proposal": best_proposal.as_dict(),
-            "cost_snapshot": cost_snapshot.as_dict(),
+            "cost_snapshot": active_cost_snapshot.as_dict(),
+            "exploration_cost_snapshot": exploration_cost_snapshot.as_dict(),
             "risk_reward": risk_reward.as_dict(),
             "net_gate": net_gate.as_dict(),
+            "exploration_gate": exploration_gate.as_dict(),
+            "selective_gate": selective_gate.as_dict(),
             "critic": critic.as_dict(),
             "risk_manager": risk_manager.as_dict(),
             "meta_learning": meta_learning.as_dict(),
             "timeframe_alignment": tf_alignment.as_dict(),
+            "rejection_diagnostics": {
+                "rejected_by_agent": rejected_by_agent,
+                "rejected_stage": rejected_stage,
+                "would_trade_if_exploration_enabled": would_trade_if_exploration_enabled,
+            },
             "score_breakdown": {
                 "strategy_score": strategy_score,
                 "market_alignment_score": market_alignment_score,
@@ -447,7 +557,7 @@ class TradingBrainOrchestrator:
                     score=proposal.confidence,
                     expected_move_pct=proposal.expected_move_pct,
                     expected_net_edge_pct=proposal.expected_net_edge_pct,
-                    cost_estimate_pct=cost_snapshot.minimum_profitable_move_pct,
+                    cost_estimate_pct=active_cost_snapshot.minimum_profitable_move_pct,
                     risk_reward_ratio=proposal.risk_reward_ratio,
                     regime=market_state.market_state,
                     risk_mode=risk_manager.risk_mode,
@@ -472,9 +582,42 @@ class TradingBrainOrchestrator:
                 cost_coverage_multiple=float(net_gate.cost_coverage_multiple),
                 approved=approved,
                 reason=rejection_reason or best_proposal.entry_reason,
+                provider_used=provider_result.provider_used,
+                paper_mode=paper_mode,
+                rejected_by_agent=rejected_by_agent or None,
+                rejected_stage=rejected_stage or None,
+                outcome_label=None,
+                expected_move_pct=float(best_proposal.expected_move_pct),
+                total_cost_pct=float(active_cost_snapshot.minimum_profitable_move_pct),
+                multi_timeframe_conflict=tf_alignment.timeframe_alignment == "CONTRADICTED",
+                would_trade_if_exploration_enabled=would_trade_if_exploration_enabled,
                 raw_payload=json.dumps(payload, ensure_ascii=True),
             )
         )
+        if not approved:
+            self._database.insert_rejected_signal(
+                RejectedSignalRecord(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    signal_tier=str(delta_signal.get("signal_tier", "REJECTED")),
+                    reason=rejection_reason or best_proposal.entry_reason,
+                    context_payload=json.dumps(payload, ensure_ascii=True),
+                    thresholds_failed=json.dumps(list(delta_signal.get("thresholds_failed", [])), ensure_ascii=True),
+                    timestamp=timestamp,
+                    rejected_by_agent=rejected_by_agent or None,
+                    rejected_stage=rejected_stage or None,
+                    expected_move_pct=float(best_proposal.expected_move_pct),
+                    total_cost_pct=float(active_cost_snapshot.minimum_profitable_move_pct),
+                    expected_net_edge_pct=float(net_gate.expected_net_edge_pct),
+                    risk_reward_ratio=float(net_gate.expected_net_reward_risk),
+                    cost_coverage_multiple=float(net_gate.cost_coverage_multiple),
+                    multi_timeframe_conflict=tf_alignment.timeframe_alignment == "CONTRADICTED",
+                    market_regime=market_state.market_state,
+                    selected_strategy=best_proposal.strategy_name,
+                    paper_mode=paper_mode,
+                    would_trade_if_exploration_enabled=would_trade_if_exploration_enabled,
+                )
+            )
         self._database.insert_agent_decision(
             AgentDecisionRecord(
                 timestamp=timestamp,
@@ -499,6 +642,7 @@ class TradingBrainOrchestrator:
                 outcome_label="APPROVED" if approved else "REJECTED",
             )
         )
+        self._evaluate_pending_no_trade_outcomes()
 
         return BrainDecision(
             symbol=symbol,
@@ -520,6 +664,7 @@ class TradingBrainOrchestrator:
             exit_reason=exit_reason,
             provider_used=provider_result.provider_used,
             data_stale=assessment.is_stale,
+            paper_mode=paper_mode,
             raw_payload=payload,
         )
 
@@ -590,6 +735,129 @@ class TradingBrainOrchestrator:
                 return True
         return False
 
+    def _recent_trade_count_by_mode(self, paper_mode: str, *, hours: int) -> int:
+        cutoff = datetime.now(timezone.utc).timestamp() - (hours * 3600)
+        count = 0
+        for trade in self._database.get_recent_simulated_trades(limit=200):
+            timestamp_value = trade.created_at or trade.entry_time
+            if not timestamp_value:
+                continue
+            try:
+                trade_ts = datetime.fromisoformat(timestamp_value).timestamp()
+            except ValueError:
+                continue
+            if trade_ts >= cutoff and (trade.paper_mode or "OBSERVE_ONLY") == paper_mode:
+                count += 1
+        return count
+
+    def _recent_rejection_count(self, *, symbol: str, timeframe: str) -> int:
+        count = 0
+        for row in self._database.get_recent_rejected_signals(limit=100):
+            if row.get("symbol") == symbol and row.get("timeframe") == timeframe:
+                count += 1
+        return count
+
+    def _select_paper_mode(
+        self,
+        *,
+        observer_mode: bool,
+        assessment_is_stale: bool,
+        provider_used: str,
+        symbol_tradable: bool,
+        risk_manager_action: str,
+        market_risk_mode: str,
+        contradiction_score: float,
+        alignment_label: str,
+        meta_sample_strength: str,
+        open_positions: int,
+        recent_exploration_trades: int,
+        recent_rejected_opportunities: int,
+    ) -> str:
+        if observer_mode:
+            return "OBSERVE_ONLY"
+        if assessment_is_stale or risk_manager_action == "BLOCK" or not symbol_tradable:
+            return "OBSERVE_ONLY"
+        if market_risk_mode in {"DO_NOT_TRADE", "CAPITAL_PROTECTION"}:
+            return "OBSERVE_ONLY"
+        if provider_used == "LOCAL_SQLITE":
+            return "OBSERVE_ONLY"
+        if contradiction_score >= 0.7 or alignment_label == "CONTRADICTED":
+            return "OBSERVE_ONLY"
+        if not self._settings.paper_mode_auto:
+            return "PAPER_SELECTIVE"
+        if open_positions >= self._settings.exploration_max_open_positions:
+            return "OBSERVE_ONLY"
+        if meta_sample_strength in {"USABLE", "STRONG", "VERY_STRONG"} and contradiction_score <= 0.25 and alignment_label in {"FULL_ALIGNMENT", "SCALP_ONLY"}:
+            return "PAPER_SELECTIVE"
+        if recent_exploration_trades < self._settings.exploration_max_trades_per_hour and recent_rejected_opportunities >= 3:
+            return "PAPER_EXPLORATION"
+        return "PAPER_EXPLORATION"
+
+    @staticmethod
+    def _classify_rejection(
+        *,
+        critic,
+        net_gate,
+        risk_manager,
+        paper_mode: str,
+        observer_mode: bool,
+        symbol_tradable: bool,
+        final_score: float,
+        threshold: float,
+    ) -> tuple[str, str]:
+        if observer_mode or paper_mode == "OBSERVE_ONLY":
+            return "OperatingMode", "PAPER_MODE"
+        if risk_manager.recommended_action == "BLOCK":
+            return "RiskManagerAgent", "RISK"
+        if not symbol_tradable:
+            return "SymbolSelectionAgent", "SYMBOL_FILTER"
+        if critic.critic_decision == "REJECT":
+            return "StrategyCriticAgent", "CRITIC"
+        if not net_gate.approved:
+            return "NetProfitabilityGate", "NET_GATE"
+        if final_score < threshold:
+            return "TradingBrainOrchestrator", "FINAL_SCORE"
+        return "TradingBrainOrchestrator", "GENERAL"
+
+    def _evaluate_pending_no_trade_outcomes(self) -> None:
+        horizon = max(3, self._settings.simulated_max_hold_candles)
+        for row in self._database.get_unevaluated_no_trade_brain_decisions(limit=25):
+            payload = json.loads(str(row.get("raw_payload") or "{}"))
+            proposal = payload.get("best_proposal", {}) if isinstance(payload, dict) else {}
+            direction = str(proposal.get("proposed_decision", "NO_TRADE"))
+            if direction not in {"LONG", "SHORT"}:
+                self._database.update_brain_decision_outcome(decision_id=int(row["id"]), outcome_label="INSUFFICIENT_DATA")
+                continue
+            future_candles = self._database.get_next_candles(
+                symbol=str(row["symbol"]),
+                timeframe=str(row["timeframe"]),
+                after_close_time=str(row["timestamp"]),
+                limit=horizon,
+            )
+            if len(future_candles) < horizon:
+                continue
+            entry_price = future_candles[0].open
+            required_move = float(row.get("total_cost_pct") or 0.0)
+            if entry_price <= 0:
+                self._database.update_brain_decision_outcome(decision_id=int(row["id"]), outcome_label="INSUFFICIENT_DATA")
+                continue
+            if direction == "LONG":
+                max_favorable = max((((candle.high - entry_price) / entry_price) * 100) for candle in future_candles)
+                close_return = ((future_candles[-1].close - entry_price) / entry_price) * 100
+                max_adverse = min((((candle.low - entry_price) / entry_price) * 100) for candle in future_candles)
+            else:
+                max_favorable = max((((entry_price - candle.low) / entry_price) * 100) for candle in future_candles)
+                close_return = ((entry_price - future_candles[-1].close) / entry_price) * 100
+                max_adverse = min((((entry_price - candle.high) / entry_price) * 100) for candle in future_candles)
+            would_trade_if_exploration_enabled = bool(row.get("would_trade_if_exploration_enabled"))
+            if max_favorable >= max(required_move, 0.05) and close_return > 0:
+                outcome = "MISSED_OPPORTUNITY" if would_trade_if_exploration_enabled else "OVERFILTERED"
+            elif max_adverse <= -max(required_move, 0.05):
+                outcome = "BAD_TRADE_AVOIDED"
+            else:
+                outcome = "GOOD_AVOIDANCE"
+            self._database.update_brain_decision_outcome(decision_id=int(row["id"]), outcome_label=outcome)
+
     @staticmethod
     def _reject(symbol: str, timeframe: str, decision: str, market_state: str, risk_mode: str, provider_used: str, data_stale: bool, reason: str, payload: dict[str, object]) -> BrainDecision:
         return BrainDecision(
@@ -612,5 +880,6 @@ class TradingBrainOrchestrator:
             exit_reason=reason,
             provider_used=provider_used,
             data_stale=data_stale,
+            paper_mode="OBSERVE_ONLY",
             raw_payload=payload,
         )

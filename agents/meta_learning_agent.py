@@ -43,10 +43,19 @@ class MetaLearningAgent:
         timeframe: str,
         strategy_name: str,
         market_state: str,
+        paper_mode: str,
     ) -> MetaLearningAssessment:
         rows = self._database.get_recent_brain_decisions(limit=200)
-        matching = [row for row in rows if row["symbol"] == symbol and row["timeframe"] == timeframe and row["selected_strategy"] == strategy_name]
+        matching = [
+            row
+            for row in rows
+            if row["symbol"] == symbol
+            and row["timeframe"] == timeframe
+            and row["selected_strategy"] == strategy_name
+            and str(row.get("paper_mode") or "OBSERVE_ONLY") == paper_mode
+        ]
         sample_size = len(matching)
+        minimum_claim_sample = max(self._settings.min_sample_size_for_profitability_claim, 1)
         if sample_size < 20:
             strength = "WEAK"
             adjustment = 0.0
@@ -64,21 +73,32 @@ class MetaLearningAgent:
             adjustment = 0.12
         recent_strategy_evals = self._database.get_recent_strategy_evaluations(limit=100)
         preferred = tuple(
-            row["strategy_name"]
+            str(row["strategy_name"]).split("|", 1)[0]
             for row in recent_strategy_evals
-            if row["symbol"] == symbol and row["recommendation"] in {"PREFER", "ALLOW"}
+            if row["symbol"] == symbol and row["recommendation"] in {"PREFER", "ALLOW", "WATCHLIST_POSITIVE"}
         )[:3]
         blocked = tuple(
-            row["strategy_name"]
+            str(row["strategy_name"]).split("|", 1)[0]
             for row in recent_strategy_evals
             if row["symbol"] == symbol and row["recommendation"] in {"BLOCK", "AVOID"}
         )[:3]
         agent_rows = self._database.get_recent_agent_performance(limit=100)
         reliability = {row["agent_name"]: float(row["reliability_score"]) for row in agent_rows[:8]}
+        outcome_rows = [row for row in matching if str(row.get("final_decision")) == "NO_TRADE"]
+        missed_opportunities = sum(1 for row in outcome_rows if str(row.get("outcome_label") or "") in {"MISSED_OPPORTUNITY", "OVERFILTERED"})
+        good_avoidances = sum(1 for row in outcome_rows if str(row.get("outcome_label") or "") in {"GOOD_AVOIDANCE", "BAD_TRADE_AVOIDED"})
+        avg_edge = sum(float(row.get("expected_net_edge_pct") or 0.0) for row in matching) / sample_size if sample_size else 0.0
         if strategy_name in blocked:
             adjustment = min(adjustment, 0.0) - 0.08
         elif strategy_name in preferred:
             adjustment += 0.05
+        if sample_size >= minimum_claim_sample and avg_edge > 0:
+            adjustment += 0.04
+        if missed_opportunities > good_avoidances and sample_size >= 10:
+            adjustment += 0.02
+        if good_avoidances > missed_opportunities and avg_edge <= 0:
+            adjustment -= 0.02
+        adjustment = max(-0.15, min(0.15, adjustment))
         symbol_recommendation = "PREFER" if strategy_name in preferred else "AVOID" if strategy_name in blocked else "NEUTRAL"
         regime_recommendation = f"prefer {strategy_name} in {market_state}" if strategy_name in preferred else f"use caution in {market_state}"
         return MetaLearningAssessment(
@@ -89,6 +109,15 @@ class MetaLearningAgent:
             regime_recommendation=regime_recommendation,
             symbol_recommendation=symbol_recommendation,
             sample_strength=strength,
-            reason=json.dumps({"sample_size": sample_size, "market_state": market_state}, ensure_ascii=True),
+            reason=json.dumps(
+                {
+                    "sample_size": sample_size,
+                    "market_state": market_state,
+                    "paper_mode": paper_mode,
+                    "avg_edge": round(avg_edge, 6),
+                    "missed_opportunities": missed_opportunities,
+                    "good_avoidances": good_avoidances,
+                },
+                ensure_ascii=True,
+            ),
         )
-

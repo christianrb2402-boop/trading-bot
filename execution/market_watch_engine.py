@@ -23,10 +23,19 @@ class MarketWatchEngine:
         self._settings = settings
         self._trading_brain = trading_brain
 
-    def run(self, *, symbols: Sequence[str], timeframes: Sequence[str], run_minutes: int, prefer_fallback: bool, allow_stale_fallback: bool) -> MarketWatchResult:
-        deadline = datetime.now(timezone.utc) + timedelta(minutes=run_minutes)
-        fast_validation_mode = run_minutes <= 5
-        target_loops = max(1, run_minutes) if fast_validation_mode else None
+    def run(
+        self,
+        *,
+        symbols: Sequence[str],
+        timeframes: Sequence[str],
+        run_minutes: int | None,
+        max_loops: int | None,
+        prefer_fallback: bool,
+        allow_stale_fallback: bool,
+    ) -> MarketWatchResult:
+        deadline = datetime.now(timezone.utc) + timedelta(minutes=run_minutes or 5)
+        fast_validation_mode = max_loops is not None or (run_minutes or 0) <= 5
+        target_loops = max_loops if max_loops is not None else (max(1, run_minutes or 5) if fast_validation_mode else None)
         loops = 0
         observations = 0
         while datetime.now(timezone.utc) < deadline:

@@ -54,6 +54,7 @@ python main.py --load-history --symbols BTCUSDT ETHUSDT BNBUSDT SOLUSDT XRPUSDT 
 ```bat
 python main.py --quick-audit
 python main.py --preflight-live-paper
+python main.py --brain-report
 ```
 
 Objetivo:
@@ -90,8 +91,14 @@ Nota:
 ## 10. Prueba corta de live paper
 
 ```bat
-python main.py --live-paper-engine --max-loops 5
+python main.py --market-watch-engine --max-loops 5
+python main.py --autonomous-paper-engine --max-loops 5
 ```
+
+Interpretacion:
+- `market-watch-engine` observa y persiste decisiones sin abrir trades
+- `autonomous-paper-engine` si puede abrir paper trades, pero solo si el brain sale de `OBSERVE_ONLY`
+- si ambos pasan y el ledger sigue `OK`, la arquitectura viva esta sana aunque todavia no haya edge neto positivo
 
 ## 11. Prueba de 60 minutos
 
@@ -145,8 +152,10 @@ Archivos esperados:
 6. `python main.py --readiness-check`
 7. `python main.py --reconcile-ledger`
 8. `python main.py --status-report`
-9. `python main.py --benchmark --limit 5000 --timeframes "1m,5m,15m,30m,1h,4h,1d"`
-10. `python main.py --walk-forward --limit 10000 --train-pct 70 --timeframes "1m,5m,15m,30m,1h,4h,1d"`
-11. `python main.py --live-paper-engine --max-loops 5`
-12. `python main.py --live-paper-engine --run-minutes 60`
-13. `python main.py --export-report`
+9. `python main.py --brain-report`
+10. `python main.py --benchmark --limit 5000 --timeframes "1m,5m,15m,30m,1h,4h,1d"`
+11. `python main.py --walk-forward --limit 10000 --train-pct 70 --timeframes "1m,5m,15m,30m,1h,4h,1d"`
+12. `python main.py --market-watch-engine --max-loops 5`
+13. `python main.py --autonomous-paper-engine --max-loops 5`
+14. `python main.py --live-paper-engine --run-minutes 60`
+15. `python main.py --export-report`

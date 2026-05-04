@@ -871,6 +871,7 @@ def run_preflight_live_paper(
         "readiness": readiness,
         "ledger_report": ledger_report,
         "cost_validation": cost_validation,
+        "paper_mode": "OBSERVE_ONLY" if not short_ok else ("PAPER_SELECTIVE" if long_ok else "PAPER_EXPLORATION"),
     }
 
     if print_report:
@@ -878,6 +879,7 @@ def run_preflight_live_paper(
         print(f"SAFE_TO_RUN_SHORT_PAPER: {'YES' if short_ok else 'NO'}")
         print(f"SAFE_TO_RUN_LONG_PAPER: {'YES' if long_ok else 'NO'}")
         print(f"STRATEGY_NET_PROFITABLE: {'YES' if result['strategy_net_profitable'] else 'NO'}")
+        print(f"PAPER_MODE: {result['paper_mode']}")
         print("Reason:")
         print(f"- {reason}")
         print(f"- Binance reachable: {'YES' if readiness.binance_reachable else 'NO'}")
@@ -926,6 +928,7 @@ def run_quick_audit(
     print(f"SAFE_TO_RUN_SHORT_PAPER: {'YES' if safe_short else 'NO'}")
     print(f"SAFE_TO_RUN_LONG_PAPER: {'YES' if safe_long else 'NO'}")
     print(f"STRATEGY_NET_PROFITABLE: {'YES' if strategy_net_profitable else 'NO'}")
+    print(f"PAPER_MODE: {'OBSERVE_ONLY' if not safe_short else ('PAPER_SELECTIVE' if safe_long else 'PAPER_EXPLORATION')}")
     print("Reason:")
     for reason in reasons:
         print(f"- {reason}")
@@ -961,6 +964,7 @@ def run_quick_audit(
         "readiness": readiness,
         "ledger_report": ledger_report,
         "cost_validation": cost_validation,
+        "paper_mode": "OBSERVE_ONLY" if not safe_short else ("PAPER_SELECTIVE" if safe_long else "PAPER_EXPLORATION"),
     }
 
 
@@ -973,17 +977,18 @@ def refresh_brain_learning_tables(database: Database) -> None:
         conn.execute("DELETE FROM strategy_evaluations")
         conn.execute("DELETE FROM agent_performance")
 
-    grouped_trades: dict[tuple[str, str, str, str], list[dict[str, object]]] = defaultdict(list)
+    grouped_trades: dict[tuple[str, str, str, str, str], list[dict[str, object]]] = defaultdict(list)
     for row in trade_rows:
         key = (
             str(row.get("setup_signature") or "UNKNOWN"),
             str(row.get("symbol") or "UNKNOWN"),
             str(row.get("timeframe") or "UNKNOWN"),
             str(row.get("entry_market_regime") or "UNKNOWN"),
+            str(row.get("paper_mode") or "OBSERVE_ONLY"),
         )
         grouped_trades[key].append(row)
 
-    for (setup_key, symbol, timeframe, regime), rows in grouped_trades.items():
+    for (setup_key, symbol, timeframe, regime, paper_mode), rows in grouped_trades.items():
         trade_count = len(rows)
         gross_wins = sum(1 for row in rows if float(row.get("gross_pnl") or 0.0) > 0)
         net_wins = sum(1 for row in rows if float(row.get("final_net_pnl_after_all_costs") or row.get("net_pnl") or row.get("pnl") or 0.0) > 0)
@@ -1008,6 +1013,7 @@ def refresh_brain_learning_tables(database: Database) -> None:
             "symbol": symbol,
             "timeframe": timeframe,
             "regime": regime,
+            "paper_mode": paper_mode,
             "trade_count": trade_count,
             "gross_wins": gross_wins,
             "net_wins": net_wins,
@@ -1015,7 +1021,7 @@ def refresh_brain_learning_tables(database: Database) -> None:
         database.insert_strategy_evaluation(
             StrategyEvaluationRecord(
                 timestamp=timestamp,
-                strategy_name=setup_key,
+                strategy_name=f"{setup_key}|{paper_mode}",
                 symbol=symbol,
                 timeframe=timeframe,
                 regime=regime,
@@ -1060,18 +1066,8 @@ def refresh_brain_learning_tables(database: Database) -> None:
                 winning_votes += 1
             elif net_value < 0:
                 losing_votes += 1
-        missed_opportunities = sum(
-            1
-            for row in decision_rows
-            if str(row.get("final_decision")) == "NO_TRADE"
-            and float(row.get("expected_net_edge_pct") or 0.0) >= 0.25
-        )
-        good_avoidances = sum(
-            1
-            for row in decision_rows
-            if str(row.get("final_decision")) == "NO_TRADE"
-            and float(row.get("expected_net_edge_pct") or 0.0) <= 0.0
-        )
+        missed_opportunities = sum(1 for row in decision_rows if str(row.get("outcome_label") or "") in {"MISSED_OPPORTUNITY", "OVERFILTERED"})
+        good_avoidances = sum(1 for row in decision_rows if str(row.get("outcome_label") or "") in {"GOOD_AVOIDANCE", "BAD_TRADE_AVOIDED"})
         avg_net_after_vote = sum(net_pnls) / len(net_pnls) if net_pnls else 0.0
         reliability_base = (winning_votes / max(winning_votes + losing_votes, 1)) if (winning_votes + losing_votes) else 0.5
         reliability_score = max(0.0, min(1.0, reliability_base + ((approved_votes / max(total_votes, 1)) - 0.5) * 0.1))
@@ -1099,15 +1095,34 @@ def build_brain_snapshot(database: Database) -> dict[str, object]:
     recent_strategy_evaluations = database.get_recent_strategy_evaluations(limit=10)
     recent_agent_performance = database.get_recent_agent_performance(limit=10)
     recent_brain_decisions = database.get_recent_brain_decisions(limit=10)
+    aggregate_brain_decisions = database.get_recent_brain_decisions(limit=1000)
     recent_risk_events = database.get_recent_risk_events(limit=10)
     recent_provider_status = database.get_recent_provider_status(limit=10)
     recent_data_quality_events = database.get_recent_data_quality_events(limit=10)
     recent_websocket_events = database.get_recent_websocket_events(limit=10)
     recent_gap_repairs = database.get_recent_gap_repair_events(limit=10)
+    provider_summary = database.get_current_provider_summary()
     top_rejection_reasons: dict[str, int] = defaultdict(int)
-    for row in recent_brain_decisions:
+    rejected_symbols: dict[str, int] = defaultdict(int)
+    rejected_timeframes: dict[str, int] = defaultdict(int)
+    rejected_strategies: dict[str, int] = defaultdict(int)
+    rejected_by_stage: dict[str, int] = defaultdict(int)
+    paper_modes: dict[str, int] = defaultdict(int)
+    missed_opportunities = 0
+    good_avoidances = 0
+    for row in aggregate_brain_decisions:
+        paper_modes[str(row.get("paper_mode") or "OBSERVE_ONLY")] += 1
+        outcome_label = str(row.get("outcome_label") or "")
+        if outcome_label in {"MISSED_OPPORTUNITY", "OVERFILTERED"}:
+            missed_opportunities += 1
+        elif outcome_label in {"GOOD_AVOIDANCE", "BAD_TRADE_AVOIDED"}:
+            good_avoidances += 1
         if str(row.get("final_decision")) == "NO_TRADE":
             top_rejection_reasons[str(row.get("reason") or "unknown")] += 1
+            rejected_symbols[str(row.get("symbol") or "UNKNOWN")] += 1
+            rejected_timeframes[str(row.get("timeframe") or "UNKNOWN")] += 1
+            rejected_strategies[str(row.get("selected_strategy") or "UNKNOWN")] += 1
+            rejected_by_stage[str(row.get("rejected_stage") or "GENERAL")] += 1
     return {
         "recent_feature_snapshots": recent_feature_snapshots,
         "recent_strategy_votes": recent_strategy_votes,
@@ -1116,10 +1131,19 @@ def build_brain_snapshot(database: Database) -> dict[str, object]:
         "recent_brain_decisions": recent_brain_decisions,
         "recent_risk_events": recent_risk_events,
         "recent_provider_status": recent_provider_status,
+        "provider_summary": provider_summary,
         "recent_data_quality_events": recent_data_quality_events,
         "recent_websocket_events": recent_websocket_events,
         "recent_gap_repairs": recent_gap_repairs,
         "top_rejection_reasons": sorted(top_rejection_reasons.items(), key=lambda item: item[1], reverse=True)[:10],
+        "rejected_symbols": sorted(rejected_symbols.items(), key=lambda item: item[1], reverse=True)[:10],
+        "rejected_timeframes": sorted(rejected_timeframes.items(), key=lambda item: item[1], reverse=True)[:10],
+        "rejected_strategies": sorted(rejected_strategies.items(), key=lambda item: item[1], reverse=True)[:10],
+        "rejected_by_stage": sorted(rejected_by_stage.items(), key=lambda item: item[1], reverse=True)[:10],
+        "paper_modes": dict(paper_modes),
+        "current_paper_mode": recent_brain_decisions[0].get("paper_mode", "OBSERVE_ONLY") if recent_brain_decisions else "OBSERVE_ONLY",
+        "missed_opportunities": missed_opportunities,
+        "good_avoidances": good_avoidances,
     }
 
 
@@ -1164,7 +1188,46 @@ def build_status_snapshot(
         timeframes=settings.market_timeframes,
         ledger_result=ledger_report.result,
     )
-    current_provider = recent_market_snapshots[0]["provider_used"] if recent_market_snapshots else "UNKNOWN"
+    provider_summary = database.get_current_provider_summary()
+    current_provider = (
+        (provider_summary.get("current_live_provider") or {}).get("provider")
+        or (provider_summary.get("latest_market_snapshot_provider") or {}).get("provider_used")
+        or "UNKNOWN"
+    )
+    last_successful_provider = (provider_summary.get("last_successful_provider") or {}).get("provider", "UNKNOWN")
+    latest_brain_provider = (provider_summary.get("latest_brain_provider") or {}).get("provider_used", "UNKNOWN")
+    latest_market_snapshot_provider = (provider_summary.get("latest_market_snapshot_provider") or {}).get("provider_used", "UNKNOWN")
+    with database.connection() as conn:
+        brain_counts_row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total_brain_decisions,
+                SUM(CASE WHEN outcome_label IN ('MISSED_OPPORTUNITY', 'OVERFILTERED') THEN 1 ELSE 0 END) AS missed_opportunities,
+                SUM(CASE WHEN outcome_label IN ('GOOD_AVOIDANCE', 'BAD_TRADE_AVOIDED') THEN 1 ELSE 0 END) AS good_avoidances,
+                SUM(CASE WHEN COALESCE(paper_mode, 'OBSERVE_ONLY') = 'PAPER_EXPLORATION' THEN 1 ELSE 0 END) AS exploration_decisions,
+                SUM(CASE WHEN COALESCE(paper_mode, 'OBSERVE_ONLY') = 'PAPER_SELECTIVE' THEN 1 ELSE 0 END) AS selective_decisions
+            FROM brain_decisions
+            """
+        ).fetchone()
+        strategy_vote_count_row = conn.execute("SELECT COUNT(*) AS total_strategy_votes FROM strategy_votes").fetchone()
+        rejected_counts_row = conn.execute(
+            """
+            SELECT
+                SUM(CASE WHEN COALESCE(rejected_stage, '') = 'NET_GATE' THEN 1 ELSE 0 END) AS rejected_by_cost,
+                SUM(CASE WHEN COALESCE(rejected_stage, '') = 'RISK' THEN 1 ELSE 0 END) AS rejected_by_risk,
+                SUM(CASE WHEN COALESCE(rejected_stage, '') IN ('CRITIC', 'FINAL_SCORE') THEN 1 ELSE 0 END) AS rejected_by_contradiction,
+                SUM(CASE WHEN COALESCE(rejected_stage, '') IN ('PAPER_MODE', 'SYMBOL_FILTER') THEN 1 ELSE 0 END) AS rejected_by_insufficient_data
+            FROM rejected_signals_log
+            """
+        ).fetchone()
+        trade_mode_row = conn.execute(
+            """
+            SELECT
+                SUM(CASE WHEN COALESCE(paper_mode, 'OBSERVE_ONLY') = 'PAPER_EXPLORATION' THEN 1 ELSE 0 END) AS exploratory_trades,
+                SUM(CASE WHEN COALESCE(paper_mode, 'OBSERVE_ONLY') = 'PAPER_SELECTIVE' THEN 1 ELSE 0 END) AS selective_trades
+            FROM simulated_trades
+            """
+        ).fetchone()
     symbol_health: list[dict[str, object]] = []
     for symbol in settings.market_symbols:
         for timeframe in settings.market_timeframes:
@@ -1192,6 +1255,10 @@ def build_status_snapshot(
     return {
         "database_path": str(settings.sqlite_path),
         "current_provider": current_provider,
+        "last_successful_provider": last_successful_provider,
+        "latest_brain_provider": latest_brain_provider,
+        "latest_market_snapshot_provider": latest_market_snapshot_provider,
+        "current_paper_mode": brain_snapshot["current_paper_mode"],
         "candle_counts": candle_counts,
         "signal_counts": signal_counts,
         "recent_signals": recent_signals,
@@ -1213,6 +1280,18 @@ def build_status_snapshot(
         "recent_benchmarks": recent_benchmarks,
         "recent_walk_forward": recent_walk_forward,
         "total_agent_decisions": database.count_agent_decisions(),
+        "total_brain_decisions": int(brain_counts_row["total_brain_decisions"] or 0),
+        "total_strategy_votes": int(strategy_vote_count_row["total_strategy_votes"] or 0),
+        "missed_opportunities": int(brain_counts_row["missed_opportunities"] or 0),
+        "good_avoidances": int(brain_counts_row["good_avoidances"] or 0),
+        "exploration_decisions": int(brain_counts_row["exploration_decisions"] or 0),
+        "selective_decisions": int(brain_counts_row["selective_decisions"] or 0),
+        "exploratory_trades": int(trade_mode_row["exploratory_trades"] or 0),
+        "selective_trades": int(trade_mode_row["selective_trades"] or 0),
+        "rejected_by_cost": int(rejected_counts_row["rejected_by_cost"] or 0),
+        "rejected_by_risk": int(rejected_counts_row["rejected_by_risk"] or 0),
+        "rejected_by_contradiction": int(rejected_counts_row["rejected_by_contradiction"] or 0),
+        "rejected_by_insufficient_data": int(rejected_counts_row["rejected_by_insufficient_data"] or 0),
         "total_paper_orders": database.count_paper_orders(),
         "open_paper_positions_count": database.count_open_paper_positions(),
         "symbol_health": symbol_health,
@@ -1269,7 +1348,11 @@ def run_status_report(
 
     print("Status Report")
     print(f"Database path: {snapshot['database_path']}")
-    print(f"Current provider: {snapshot['current_provider']}")
+    print(f"Current live provider: {snapshot['current_provider']}")
+    print(f"Last successful provider: {snapshot['last_successful_provider']}")
+    print(f"Provider used in latest brain decision: {snapshot['latest_brain_provider']}")
+    print(f"Provider used in latest market snapshot: {snapshot['latest_market_snapshot_provider']}")
+    print(f"Current paper mode: {snapshot['current_paper_mode']}")
     print("")
 
     print("Readiness snapshot:")
@@ -1328,7 +1411,11 @@ def run_status_report(
         for row in recent_rejected_signals:
             print(
                 f"- [{row['id']}] {row['timestamp']} {row['symbol']} {row['timeframe']} "
-                f"tier={row['signal_tier']} reason={row['reason']} thresholds_failed={row['thresholds_failed']}"
+                f"tier={row['signal_tier']} paper_mode={row.get('paper_mode', 'OBSERVE_ONLY')} "
+                f"rejected_by={row.get('rejected_by_agent') or 'UNKNOWN'} stage={row.get('rejected_stage') or 'GENERAL'} "
+                f"reason={row['reason']} expected_move={row.get('expected_move_pct', 0.0)} "
+                f"cost={row.get('total_cost_pct', 0.0)} edge={row.get('expected_net_edge_pct', 0.0)} "
+                f"rr={row.get('risk_reward_ratio', 0.0)} explore_if_enabled={row.get('would_trade_if_exploration_enabled', 0)}"
             )
     else:
         print("- none")
@@ -1405,10 +1492,22 @@ def run_status_report(
 
     print("Operational counters:")
     print(f"- total agent decisions: {snapshot['total_agent_decisions']}")
+    print(f"- total brain decisions: {snapshot['total_brain_decisions']}")
+    print(f"- total strategy votes: {snapshot['total_strategy_votes']}")
     print(f"- total paper orders: {snapshot['total_paper_orders']}")
     print(f"- open paper positions: {snapshot['open_paper_positions_count']}")
     print(f"- open simulated trades: {len(open_trades)}")
     print(f"- closed simulated trades: {trade_metrics['closed_trades']}")
+    print(f"- exploration decisions: {snapshot['exploration_decisions']}")
+    print(f"- selective decisions: {snapshot['selective_decisions']}")
+    print(f"- exploratory trades: {snapshot['exploratory_trades']}")
+    print(f"- selective trades: {snapshot['selective_trades']}")
+    print(f"- missed opportunities: {snapshot['missed_opportunities']}")
+    print(f"- good avoidances: {snapshot['good_avoidances']}")
+    print(f"- rejected by cost: {snapshot['rejected_by_cost']}")
+    print(f"- rejected by risk: {snapshot['rejected_by_risk']}")
+    print(f"- rejected by contradiction: {snapshot['rejected_by_contradiction']}")
+    print(f"- rejected by insufficient data: {snapshot['rejected_by_insufficient_data']}")
     print("")
 
     print("Open paper positions:")
@@ -1766,8 +1865,12 @@ def run_brain_report(
         recommendation = "DO_NOT_TRADE"
 
     print("Brain Report")
-    print(f"Current provider: {snapshot['current_provider']}")
+    print(f"Current live provider: {snapshot['current_provider']}")
+    print(f"Last successful provider: {snapshot['last_successful_provider']}")
+    print(f"Provider used in latest brain decision: {snapshot['latest_brain_provider']}")
+    print(f"Provider used in latest market snapshot: {snapshot['latest_market_snapshot_provider']}")
     print(f"Connectivity status: {'BINANCE_HTTP_OK' if readiness_report['binance_reachable'] else 'BINANCE_HTTP_FAIL'}")
+    print(f"Paper mode: {snapshot['current_paper_mode']}")
     print(f"Fresh symbols/timeframes: {len(fresh_symbols)}")
     print(f"Stale symbols/timeframes: {len(stale_symbols)}")
     print(f"Risk mode recommended: {brain_snapshot['recent_brain_decisions'][0]['risk_mode'] if brain_snapshot['recent_brain_decisions'] else 'UNKNOWN'}")
@@ -1778,6 +1881,12 @@ def run_brain_report(
     print(f"Spread accumulated: {trade_metrics['total_spread_paid']}")
     print(f"Equity simulated: {portfolio.get('total_equity', 0.0)}")
     print(f"Gross wins that became net losses: {gross_wins_net_losses}")
+    print(f"Missed opportunities: {snapshot['missed_opportunities']}")
+    print(f"Good avoidances: {snapshot['good_avoidances']}")
+    print(f"Rejected by cost: {snapshot['rejected_by_cost']}")
+    print(f"Rejected by risk: {snapshot['rejected_by_risk']}")
+    print(f"Rejected by contradiction: {snapshot['rejected_by_contradiction']}")
+    print(f"Rejected by insufficient data: {snapshot['rejected_by_insufficient_data']}")
     print(f"Too conservative: {'YES' if too_conservative else 'NO'}")
     print(f"Too aggressive: {'YES' if too_aggressive else 'NO'}")
     print(f"Recommendation: {recommendation}")
@@ -1810,6 +1919,16 @@ def run_brain_report(
     for reason, count in brain_snapshot["top_rejection_reasons"][:10]:
         print(f"- count={count} reason={reason}")
     if not brain_snapshot["top_rejection_reasons"]:
+        print("- none")
+    print("Rejected symbols:")
+    for symbol, count in brain_snapshot["rejected_symbols"][:10]:
+        print(f"- count={count} symbol={symbol}")
+    if not brain_snapshot["rejected_symbols"]:
+        print("- none")
+    print("Rejected strategies:")
+    for strategy, count in brain_snapshot["rejected_strategies"][:10]:
+        print(f"- count={count} strategy={strategy}")
+    if not brain_snapshot["rejected_strategies"]:
         print("- none")
     print("")
     print(f"Strategy net profitable after costs: {'YES' if strategy_net_profitable else 'NO'}")
@@ -1921,6 +2040,10 @@ def run_export_report(
             "portfolio": snapshot["portfolio"],
             "ledger_consistency": snapshot["ledger_report"],
             "provider_used": snapshot["current_provider"],
+            "last_successful_provider": snapshot["last_successful_provider"],
+            "latest_brain_provider": snapshot["latest_brain_provider"],
+            "latest_market_snapshot_provider": snapshot["latest_market_snapshot_provider"],
+            "paper_mode": snapshot["current_paper_mode"],
             "symbols": list(settings.market_symbols),
             "timeframes": list(settings.market_timeframes),
             "supported_execution_timeframes": list(settings.execution_timeframes),
@@ -1941,6 +2064,10 @@ def run_export_report(
                 "average_cost_per_trade": snapshot["trade_metrics"]["average_cost_per_trade"],
                 "average_required_move_to_break_even": snapshot["trade_metrics"]["average_required_move_to_break_even"],
                 "breakeven_winrate_approx": snapshot["trade_metrics"]["breakeven_winrate_approx"],
+                "rejected_by_cost": snapshot["rejected_by_cost"],
+                "rejected_by_risk": snapshot["rejected_by_risk"],
+                "rejected_by_contradiction": snapshot["rejected_by_contradiction"],
+                "rejected_by_insufficient_data": snapshot["rejected_by_insufficient_data"],
             },
             "brain": {
                 "recent_strategy_votes": brain_snapshot["recent_strategy_votes"],
@@ -1953,6 +2080,12 @@ def run_export_report(
                 "recent_websocket_events": brain_snapshot["recent_websocket_events"],
                 "recent_gap_repairs": brain_snapshot["recent_gap_repairs"],
                 "top_rejection_reasons": brain_snapshot["top_rejection_reasons"],
+                "rejected_symbols": brain_snapshot["rejected_symbols"],
+                "rejected_timeframes": brain_snapshot["rejected_timeframes"],
+                "rejected_strategies": brain_snapshot["rejected_strategies"],
+                "paper_modes": brain_snapshot["paper_modes"],
+                "missed_opportunities": snapshot["missed_opportunities"],
+                "good_avoidances": snapshot["good_avoidances"],
             },
         },
         "details": snapshot,
@@ -1995,7 +2128,8 @@ def run_market_watch_engine(
     *,
     symbols: tuple[str, ...],
     timeframes: tuple[str, ...],
-    run_minutes: int,
+    run_minutes: int | None,
+    max_loops: int | None,
     prefer_fallback: bool,
     allow_stale_fallback: bool,
 ) -> None:
@@ -2003,6 +2137,7 @@ def run_market_watch_engine(
         symbols=symbols,
         timeframes=timeframes,
         run_minutes=run_minutes,
+        max_loops=max_loops,
         prefer_fallback=prefer_fallback,
         allow_stale_fallback=allow_stale_fallback,
     )
@@ -2018,7 +2153,8 @@ def run_autonomous_paper_engine(
     *,
     symbols: tuple[str, ...],
     timeframes: tuple[str, ...],
-    run_minutes: int,
+    run_minutes: int | None,
+    max_loops: int | None,
     prefer_fallback: bool,
     allow_stale_fallback: bool,
 ) -> object:
@@ -2026,6 +2162,7 @@ def run_autonomous_paper_engine(
         symbols=symbols,
         timeframes=timeframes,
         run_minutes=run_minutes,
+        max_loops=max_loops,
         prefer_fallback=prefer_fallback,
         allow_stale_fallback=allow_stale_fallback,
     )
@@ -2838,7 +2975,8 @@ def main() -> int:
                 market_watch_engine,
                 symbols=symbols,
                 timeframes=timeframes,
-                run_minutes=args.run_minutes or 5,
+                run_minutes=args.run_minutes or (None if args.max_loops is not None else 5),
+                max_loops=args.max_loops,
                 prefer_fallback=prefer_fallback,
                 allow_stale_fallback=args.allow_stale_fallback,
             )
@@ -2869,7 +3007,8 @@ def main() -> int:
                 autonomous_paper_engine,
                 symbols=symbols,
                 timeframes=timeframes,
-                run_minutes=args.run_minutes or 5,
+                run_minutes=args.run_minutes or (None if args.max_loops is not None else 5),
+                max_loops=args.max_loops,
                 prefer_fallback=prefer_fallback,
                 allow_stale_fallback=args.allow_stale_fallback,
             )

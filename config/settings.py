@@ -77,6 +77,16 @@ class Settings:
     min_cost_coverage_multiple_conservative: float
     min_cost_coverage_multiple_balanced: float
     min_cost_coverage_multiple_aggressive: float
+    paper_mode_auto: bool
+    exploration_max_trades_per_hour: int
+    exploration_max_open_positions: int
+    exploration_risk_per_trade_pct: float
+    exploration_max_daily_drawdown_pct: float
+    exploration_min_rr: float
+    selective_min_rr: float
+    exploration_min_cost_coverage_multiple: float
+    selective_min_cost_coverage_multiple: float
+    min_sample_size_for_profitability_claim: int
     brain_min_final_score: float
     autonomous_loop_seconds: int
     market_watch_loop_seconds: int
@@ -253,6 +263,16 @@ def load_settings() -> Settings:
         min_cost_coverage_multiple_conservative=float(os.getenv("MIN_COST_COVERAGE_MULTIPLE_CONSERVATIVE", "3.0")),
         min_cost_coverage_multiple_balanced=float(os.getenv("MIN_COST_COVERAGE_MULTIPLE_BALANCED", "2.5")),
         min_cost_coverage_multiple_aggressive=float(os.getenv("MIN_COST_COVERAGE_MULTIPLE_AGGRESSIVE", "2.0")),
+        paper_mode_auto=_parse_bool(os.getenv("PAPER_MODE_AUTO", "true"), True),
+        exploration_max_trades_per_hour=int(os.getenv("EXPLORATION_MAX_TRADES_PER_HOUR", "3")),
+        exploration_max_open_positions=int(os.getenv("EXPLORATION_MAX_OPEN_POSITIONS", "1")),
+        exploration_risk_per_trade_pct=float(os.getenv("EXPLORATION_RISK_PER_TRADE_PCT", "0.10")),
+        exploration_max_daily_drawdown_pct=float(os.getenv("EXPLORATION_MAX_DAILY_DRAWDOWN_PCT", "1.00")),
+        exploration_min_rr=float(os.getenv("EXPLORATION_MIN_RR", "1.10")),
+        selective_min_rr=float(os.getenv("SELECTIVE_MIN_RR", "1.50")),
+        exploration_min_cost_coverage_multiple=float(os.getenv("EXPLORATION_MIN_COST_COVERAGE_MULTIPLE", "1.10")),
+        selective_min_cost_coverage_multiple=float(os.getenv("SELECTIVE_MIN_COST_COVERAGE_MULTIPLE", "1.50")),
+        min_sample_size_for_profitability_claim=int(os.getenv("MIN_SAMPLE_SIZE_FOR_PROFITABILITY_CLAIM", "50")),
         brain_min_final_score=float(os.getenv("BRAIN_MIN_FINAL_SCORE", "0.55")),
         autonomous_loop_seconds=int(os.getenv("AUTONOMOUS_LOOP_SECONDS", "60")),
         market_watch_loop_seconds=int(os.getenv("MARKET_WATCH_LOOP_SECONDS", "60")),

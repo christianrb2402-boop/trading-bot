@@ -37,10 +37,19 @@ class AutonomousPaperEngine:
         self._execution_agent = execution_agent
         self._ledger_reconciler = ledger_reconciler
 
-    def run(self, *, symbols: Sequence[str], timeframes: Sequence[str], run_minutes: int, prefer_fallback: bool, allow_stale_fallback: bool) -> AutonomousPaperResult:
-        deadline = datetime.now(timezone.utc) + timedelta(minutes=run_minutes)
-        fast_validation_mode = run_minutes <= 5
-        target_loops = max(1, run_minutes) if fast_validation_mode else None
+    def run(
+        self,
+        *,
+        symbols: Sequence[str],
+        timeframes: Sequence[str],
+        run_minutes: int | None,
+        max_loops: int | None,
+        prefer_fallback: bool,
+        allow_stale_fallback: bool,
+    ) -> AutonomousPaperResult:
+        deadline = datetime.now(timezone.utc) + timedelta(minutes=run_minutes or 5)
+        fast_validation_mode = max_loops is not None or (run_minutes or 0) <= 5
+        target_loops = max_loops if max_loops is not None else (max(1, run_minutes or 5) if fast_validation_mode else None)
         loops = 0
         decisions = 0
         opened = 0
@@ -84,9 +93,11 @@ class AutonomousPaperEngine:
                         "setup_signature": decision.selected_strategy,
                         "explanation": decision.entry_reason,
                         "provider_used": decision.provider_used,
+                        "paper_mode": decision.paper_mode,
                         "risk_reward_snapshot": decision.raw_payload.get("risk_reward", {}),
                         "cost_snapshot": decision.raw_payload.get("cost_snapshot", {}),
                         "agent_votes": decision.raw_payload.get("strategy_votes", []),
+                        "position_size_usd": decision.raw_payload.get("position_size_usd", 0.0),
                     }
                     result = self._execution_agent.process_cycle(
                         symbol=symbol,

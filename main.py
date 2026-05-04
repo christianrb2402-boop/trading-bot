@@ -5,6 +5,7 @@ import csv
 import json
 import logging
 import time
+from collections import defaultdict
 from datetime import datetime, timezone
 
 from analytics.backtest_engine import BacktestEngine
@@ -12,38 +13,73 @@ from analytics.benchmark_engine import BenchmarkEngine
 from analytics.performance_analyzer import PerformanceAnalyzer
 from analytics.walk_forward_engine import WalkForwardEngine
 from agents.audit_agent import AuditAgent
+from agents.breakout_agent import BreakoutAgent
 from agents.cost_model_agent import CostModelAgent
 from agents.decision_orchestrator import DecisionOrchestrator
 from agents.delta_agent import DeltaAgent
 from agents.execution_simulator_agent import ExecutionSimulatorAgent
 from agents.market_data_agent import MarketDataAgent
 from agents.market_context_agent import MarketContextAgent
+from agents.market_state_agent import MarketStateAgent
+from agents.mean_reversion_agent import MeanReversionAgent
+from agents.meta_learning_agent import MetaLearningAgent
+from agents.momentum_scalp_agent import MomentumScalpAgent
 from agents.net_profitability_gate import NetProfitabilityGate
 from agents.performance_learning_agent import PerformanceLearningAgent
+from agents.pullback_continuation_agent import PullbackContinuationAgent
+from agents.risk_manager_agent import RiskManagerAgent
 from agents.risk_reward_agent import RiskRewardAgent
 from agents.signal_evaluator import SignalEvaluator
+from agents.strategy_critic_agent import StrategyCriticAgent
+from agents.strategy_selection_agent import StrategySelectionAgent
 from agents.symbol_selection_agent import SymbolSelectionAgent
+from agents.trading_brain_orchestrator import TradingBrainOrchestrator
+from agents.trend_following_agent import TrendFollowingAgent
 from config.settings import Settings, load_settings
 from core.database import (
     AgentDecisionRecord,
+    AgentPerformanceRecord,
+    BrainDecisionRecord,
+    DataQualityEventRecord,
     Database,
     ErrorEventRecord,
+    FeatureSnapshotRecord,
+    GapRepairEventRecord,
     MarketContextRecord,
+    ProviderStatusRecord,
     RejectedSignalRecord,
+    RiskEventRecord,
     SignalLogRecord,
+    StrategyEvaluationRecord,
+    StrategyVoteRecord,
+    WebsocketEventRecord,
 )
 from core.exceptions import TradingSystemError
 from core.ledger_reconciler import LedgerConsistencyReport, LedgerReconciler
 from core.logger import configure_logging
 from core.runtime_checks import ReadinessReport, build_readiness_report, format_age_seconds, inspect_symbol_health, timeframe_to_seconds
 from data.binance_market_data import BinanceConnectivityProbe, BinanceMarketDataService
+from data.binance_websocket_provider import BinanceWebsocketProvider
 from data.market_data_provider import BinanceProvider, FutureYahooProvider, LocalSQLiteProvider, ProviderRouter
+from execution.autonomous_paper_engine import AutonomousPaperEngine
 from execution.live_paper_engine import LivePaperEngine, LivePaperEngineResult
+from execution.market_watch_engine import MarketWatchEngine
 from execution.paper_trader import PaperTrader
 from execution.simulated_trade_tracker import SimulatedTradeTracker
+from features.feature_store import FeatureStore
 
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_json_loads(value: str | None) -> dict[str, object]:
+    if not value:
+        return {}
+    try:
+        loaded = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -58,12 +94,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--paper-trade", action="store_true", help="Ejecuta paper trading LONG-only con datos reales de Binance")
     parser.add_argument("--continuous-engine", action="store_true", help="Ejecuta analisis continuo de mercado cada 60 segundos")
     parser.add_argument("--live-paper-engine", action="store_true", help="Ejecuta el motor live paper trading con comite y ledger simulado")
+    parser.add_argument("--market-watch-engine", action="store_true", help="Observa el mercado con el brain sin abrir trades")
+    parser.add_argument("--autonomous-paper-engine", action="store_true", help="Ejecuta paper trading autonomo usando el brain multiagente")
     parser.add_argument("--backtest", action="store_true", help="Ejecuta backtest historico candle by candle sin fuga de datos")
     parser.add_argument("--benchmark", action="store_true", help="Compara la estrategia contra benchmarks basicos")
     parser.add_argument("--walk-forward", action="store_true", help="Ejecuta validacion walk-forward sin fuga de datos")
     parser.add_argument("--reconcile-ledger", action="store_true", help="Revisa y reconcilia ledger, posiciones y exposicion")
     parser.add_argument("--status-report", action="store_true", help="Muestra el estado persistido del sistema")
     parser.add_argument("--export-report", action="store_true", help="Exporta un reporte auditable en JSON")
+    parser.add_argument("--brain-report", action="store_true", help="Muestra el estado del cerebro multiagente y su memoria reciente")
     parser.add_argument("--diagnose-connectivity", action="store_true", help="Prueba conectividad HTTP real hacia Binance")
     parser.add_argument("--readiness-check", action="store_true", help="Evalua si el sistema esta listo para correr live paper largo")
     parser.add_argument("--quick-audit", action="store_true", help="Ejecuta una auditoria operativa corta sin trading real")
@@ -925,6 +964,165 @@ def run_quick_audit(
     }
 
 
+def refresh_brain_learning_tables(database: Database) -> None:
+    timestamp = datetime.now(timezone.utc).isoformat()
+    with database.connection() as conn:
+        trade_rows = [dict(row) for row in conn.execute("SELECT * FROM simulated_trades WHERE status != 'OPEN'").fetchall()]
+        vote_rows = [dict(row) for row in conn.execute("SELECT * FROM strategy_votes").fetchall()]
+        decision_rows = [dict(row) for row in conn.execute("SELECT * FROM brain_decisions").fetchall()]
+        conn.execute("DELETE FROM strategy_evaluations")
+        conn.execute("DELETE FROM agent_performance")
+
+    grouped_trades: dict[tuple[str, str, str, str], list[dict[str, object]]] = defaultdict(list)
+    for row in trade_rows:
+        key = (
+            str(row.get("setup_signature") or "UNKNOWN"),
+            str(row.get("symbol") or "UNKNOWN"),
+            str(row.get("timeframe") or "UNKNOWN"),
+            str(row.get("entry_market_regime") or "UNKNOWN"),
+        )
+        grouped_trades[key].append(row)
+
+    for (setup_key, symbol, timeframe, regime), rows in grouped_trades.items():
+        trade_count = len(rows)
+        gross_wins = sum(1 for row in rows if float(row.get("gross_pnl") or 0.0) > 0)
+        net_wins = sum(1 for row in rows if float(row.get("final_net_pnl_after_all_costs") or row.get("net_pnl") or row.get("pnl") or 0.0) > 0)
+        avg_gross = sum(float(row.get("gross_pnl") or 0.0) for row in rows) / trade_count
+        avg_net = sum(float(row.get("final_net_pnl_after_all_costs") or row.get("net_pnl") or row.get("pnl") or 0.0) for row in rows) / trade_count
+        avg_cost_drag = sum(float(row.get("total_cost_drag") or 0.0) for row in rows) / trade_count
+        max_drawdown = min(float(row.get("final_net_pnl_after_all_costs") or row.get("net_pnl") or row.get("pnl") or 0.0) for row in rows)
+        if trade_count >= 20 and avg_net > 0:
+            confidence_adjustment = 0.08
+            recommendation = "PREFER"
+        elif avg_net > 0:
+            confidence_adjustment = 0.03
+            recommendation = "WATCHLIST_POSITIVE"
+        elif trade_count >= 20:
+            confidence_adjustment = -0.08
+            recommendation = "AVOID"
+        else:
+            confidence_adjustment = -0.03 if avg_net < 0 else 0.0
+            recommendation = "NEUTRAL"
+        payload = {
+            "setup_key": setup_key,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "regime": regime,
+            "trade_count": trade_count,
+            "gross_wins": gross_wins,
+            "net_wins": net_wins,
+        }
+        database.insert_strategy_evaluation(
+            StrategyEvaluationRecord(
+                timestamp=timestamp,
+                strategy_name=setup_key,
+                symbol=symbol,
+                timeframe=timeframe,
+                regime=regime,
+                trades_count=trade_count,
+                gross_winrate=round((gross_wins / trade_count) * 100, 2),
+                net_winrate=round((net_wins / trade_count) * 100, 2),
+                avg_gross_pnl=round(avg_gross, 6),
+                avg_net_pnl=round(avg_net, 6),
+                cost_drag=round(avg_cost_drag, 6),
+                max_drawdown=round(max_drawdown, 6),
+                confidence_adjustment=round(confidence_adjustment, 6),
+                recommendation=recommendation,
+                raw_payload=json.dumps(payload, ensure_ascii=True),
+            )
+        )
+
+    grouped_votes: dict[str, list[dict[str, object]]] = defaultdict(list)
+    for row in vote_rows:
+        grouped_votes[str(row.get("agent_name") or "UNKNOWN")].append(row)
+
+    for agent_name, rows in grouped_votes.items():
+        total_votes = len(rows)
+        approved_votes = sum(1 for row in rows if bool(row.get("approved")))
+        rejected_votes = total_votes - approved_votes
+        winning_votes = 0
+        losing_votes = 0
+        net_pnls: list[float] = []
+        for vote in rows:
+            matching = [
+                trade
+                for trade in trade_rows
+                if str(trade.get("symbol")) == str(vote.get("symbol"))
+                and str(trade.get("timeframe")) == str(vote.get("timeframe"))
+                and str(trade.get("setup_signature") or "UNKNOWN") == str(vote.get("strategy_name") or "UNKNOWN")
+            ]
+            if not matching:
+                continue
+            trade = matching[-1]
+            net_value = float(trade.get("final_net_pnl_after_all_costs") or trade.get("net_pnl") or trade.get("pnl") or 0.0)
+            net_pnls.append(net_value)
+            if net_value > 0:
+                winning_votes += 1
+            elif net_value < 0:
+                losing_votes += 1
+        missed_opportunities = sum(
+            1
+            for row in decision_rows
+            if str(row.get("final_decision")) == "NO_TRADE"
+            and float(row.get("expected_net_edge_pct") or 0.0) >= 0.25
+        )
+        good_avoidances = sum(
+            1
+            for row in decision_rows
+            if str(row.get("final_decision")) == "NO_TRADE"
+            and float(row.get("expected_net_edge_pct") or 0.0) <= 0.0
+        )
+        avg_net_after_vote = sum(net_pnls) / len(net_pnls) if net_pnls else 0.0
+        reliability_base = (winning_votes / max(winning_votes + losing_votes, 1)) if (winning_votes + losing_votes) else 0.5
+        reliability_score = max(0.0, min(1.0, reliability_base + ((approved_votes / max(total_votes, 1)) - 0.5) * 0.1))
+        database.insert_agent_performance(
+            AgentPerformanceRecord(
+                timestamp=timestamp,
+                agent_name=agent_name,
+                total_votes=total_votes,
+                approved_votes=approved_votes,
+                rejected_votes=rejected_votes,
+                winning_votes=winning_votes,
+                losing_votes=losing_votes,
+                missed_opportunities=missed_opportunities,
+                good_avoidances=good_avoidances,
+                avg_net_pnl_after_vote=round(avg_net_after_vote, 6),
+                reliability_score=round(reliability_score, 6),
+            )
+        )
+
+
+def build_brain_snapshot(database: Database) -> dict[str, object]:
+    refresh_brain_learning_tables(database)
+    recent_feature_snapshots = database.get_recent_feature_snapshots(limit=10)
+    recent_strategy_votes = database.get_recent_strategy_votes(limit=10)
+    recent_strategy_evaluations = database.get_recent_strategy_evaluations(limit=10)
+    recent_agent_performance = database.get_recent_agent_performance(limit=10)
+    recent_brain_decisions = database.get_recent_brain_decisions(limit=10)
+    recent_risk_events = database.get_recent_risk_events(limit=10)
+    recent_provider_status = database.get_recent_provider_status(limit=10)
+    recent_data_quality_events = database.get_recent_data_quality_events(limit=10)
+    recent_websocket_events = database.get_recent_websocket_events(limit=10)
+    recent_gap_repairs = database.get_recent_gap_repair_events(limit=10)
+    top_rejection_reasons: dict[str, int] = defaultdict(int)
+    for row in recent_brain_decisions:
+        if str(row.get("final_decision")) == "NO_TRADE":
+            top_rejection_reasons[str(row.get("reason") or "unknown")] += 1
+    return {
+        "recent_feature_snapshots": recent_feature_snapshots,
+        "recent_strategy_votes": recent_strategy_votes,
+        "recent_strategy_evaluations": recent_strategy_evaluations,
+        "recent_agent_performance": recent_agent_performance,
+        "recent_brain_decisions": recent_brain_decisions,
+        "recent_risk_events": recent_risk_events,
+        "recent_provider_status": recent_provider_status,
+        "recent_data_quality_events": recent_data_quality_events,
+        "recent_websocket_events": recent_websocket_events,
+        "recent_gap_repairs": recent_gap_repairs,
+        "top_rejection_reasons": sorted(top_rejection_reasons.items(), key=lambda item: item[1], reverse=True)[:10],
+    }
+
+
 def build_status_snapshot(
     database: Database,
     settings: Settings,
@@ -932,6 +1130,7 @@ def build_status_snapshot(
     ledger_reconciler: LedgerReconciler,
     service: BinanceMarketDataService,
 ) -> dict[str, object]:
+    brain_snapshot = build_brain_snapshot(database)
     performance_report = performance_analyzer.refresh()
     candle_counts = database.list_candle_counts()
     signal_counts = database.list_signal_counts()
@@ -1019,6 +1218,7 @@ def build_status_snapshot(
         "symbol_health": symbol_health,
         "latest_decisions_by_agent": latest_decisions_by_agent,
         "ledger_report": ledger_report.as_dict(),
+        "brain_snapshot": brain_snapshot,
         "readiness_report": {
             "ready_for_live_paper": readiness_report.ready_for_live_paper,
             "binance_reachable": readiness_report.binance_reachable,
@@ -1065,6 +1265,7 @@ def run_status_report(
     latest_decisions_by_agent = snapshot["latest_decisions_by_agent"]
     ledger_report = snapshot["ledger_report"]
     readiness_report = snapshot["readiness_report"]
+    brain_snapshot = snapshot["brain_snapshot"]
 
     print("Status Report")
     print(f"Database path: {snapshot['database_path']}")
@@ -1426,6 +1627,86 @@ def run_status_report(
         print("- none")
     print("")
 
+    print("Brain decisions:")
+    if brain_snapshot["recent_brain_decisions"]:
+        for row in brain_snapshot["recent_brain_decisions"]:
+            print(
+                f"- [{row['id']}] {row['timestamp']} {row['symbol']} {row['timeframe']} "
+                f"decision={row['final_decision']} strategy={row['selected_strategy']} "
+                f"market_state={row['market_state']} risk_mode={row['risk_mode']} "
+                f"final_score={row['final_score']} approved={bool(row['approved'])} reason={row['reason']}"
+            )
+    else:
+        print("- none")
+    print("")
+
+    print("Recent strategy votes:")
+    if brain_snapshot["recent_strategy_votes"]:
+        for row in brain_snapshot["recent_strategy_votes"]:
+            print(
+                f"- [{row['id']}] {row['timestamp']} {row['agent_name']} {row['symbol']} {row['timeframe']} "
+                f"strategy={row['strategy_name']} decision={row['decision']} confidence={row['confidence']} "
+                f"net_edge={row['expected_net_edge_pct']} approved={bool(row['approved'])}"
+            )
+    else:
+        print("- none")
+    print("")
+
+    print("Strategy evaluations:")
+    if brain_snapshot["recent_strategy_evaluations"]:
+        for row in brain_snapshot["recent_strategy_evaluations"]:
+            print(
+                f"- [{row['id']}] {row['strategy_name']} {row['symbol']} {row['timeframe']} regime={row['regime']} "
+                f"trades={row['trades_count']} gross_winrate={row['gross_winrate']}% "
+                f"net_winrate={row['net_winrate']}% avg_net_pnl={row['avg_net_pnl']} "
+                f"recommendation={row['recommendation']}"
+            )
+    else:
+        print("- none")
+    print("")
+
+    print("Agent performance:")
+    if brain_snapshot["recent_agent_performance"]:
+        for row in brain_snapshot["recent_agent_performance"]:
+            print(
+                f"- [{row['id']}] {row['agent_name']} total_votes={row['total_votes']} "
+                f"winning_votes={row['winning_votes']} losing_votes={row['losing_votes']} "
+                f"avg_net_after_vote={row['avg_net_pnl_after_vote']} reliability={row['reliability_score']}"
+            )
+    else:
+        print("- none")
+    print("")
+
+    print("Provider status:")
+    if brain_snapshot["recent_provider_status"]:
+        for row in brain_snapshot["recent_provider_status"]:
+            print(
+                f"- [{row['id']}] {row['timestamp']} provider={row['provider']} status={row['status']} "
+                f"latency_ms={row['latency_ms']} last_success_at={row['last_success_at']} last_error={row['last_error']}"
+            )
+    else:
+        print("- none")
+    print("")
+
+    print("Data quality events:")
+    if brain_snapshot["recent_data_quality_events"]:
+        for row in brain_snapshot["recent_data_quality_events"]:
+            print(
+                f"- [{row['id']}] {row['timestamp']} {row['symbol']} {row['timeframe']} "
+                f"{row['event_type']} severity={row['severity']} reason={row['reason']}"
+            )
+    else:
+        print("- none")
+    print("")
+
+    print("Top rejection reasons:")
+    if brain_snapshot["top_rejection_reasons"]:
+        for reason, count in brain_snapshot["top_rejection_reasons"]:
+            print(f"- count={count} reason={reason}")
+    else:
+        print("- none")
+    print("")
+
     print("Last 10 errors:")
     if recent_errors:
         for error in recent_errors:
@@ -1451,6 +1732,89 @@ def run_status_report(
         print("- none")
 
 
+def run_brain_report(
+    database: Database,
+    settings: Settings,
+    performance_analyzer: PerformanceAnalyzer,
+    ledger_reconciler: LedgerReconciler,
+    service: BinanceMarketDataService,
+) -> None:
+    snapshot = build_status_snapshot(database, settings, performance_analyzer, ledger_reconciler, service)
+    brain_snapshot = snapshot["brain_snapshot"]
+    trade_metrics = snapshot["trade_metrics"]
+    performance_by_symbol = snapshot["performance_by_symbol"]
+    symbol_health = snapshot["symbol_health"]
+    readiness_report = snapshot["readiness_report"]
+    portfolio = snapshot["portfolio"] or {}
+
+    fresh_symbols = [row for row in symbol_health if not row["is_stale"] and row["is_valid"]]
+    stale_symbols = [row for row in symbol_health if row["is_stale"]]
+    best_symbols = performance_by_symbol[:3]
+    worst_symbols = list(reversed(performance_by_symbol[-3:])) if performance_by_symbol else []
+    reliable_agents = sorted(brain_snapshot["recent_agent_performance"], key=lambda row: float(row.get("reliability_score") or 0.0), reverse=True)
+    best_strategies = sorted(brain_snapshot["recent_strategy_evaluations"], key=lambda row: float(row.get("avg_net_pnl") or 0.0), reverse=True)
+    gross_wins_net_losses = int(trade_metrics.get("gross_win_net_loss", 0) or 0)
+    strategy_net_profitable = float(trade_metrics.get("total_pnl", 0.0) or 0.0) > 0
+
+    too_conservative = not snapshot["open_trades"] and gross_wins_net_losses == 0 and float(trade_metrics.get("closed_trades", 0) or 0.0) == 0
+    too_aggressive = float(portfolio.get("drawdown", 0.0) or 0.0) < -(settings.max_daily_drawdown_pct * 100)
+    if readiness_report["can_run_long_paper"] and not too_aggressive and not stale_symbols:
+        recommendation = "PAPER_TRADE_ALLOWED"
+    elif readiness_report["can_run_short_paper"]:
+        recommendation = "OBSERVE_ONLY"
+    else:
+        recommendation = "DO_NOT_TRADE"
+
+    print("Brain Report")
+    print(f"Current provider: {snapshot['current_provider']}")
+    print(f"Connectivity status: {'BINANCE_HTTP_OK' if readiness_report['binance_reachable'] else 'BINANCE_HTTP_FAIL'}")
+    print(f"Fresh symbols/timeframes: {len(fresh_symbols)}")
+    print(f"Stale symbols/timeframes: {len(stale_symbols)}")
+    print(f"Risk mode recommended: {brain_snapshot['recent_brain_decisions'][0]['risk_mode'] if brain_snapshot['recent_brain_decisions'] else 'UNKNOWN'}")
+    print(f"Gross winrate: {trade_metrics['gross_winrate']}%")
+    print(f"Net winrate: {trade_metrics['winrate']}%")
+    print(f"Fees accumulated: {trade_metrics['total_fees_paid']}")
+    print(f"Slippage accumulated: {trade_metrics['total_slippage_paid']}")
+    print(f"Spread accumulated: {trade_metrics['total_spread_paid']}")
+    print(f"Equity simulated: {portfolio.get('total_equity', 0.0)}")
+    print(f"Gross wins that became net losses: {gross_wins_net_losses}")
+    print(f"Too conservative: {'YES' if too_conservative else 'NO'}")
+    print(f"Too aggressive: {'YES' if too_aggressive else 'NO'}")
+    print(f"Recommendation: {recommendation}")
+    print("")
+    print("Best symbols:")
+    for row in best_symbols:
+        print(f"- {row['symbol']} total_net_pnl={row['total_net_pnl']} trades={row['trade_count']}")
+    if not best_symbols:
+        print("- none")
+    print("")
+    print("Worst symbols:")
+    for row in worst_symbols:
+        print(f"- {row['symbol']} total_net_pnl={row['total_net_pnl']} trades={row['trade_count']}")
+    if not worst_symbols:
+        print("- none")
+    print("")
+    print("Most reliable agents:")
+    for row in reliable_agents[:5]:
+        print(f"- {row['agent_name']} reliability={row['reliability_score']} avg_net_after_vote={row['avg_net_pnl_after_vote']}")
+    if not reliable_agents:
+        print("- none")
+    print("")
+    print("Best strategies:")
+    for row in best_strategies[:5]:
+        print(f"- {row['strategy_name']} {row['symbol']} {row['timeframe']} avg_net_pnl={row['avg_net_pnl']} net_winrate={row['net_winrate']}% recommendation={row['recommendation']}")
+    if not best_strategies:
+        print("- none")
+    print("")
+    print("Main rejection reasons:")
+    for reason, count in brain_snapshot["top_rejection_reasons"][:10]:
+        print(f"- count={count} reason={reason}")
+    if not brain_snapshot["top_rejection_reasons"]:
+        print("- none")
+    print("")
+    print(f"Strategy net profitable after costs: {'YES' if strategy_net_profitable else 'NO'}")
+
+
 def run_export_report(
     database: Database,
     settings: Settings,
@@ -1460,6 +1824,7 @@ def run_export_report(
     export_format: str,
 ) -> str:
     snapshot = build_status_snapshot(database, settings, performance_analyzer, ledger_reconciler, service)
+    brain_snapshot = snapshot["brain_snapshot"]
     output_dir = settings.sqlite_path.parent
     if export_format == "csv":
         trade_metrics = snapshot["trade_metrics"]
@@ -1523,6 +1888,18 @@ def run_export_report(
             "readiness.csv": readiness_rows,
             "net_profitability_summary.csv": profitability_rows,
             "recent_agent_decisions.csv": snapshot["recent_decisions"],
+            "strategy_votes.csv": brain_snapshot["recent_strategy_votes"],
+            "strategy_evaluations.csv": brain_snapshot["recent_strategy_evaluations"],
+            "agent_performance.csv": brain_snapshot["recent_agent_performance"],
+            "brain_decisions.csv": brain_snapshot["recent_brain_decisions"],
+            "risk_events.csv": brain_snapshot["recent_risk_events"],
+            "feature_snapshots.csv": brain_snapshot["recent_feature_snapshots"],
+            "provider_status.csv": brain_snapshot["recent_provider_status"],
+            "data_quality_events.csv": brain_snapshot["recent_data_quality_events"],
+            "websocket_events.csv": brain_snapshot["recent_websocket_events"],
+            "gap_repair_events.csv": brain_snapshot["recent_gap_repairs"],
+            "recent_brain_decisions.csv": brain_snapshot["recent_brain_decisions"],
+            "rejected_signals.csv": snapshot["recent_rejected_signals"],
         }
         for filename, rows in csv_targets.items():
             path = output_dir / filename
@@ -1565,6 +1942,18 @@ def run_export_report(
                 "average_required_move_to_break_even": snapshot["trade_metrics"]["average_required_move_to_break_even"],
                 "breakeven_winrate_approx": snapshot["trade_metrics"]["breakeven_winrate_approx"],
             },
+            "brain": {
+                "recent_strategy_votes": brain_snapshot["recent_strategy_votes"],
+                "recent_strategy_evaluations": brain_snapshot["recent_strategy_evaluations"],
+                "recent_agent_performance": brain_snapshot["recent_agent_performance"],
+                "recent_brain_decisions": brain_snapshot["recent_brain_decisions"],
+                "recent_risk_events": brain_snapshot["recent_risk_events"],
+                "recent_provider_status": brain_snapshot["recent_provider_status"],
+                "recent_data_quality_events": brain_snapshot["recent_data_quality_events"],
+                "recent_websocket_events": brain_snapshot["recent_websocket_events"],
+                "recent_gap_repairs": brain_snapshot["recent_gap_repairs"],
+                "top_rejection_reasons": brain_snapshot["top_rejection_reasons"],
+            },
         },
         "details": snapshot,
     }
@@ -1598,6 +1987,56 @@ def run_live_paper_engine(
     print(f"Decisions persisted: {result.decisions_persisted}")
     print(f"Trades opened: {result.trades_opened}")
     print(f"Trades closed: {result.trades_closed}")
+    return result
+
+
+def run_market_watch_engine(
+    market_watch_engine: MarketWatchEngine,
+    *,
+    symbols: tuple[str, ...],
+    timeframes: tuple[str, ...],
+    run_minutes: int,
+    prefer_fallback: bool,
+    allow_stale_fallback: bool,
+) -> None:
+    result = market_watch_engine.run(
+        symbols=symbols,
+        timeframes=timeframes,
+        run_minutes=run_minutes,
+        prefer_fallback=prefer_fallback,
+        allow_stale_fallback=allow_stale_fallback,
+    )
+    print("Market Watch Engine Summary")
+    print(f"Symbols: {', '.join(symbols)}")
+    print(f"Timeframes: {', '.join(timeframes)}")
+    print(f"Loops completed: {result.loops_completed}")
+    print(f"Observations recorded: {result.observations_recorded}")
+
+
+def run_autonomous_paper_engine(
+    autonomous_paper_engine: AutonomousPaperEngine,
+    *,
+    symbols: tuple[str, ...],
+    timeframes: tuple[str, ...],
+    run_minutes: int,
+    prefer_fallback: bool,
+    allow_stale_fallback: bool,
+) -> object:
+    result = autonomous_paper_engine.run(
+        symbols=symbols,
+        timeframes=timeframes,
+        run_minutes=run_minutes,
+        prefer_fallback=prefer_fallback,
+        allow_stale_fallback=allow_stale_fallback,
+    )
+    print("Autonomous Paper Engine Summary")
+    print(f"Symbols: {', '.join(symbols)}")
+    print(f"Timeframes: {', '.join(timeframes)}")
+    print(f"Loops completed: {result.loops_completed}")
+    print(f"Decisions processed: {result.decisions_processed}")
+    print(f"Trades opened: {result.trades_opened}")
+    print(f"Trades closed: {result.trades_closed}")
+    print(f"Stopped reason: {result.stopped_reason}")
     return result
 
 
@@ -1957,6 +2396,41 @@ def main() -> int:
     audit_agent = AuditAgent()
     decision_orchestrator = DecisionOrchestrator(settings)
     ledger_reconciler = LedgerReconciler(database, settings)
+    feature_store = FeatureStore(database=database, settings=settings)
+    market_state_agent = MarketStateAgent()
+    strategy_selection_agent = StrategySelectionAgent()
+    strategy_critic_agent = StrategyCriticAgent()
+    risk_manager_agent = RiskManagerAgent(settings)
+    meta_learning_agent = MetaLearningAgent(database, settings)
+    binance_websocket_provider = BinanceWebsocketProvider()
+    trading_brain = TradingBrainOrchestrator(
+        database=database,
+        settings=settings,
+        provider_router=provider_router,
+        market_data_agent=market_data_agent,
+        market_context_agent=market_context_agent,
+        delta_agent=delta_agent,
+        symbol_selection_agent=symbol_selection_agent,
+        cost_model_agent=cost_model_agent,
+        risk_reward_agent=risk_reward_agent,
+        net_profitability_gate=net_profitability_gate,
+        decision_orchestrator=decision_orchestrator,
+        feature_store=feature_store,
+        market_state_agent=market_state_agent,
+        strategy_selection_agent=strategy_selection_agent,
+        strategy_critic_agent=strategy_critic_agent,
+        risk_manager_agent=risk_manager_agent,
+        meta_learning_agent=meta_learning_agent,
+        ledger_reconciler=ledger_reconciler,
+    )
+    market_watch_engine = MarketWatchEngine(database=database, settings=settings, trading_brain=trading_brain)
+    autonomous_paper_engine = AutonomousPaperEngine(
+        database=database,
+        settings=settings,
+        trading_brain=trading_brain,
+        execution_agent=execution_simulator_agent,
+        ledger_reconciler=ledger_reconciler,
+    )
     live_paper_engine = LivePaperEngine(
         database=database,
         settings=settings,
@@ -2011,6 +2485,27 @@ def main() -> int:
             optimization_thresholds,
         )
         initialize_database(database, str(settings.sqlite_path))
+        websocket_status = binance_websocket_provider.heartbeat()
+        database.insert_provider_status(
+            ProviderStatusRecord(
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                provider=websocket_status.provider,
+                status=websocket_status.status,
+                latency_ms=websocket_status.latency_ms,
+                last_success_at=None,
+                last_error=websocket_status.reason,
+            )
+        )
+        database.insert_websocket_event(
+            WebsocketEventRecord(
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                provider=websocket_status.provider,
+                event_type="HEARTBEAT",
+                status=websocket_status.status,
+                detail=websocket_status.reason,
+                raw_payload=json.dumps(websocket_status.as_dict(), ensure_ascii=True),
+            )
+        )
 
         if args.init_only:
             logger.info(
@@ -2092,6 +2587,14 @@ def main() -> int:
             logger.info(
                 "Clean shutdown",
                 extra={"event": "shutdown", "context": {"status": "export_report_success"}},
+            )
+            return 0
+
+        if args.brain_report:
+            run_brain_report(database, settings, performance_analyzer, ledger_reconciler, service)
+            logger.info(
+                "Clean shutdown",
+                extra={"event": "shutdown", "context": {"status": "brain_report_success"}},
             )
             return 0
 
@@ -2315,6 +2818,65 @@ def main() -> int:
             logger.info(
                 "Clean shutdown",
                 extra={"event": "shutdown", "context": {"status": "live_paper_engine_success"}},
+            )
+            return 0
+
+        if args.market_watch_engine:
+            preflight = run_preflight_live_paper(
+                settings=settings,
+                database=database,
+                service=service,
+                market_data_agent=market_data_agent,
+                ledger_reconciler=ledger_reconciler,
+                symbols=symbols,
+                timeframes=timeframes,
+                allow_stale_fallback=args.allow_stale_fallback,
+                print_report=False,
+            )
+            prefer_fallback = not preflight["readiness"].binance_reachable
+            run_market_watch_engine(
+                market_watch_engine,
+                symbols=symbols,
+                timeframes=timeframes,
+                run_minutes=args.run_minutes or 5,
+                prefer_fallback=prefer_fallback,
+                allow_stale_fallback=args.allow_stale_fallback,
+            )
+            logger.info(
+                "Clean shutdown",
+                extra={"event": "shutdown", "context": {"status": "market_watch_engine_success"}},
+            )
+            return 0
+
+        if args.autonomous_paper_engine:
+            preflight = run_preflight_live_paper(
+                settings=settings,
+                database=database,
+                service=service,
+                market_data_agent=market_data_agent,
+                ledger_reconciler=ledger_reconciler,
+                symbols=symbols,
+                timeframes=timeframes,
+                allow_stale_fallback=args.allow_stale_fallback,
+                print_report=True,
+            )
+            if not preflight["safe_to_run_short_paper"]:
+                print("Autonomous paper engine blocked by preflight.")
+                print(f"Reason: {preflight['reason']}")
+                return 1
+            prefer_fallback = not preflight["readiness"].binance_reachable
+            run_autonomous_paper_engine(
+                autonomous_paper_engine,
+                symbols=symbols,
+                timeframes=timeframes,
+                run_minutes=args.run_minutes or 5,
+                prefer_fallback=prefer_fallback,
+                allow_stale_fallback=args.allow_stale_fallback,
+            )
+            run_export_report(database, settings, performance_analyzer, ledger_reconciler, service, "json")
+            logger.info(
+                "Clean shutdown",
+                extra={"event": "shutdown", "context": {"status": "autonomous_paper_engine_success"}},
             )
             return 0
 

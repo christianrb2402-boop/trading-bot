@@ -63,8 +63,10 @@ class NetProfitabilityGate:
         *,
         signal: dict[str, object],
         cost_snapshot: CostSnapshot,
+        risk_mode: str | None = None,
     ) -> NetProfitabilityAssessment:
         direction = str(signal.get("signal_type", "NONE"))
+        effective_risk_mode = (risk_mode or str(signal.get("risk_mode", "")) or self._settings.aggressiveness_level).upper()
         expected_move_pct = float(cost_snapshot.expected_gross_reward_pct)
         expected_move_value = float(cost_snapshot.notional_exposure) * (expected_move_pct / 100)
         total_estimated_costs = float(cost_snapshot.total_estimated_costs)
@@ -79,13 +81,21 @@ class NetProfitabilityGate:
         volatility_pct = max(float(signal.get("volatility_pct", 0.0)), 0.0)
 
         rejection_reasons: list[str] = []
+        if effective_risk_mode in {"CAPITAL_PROTECTION", "DO_NOT_TRADE"}:
+            rejection_reasons.append(f"risk mode {effective_risk_mode} blocks new entries")
+        if effective_risk_mode == "CONSERVATIVE":
+            min_cost_coverage = self._settings.min_cost_coverage_multiple_conservative
+        elif effective_risk_mode in {"BALANCED", ""}:
+            min_cost_coverage = self._settings.min_cost_coverage_multiple_balanced
+        else:
+            min_cost_coverage = self._settings.min_cost_coverage_multiple_aggressive
         if direction not in {"LONG", "SHORT"}:
             rejection_reasons.append("signal is not actionable")
         if expected_net_edge_value <= 0 or expected_net_edge_pct <= 0:
             rejection_reasons.append("expected net edge is not positive after estimated costs")
-        if cost_coverage_multiple < self._settings.min_cost_coverage_multiple:
+        if cost_coverage_multiple < min_cost_coverage:
             rejection_reasons.append(
-                f"expected move only covers {round(cost_coverage_multiple, 4)}x estimated costs"
+                f"expected move only covers {round(cost_coverage_multiple, 4)}x estimated costs, below required {round(min_cost_coverage, 4)}x for {effective_risk_mode}"
             )
         if net_reward_risk < self._settings.min_net_reward_risk_ratio:
             rejection_reasons.append(

@@ -128,6 +128,143 @@ class StrategyInsightRecord:
 
 
 @dataclass(slots=True, frozen=True)
+class FeatureSnapshotRecord:
+    timestamp: str
+    symbol: str
+    timeframe: str
+    feature_payload: str
+    quality_score: float
+    provider: str
+
+
+@dataclass(slots=True, frozen=True)
+class StrategyVoteRecord:
+    timestamp: str
+    symbol: str
+    timeframe: str
+    agent_name: str
+    strategy_name: str
+    decision: str
+    confidence: float
+    score: float
+    expected_move_pct: float
+    expected_net_edge_pct: float
+    cost_estimate_pct: float
+    risk_reward_ratio: float
+    regime: str
+    risk_mode: str
+    approved: bool
+    rejection_reason: str | None
+    raw_payload: str
+
+
+@dataclass(slots=True, frozen=True)
+class StrategyEvaluationRecord:
+    timestamp: str
+    strategy_name: str
+    symbol: str
+    timeframe: str
+    regime: str
+    trades_count: int
+    gross_winrate: float
+    net_winrate: float
+    avg_gross_pnl: float
+    avg_net_pnl: float
+    cost_drag: float
+    max_drawdown: float
+    confidence_adjustment: float
+    recommendation: str
+    raw_payload: str
+
+
+@dataclass(slots=True, frozen=True)
+class AgentPerformanceRecord:
+    timestamp: str
+    agent_name: str
+    total_votes: int
+    approved_votes: int
+    rejected_votes: int
+    winning_votes: int
+    losing_votes: int
+    missed_opportunities: int
+    good_avoidances: int
+    avg_net_pnl_after_vote: float
+    reliability_score: float
+
+
+@dataclass(slots=True, frozen=True)
+class BrainDecisionRecord:
+    timestamp: str
+    symbol: str
+    timeframe: str
+    final_decision: str
+    final_score: float
+    market_state: str
+    selected_strategy: str
+    risk_mode: str
+    expected_net_edge_pct: float
+    risk_reward_ratio: float
+    cost_coverage_multiple: float
+    approved: bool
+    reason: str
+    raw_payload: str
+
+
+@dataclass(slots=True, frozen=True)
+class RiskEventRecord:
+    timestamp: str
+    event_type: str
+    severity: str
+    symbol: str | None
+    reason: str
+    action_taken: str
+    raw_payload: str
+
+
+@dataclass(slots=True, frozen=True)
+class ProviderStatusRecord:
+    timestamp: str
+    provider: str
+    status: str
+    latency_ms: float
+    last_success_at: str | None
+    last_error: str | None
+
+
+@dataclass(slots=True, frozen=True)
+class DataQualityEventRecord:
+    timestamp: str
+    symbol: str
+    timeframe: str
+    event_type: str
+    severity: str
+    reason: str
+    raw_payload: str
+
+
+@dataclass(slots=True, frozen=True)
+class WebsocketEventRecord:
+    timestamp: str
+    provider: str
+    event_type: str
+    status: str
+    detail: str
+    raw_payload: str
+
+
+@dataclass(slots=True, frozen=True)
+class GapRepairEventRecord:
+    timestamp: str
+    symbol: str
+    timeframe: str
+    gaps_detected: int
+    gaps_repaired: int
+    provider_used: str
+    reason: str
+    raw_payload: str
+
+
+@dataclass(slots=True, frozen=True)
 class TradeRecord:
     id: int
     symbol: str
@@ -951,6 +1088,231 @@ class Database:
                 """
                 CREATE INDEX IF NOT EXISTS idx_strategy_insights_type_time
                 ON strategy_insights (insight_type, timestamp DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS feature_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    feature_payload TEXT NOT NULL,
+                    quality_score REAL NOT NULL,
+                    provider TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_feature_snapshots_lookup
+                ON feature_snapshots (symbol, timeframe, timestamp DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS strategy_votes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    agent_name TEXT NOT NULL,
+                    strategy_name TEXT NOT NULL,
+                    decision TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    score REAL NOT NULL,
+                    expected_move_pct REAL NOT NULL,
+                    expected_net_edge_pct REAL NOT NULL,
+                    cost_estimate_pct REAL NOT NULL,
+                    risk_reward_ratio REAL NOT NULL,
+                    regime TEXT NOT NULL,
+                    risk_mode TEXT NOT NULL,
+                    approved INTEGER NOT NULL,
+                    rejection_reason TEXT,
+                    raw_payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_strategy_votes_lookup
+                ON strategy_votes (symbol, timeframe, strategy_name, timestamp DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS strategy_evaluations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    strategy_name TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    regime TEXT NOT NULL,
+                    trades_count INTEGER NOT NULL,
+                    gross_winrate REAL NOT NULL,
+                    net_winrate REAL NOT NULL,
+                    avg_gross_pnl REAL NOT NULL,
+                    avg_net_pnl REAL NOT NULL,
+                    cost_drag REAL NOT NULL,
+                    max_drawdown REAL NOT NULL,
+                    confidence_adjustment REAL NOT NULL,
+                    recommendation TEXT NOT NULL,
+                    raw_payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_strategy_evaluations_lookup
+                ON strategy_evaluations (strategy_name, symbol, timeframe, timestamp DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_performance (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    agent_name TEXT NOT NULL,
+                    total_votes INTEGER NOT NULL,
+                    approved_votes INTEGER NOT NULL,
+                    rejected_votes INTEGER NOT NULL,
+                    winning_votes INTEGER NOT NULL,
+                    losing_votes INTEGER NOT NULL,
+                    missed_opportunities INTEGER NOT NULL,
+                    good_avoidances INTEGER NOT NULL,
+                    avg_net_pnl_after_vote REAL NOT NULL,
+                    reliability_score REAL NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_agent_performance_lookup
+                ON agent_performance (agent_name, timestamp DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS brain_decisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    final_decision TEXT NOT NULL,
+                    final_score REAL NOT NULL,
+                    market_state TEXT NOT NULL,
+                    selected_strategy TEXT NOT NULL,
+                    risk_mode TEXT NOT NULL,
+                    expected_net_edge_pct REAL NOT NULL,
+                    risk_reward_ratio REAL NOT NULL,
+                    cost_coverage_multiple REAL NOT NULL,
+                    approved INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    raw_payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_brain_decisions_lookup
+                ON brain_decisions (symbol, timeframe, timestamp DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS risk_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    severity TEXT NOT NULL,
+                    symbol TEXT,
+                    reason TEXT NOT NULL,
+                    action_taken TEXT NOT NULL,
+                    raw_payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS provider_status (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    latency_ms REAL NOT NULL,
+                    last_success_at TEXT,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_provider_status_lookup
+                ON provider_status (provider, timestamp DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS data_quality_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    severity TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    raw_payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_data_quality_events_lookup
+                ON data_quality_events (symbol, timeframe, timestamp DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS websocket_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    raw_payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS gap_repair_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    gaps_detected INTEGER NOT NULL,
+                    gaps_repaired INTEGER NOT NULL,
+                    provider_used TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    raw_payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_gap_repair_events_lookup
+                ON gap_repair_events (symbol, timeframe, timestamp DESC)
                 """
             )
             conn.execute(
@@ -2834,6 +3196,355 @@ class Database:
                 ORDER BY id DESC
                 LIMIT ?
                 """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def insert_feature_snapshot(self, record: FeatureSnapshotRecord) -> int:
+        created_at = datetime.now(timezone.utc).isoformat()
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO feature_snapshots (
+                    timestamp, symbol, timeframe, feature_payload, quality_score, provider, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.timestamp,
+                    record.symbol,
+                    record.timeframe,
+                    record.feature_payload,
+                    record.quality_score,
+                    record.provider,
+                    created_at,
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def get_latest_feature_snapshot(self, *, symbol: str, timeframe: str) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM feature_snapshots
+                WHERE symbol = ? AND timeframe = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (symbol, timeframe),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_recent_feature_snapshots(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM feature_snapshots ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def insert_strategy_vote(self, record: StrategyVoteRecord) -> int:
+        created_at = datetime.now(timezone.utc).isoformat()
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO strategy_votes (
+                    timestamp, symbol, timeframe, agent_name, strategy_name, decision, confidence, score,
+                    expected_move_pct, expected_net_edge_pct, cost_estimate_pct, risk_reward_ratio, regime,
+                    risk_mode, approved, rejection_reason, raw_payload, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.timestamp,
+                    record.symbol,
+                    record.timeframe,
+                    record.agent_name,
+                    record.strategy_name,
+                    record.decision,
+                    record.confidence,
+                    record.score,
+                    record.expected_move_pct,
+                    record.expected_net_edge_pct,
+                    record.cost_estimate_pct,
+                    record.risk_reward_ratio,
+                    record.regime,
+                    record.risk_mode,
+                    1 if record.approved else 0,
+                    record.rejection_reason,
+                    record.raw_payload,
+                    created_at,
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def get_recent_strategy_votes(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM strategy_votes ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def insert_strategy_evaluation(self, record: StrategyEvaluationRecord) -> int:
+        created_at = datetime.now(timezone.utc).isoformat()
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO strategy_evaluations (
+                    timestamp, strategy_name, symbol, timeframe, regime, trades_count, gross_winrate,
+                    net_winrate, avg_gross_pnl, avg_net_pnl, cost_drag, max_drawdown, confidence_adjustment,
+                    recommendation, raw_payload, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.timestamp,
+                    record.strategy_name,
+                    record.symbol,
+                    record.timeframe,
+                    record.regime,
+                    record.trades_count,
+                    record.gross_winrate,
+                    record.net_winrate,
+                    record.avg_gross_pnl,
+                    record.avg_net_pnl,
+                    record.cost_drag,
+                    record.max_drawdown,
+                    record.confidence_adjustment,
+                    record.recommendation,
+                    record.raw_payload,
+                    created_at,
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def get_recent_strategy_evaluations(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM strategy_evaluations ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def insert_agent_performance(self, record: AgentPerformanceRecord) -> int:
+        created_at = datetime.now(timezone.utc).isoformat()
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO agent_performance (
+                    timestamp, agent_name, total_votes, approved_votes, rejected_votes, winning_votes,
+                    losing_votes, missed_opportunities, good_avoidances, avg_net_pnl_after_vote,
+                    reliability_score, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.timestamp,
+                    record.agent_name,
+                    record.total_votes,
+                    record.approved_votes,
+                    record.rejected_votes,
+                    record.winning_votes,
+                    record.losing_votes,
+                    record.missed_opportunities,
+                    record.good_avoidances,
+                    record.avg_net_pnl_after_vote,
+                    record.reliability_score,
+                    created_at,
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def get_recent_agent_performance(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM agent_performance ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def insert_brain_decision(self, record: BrainDecisionRecord) -> int:
+        created_at = datetime.now(timezone.utc).isoformat()
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO brain_decisions (
+                    timestamp, symbol, timeframe, final_decision, final_score, market_state, selected_strategy,
+                    risk_mode, expected_net_edge_pct, risk_reward_ratio, cost_coverage_multiple, approved,
+                    reason, raw_payload, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.timestamp,
+                    record.symbol,
+                    record.timeframe,
+                    record.final_decision,
+                    record.final_score,
+                    record.market_state,
+                    record.selected_strategy,
+                    record.risk_mode,
+                    record.expected_net_edge_pct,
+                    record.risk_reward_ratio,
+                    record.cost_coverage_multiple,
+                    1 if record.approved else 0,
+                    record.reason,
+                    record.raw_payload,
+                    created_at,
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def get_recent_brain_decisions(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM brain_decisions ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def insert_risk_event(self, record: RiskEventRecord) -> int:
+        created_at = datetime.now(timezone.utc).isoformat()
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO risk_events (
+                    timestamp, event_type, severity, symbol, reason, action_taken, raw_payload, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.timestamp,
+                    record.event_type,
+                    record.severity,
+                    record.symbol,
+                    record.reason,
+                    record.action_taken,
+                    record.raw_payload,
+                    created_at,
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def get_recent_risk_events(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM risk_events ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def insert_provider_status(self, record: ProviderStatusRecord) -> int:
+        created_at = datetime.now(timezone.utc).isoformat()
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO provider_status (
+                    timestamp, provider, status, latency_ms, last_success_at, last_error, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.timestamp,
+                    record.provider,
+                    record.status,
+                    record.latency_ms,
+                    record.last_success_at,
+                    record.last_error,
+                    created_at,
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def get_recent_provider_status(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM provider_status ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def insert_data_quality_event(self, record: DataQualityEventRecord) -> int:
+        created_at = datetime.now(timezone.utc).isoformat()
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO data_quality_events (
+                    timestamp, symbol, timeframe, event_type, severity, reason, raw_payload, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.timestamp,
+                    record.symbol,
+                    record.timeframe,
+                    record.event_type,
+                    record.severity,
+                    record.reason,
+                    record.raw_payload,
+                    created_at,
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def get_recent_data_quality_events(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM data_quality_events ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def insert_websocket_event(self, record: WebsocketEventRecord) -> int:
+        created_at = datetime.now(timezone.utc).isoformat()
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO websocket_events (
+                    timestamp, provider, event_type, status, detail, raw_payload, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.timestamp,
+                    record.provider,
+                    record.event_type,
+                    record.status,
+                    record.detail,
+                    record.raw_payload,
+                    created_at,
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def insert_gap_repair_event(self, record: GapRepairEventRecord) -> int:
+        created_at = datetime.now(timezone.utc).isoformat()
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO gap_repair_events (
+                    timestamp, symbol, timeframe, gaps_detected, gaps_repaired, provider_used, reason, raw_payload, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.timestamp,
+                    record.symbol,
+                    record.timeframe,
+                    record.gaps_detected,
+                    record.gaps_repaired,
+                    record.provider_used,
+                    record.reason,
+                    record.raw_payload,
+                    created_at,
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def get_recent_gap_repair_events(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM gap_repair_events ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_recent_websocket_events(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM websocket_events ORDER BY id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
         return [dict(row) for row in rows]

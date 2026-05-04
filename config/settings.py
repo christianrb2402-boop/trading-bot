@@ -69,6 +69,18 @@ class Settings:
     allow_medium_signals: bool
     allow_strong_signals: bool
     aggressiveness_level: str
+    max_daily_drawdown_pct: float
+    max_consecutive_losses: int
+    max_position_size_pct: float
+    max_symbol_exposure_pct: float
+    max_strategy_exposure_pct: float
+    min_cost_coverage_multiple_conservative: float
+    min_cost_coverage_multiple_balanced: float
+    min_cost_coverage_multiple_aggressive: float
+    brain_min_final_score: float
+    autonomous_loop_seconds: int
+    market_watch_loop_seconds: int
+    feature_store_lookback: int
     performance_learning_min_sample: int
     backtest_min_trades: int
 
@@ -233,6 +245,18 @@ def load_settings() -> Settings:
         allow_medium_signals=_parse_bool(os.getenv("ALLOW_MEDIUM_SIGNALS", "true"), True),
         allow_strong_signals=_parse_bool(os.getenv("ALLOW_STRONG_SIGNALS", "true"), True),
         aggressiveness_level=os.getenv("AGGRESSIVENESS_LEVEL", "BALANCED").upper(),
+        max_daily_drawdown_pct=float(os.getenv("MAX_DAILY_DRAWDOWN_PCT", "0.05")),
+        max_consecutive_losses=int(os.getenv("MAX_CONSECUTIVE_LOSSES", "5")),
+        max_position_size_pct=float(os.getenv("MAX_POSITION_SIZE_PCT", "0.1")),
+        max_symbol_exposure_pct=float(os.getenv("MAX_SYMBOL_EXPOSURE_PCT", "0.25")),
+        max_strategy_exposure_pct=float(os.getenv("MAX_STRATEGY_EXPOSURE_PCT", "0.35")),
+        min_cost_coverage_multiple_conservative=float(os.getenv("MIN_COST_COVERAGE_MULTIPLE_CONSERVATIVE", "3.0")),
+        min_cost_coverage_multiple_balanced=float(os.getenv("MIN_COST_COVERAGE_MULTIPLE_BALANCED", "2.5")),
+        min_cost_coverage_multiple_aggressive=float(os.getenv("MIN_COST_COVERAGE_MULTIPLE_AGGRESSIVE", "2.0")),
+        brain_min_final_score=float(os.getenv("BRAIN_MIN_FINAL_SCORE", "0.55")),
+        autonomous_loop_seconds=int(os.getenv("AUTONOMOUS_LOOP_SECONDS", "60")),
+        market_watch_loop_seconds=int(os.getenv("MARKET_WATCH_LOOP_SECONDS", "60")),
+        feature_store_lookback=int(os.getenv("FEATURE_STORE_LOOKBACK", "60")),
         performance_learning_min_sample=int(os.getenv("PERFORMANCE_LEARNING_MIN_SAMPLE", "10")),
         backtest_min_trades=int(os.getenv("BACKTEST_MIN_TRADES", "100")),
     )

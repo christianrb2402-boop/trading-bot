@@ -103,6 +103,7 @@ class Settings:
     sentiment_enabled: bool
     cryptopanic_token: str
     coindesk_rss_url: str
+    gdelt_api_url: str
     alternative_me_fng_url: str
 
 
@@ -259,8 +260,8 @@ def load_settings() -> Settings:
         max_daily_simulated_loss_pct=float(os.getenv("MAX_DAILY_SIMULATED_LOSS_PCT", "0.03")),
         min_reward_risk_ratio=float(os.getenv("MIN_REWARD_RISK_RATIO", "1.5")),
         min_net_reward_risk_ratio=float(os.getenv("MIN_NET_REWARD_RISK_RATIO", "1.5")),
-        min_expected_net_edge_pct=float(os.getenv("MIN_EXPECTED_NET_EDGE_PCT", "0.15")),
-        min_cost_coverage_multiple=float(os.getenv("MIN_COST_COVERAGE_MULTIPLE", "2.5")),
+        min_expected_net_edge_pct=float(os.getenv("MIN_EXPECTED_NET_EDGE_PCT", "0.10")),
+        min_cost_coverage_multiple=float(os.getenv("MIN_COST_COVERAGE_MULTIPLE", "2.2")),
         max_cost_drag_pct=float(os.getenv("MAX_COST_DRAG_PCT", "0.35")),
         allow_weak_signals=_parse_bool(os.getenv("ALLOW_WEAK_SIGNALS", "true"), True),
         allow_medium_signals=_parse_bool(os.getenv("ALLOW_MEDIUM_SIGNALS", "true"), True),
@@ -283,10 +284,10 @@ def load_settings() -> Settings:
         selective_min_rr=float(os.getenv("SELECTIVE_MIN_RR", "1.50")),
         exploration_min_cost_coverage_multiple=float(os.getenv("EXPLORATION_MIN_COST_COVERAGE_MULTIPLE", "1.10")),
         selective_min_cost_coverage_multiple=float(os.getenv("SELECTIVE_MIN_COST_COVERAGE_MULTIPLE", "1.50")),
-        paper_exploration_min_cost_coverage=float(os.getenv("PAPER_EXPLORATION_MIN_COST_COVERAGE", "1.50")),
-        paper_selective_min_cost_coverage=float(os.getenv("PAPER_SELECTIVE_MIN_COST_COVERAGE", "2.50")),
-        paper_exploration_min_rr=float(os.getenv("PAPER_EXPLORATION_MIN_RR", "1.10")),
-        paper_selective_min_rr=float(os.getenv("PAPER_SELECTIVE_MIN_RR", "1.50")),
+        paper_exploration_min_cost_coverage=float(os.getenv("PAPER_EXPLORATION_MIN_COST_COVERAGE", "1.35")),
+        paper_selective_min_cost_coverage=float(os.getenv("PAPER_SELECTIVE_MIN_COST_COVERAGE", "2.20")),
+        paper_exploration_min_rr=float(os.getenv("PAPER_EXPLORATION_MIN_RR", "1.05")),
+        paper_selective_min_rr=float(os.getenv("PAPER_SELECTIVE_MIN_RR", "1.35")),
         paper_exploration_base_win_probability=float(os.getenv("PAPER_EXPLORATION_BASE_WIN_PROBABILITY", "0.53")),
         paper_selective_base_win_probability=float(os.getenv("PAPER_SELECTIVE_BASE_WIN_PROBABILITY", "0.58")),
         min_sample_size_for_profitability_claim=int(os.getenv("MIN_SAMPLE_SIZE_FOR_PROFITABILITY_CLAIM", "30")),
@@ -300,5 +301,9 @@ def load_settings() -> Settings:
         sentiment_enabled=_parse_bool(os.getenv("SENTIMENT_ENABLED", "true"), True),
         cryptopanic_token=os.getenv("CRYPTOPANIC_TOKEN", ""),
         coindesk_rss_url=os.getenv("COINDESK_RSS_URL", "https://www.coindesk.com/arc/outboundfeeds/rss/"),
+        gdelt_api_url=os.getenv(
+            "GDELT_API_URL",
+            "https://api.gdeltproject.org/api/v2/doc/doc?query=cryptocurrency%20OR%20bitcoin%20OR%20ethereum&mode=ArtList&maxrecords=10&format=json",
+        ),
         alternative_me_fng_url=os.getenv("ALTERNATIVE_ME_FNG_URL", "https://api.alternative.me/fng/?limit=1&format=json"),
     )

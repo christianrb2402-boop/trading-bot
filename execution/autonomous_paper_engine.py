@@ -10,6 +10,7 @@ from agents.trading_brain_orchestrator import TradingBrainOrchestrator
 from config.settings import Settings
 from core.database import Database, ErrorEventRecord
 from core.ledger_reconciler import LedgerReconciler
+from data.live_context_fusion import refresh_external_context
 
 
 @dataclass(slots=True, frozen=True)
@@ -61,6 +62,12 @@ class AutonomousPaperEngine:
             if ledger_report.result != "OK":
                 stop_reason = f"ledger_{ledger_report.result.lower()}"
                 break
+            refresh_external_context(
+                database=self._database,
+                settings=self._settings,
+                symbols=symbols,
+                limit=5,
+            )
             for timeframe in active_timeframes:
                 for symbol in symbols:
                     decision = self._trading_brain.decide_for_symbol(

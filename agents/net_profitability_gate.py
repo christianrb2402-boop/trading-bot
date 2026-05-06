@@ -112,22 +112,27 @@ class NetProfitabilityGate:
             min_cost_coverage = self._settings.paper_exploration_min_cost_coverage
             min_rr = self._settings.paper_exploration_min_rr
             min_net_edge_pct = 0.000001
+            volatility_headroom = 1.35
         elif effective_paper_mode == "PAPER_SELECTIVE":
             min_cost_coverage = self._settings.paper_selective_min_cost_coverage
             min_rr = self._settings.paper_selective_min_rr
             min_net_edge_pct = self._settings.min_expected_net_edge_pct
+            volatility_headroom = 1.15
         elif effective_risk_mode == "CONSERVATIVE":
             min_cost_coverage = self._settings.min_cost_coverage_multiple_conservative
             min_rr = self._settings.min_net_reward_risk_ratio
             min_net_edge_pct = self._settings.min_expected_net_edge_pct
+            volatility_headroom = 1.05
         elif effective_risk_mode in {"BALANCED", ""}:
             min_cost_coverage = self._settings.min_cost_coverage_multiple_balanced
             min_rr = self._settings.min_net_reward_risk_ratio
             min_net_edge_pct = self._settings.min_expected_net_edge_pct
+            volatility_headroom = 1.15
         else:
             min_cost_coverage = self._settings.min_cost_coverage_multiple_aggressive
             min_rr = self._settings.min_net_reward_risk_ratio
             min_net_edge_pct = self._settings.min_expected_net_edge_pct
+            volatility_headroom = 1.25
         if direction not in {"LONG", "SHORT"}:
             rejection_reasons.append("signal is not actionable")
         if expected_net_edge_value <= 0 or expected_net_edge_pct <= 0:
@@ -160,9 +165,9 @@ class NetProfitabilityGate:
             rejection_reasons.append(
                 f"cost drag {round(cost_drag_pct, 4)} exceeds maximum {self._settings.max_cost_drag_pct}"
             )
-        if volatility_pct > 0 and minimum_required_move_pct > volatility_pct:
+        if volatility_pct > 0 and minimum_required_move_pct > (volatility_pct * volatility_headroom):
             rejection_reasons.append(
-                f"minimum profitable move {round(minimum_required_move_pct, 4)}% exceeds current volatility {round(volatility_pct, 4)}%"
+                f"minimum profitable move {round(minimum_required_move_pct, 4)}% exceeds current volatility headroom {round(volatility_pct * volatility_headroom, 4)}%"
             )
 
         approved = not rejection_reasons

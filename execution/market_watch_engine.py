@@ -9,6 +9,7 @@ from typing import Sequence
 from agents.trading_brain_orchestrator import TradingBrainOrchestrator
 from config.settings import Settings
 from core.database import Database, RiskEventRecord
+from data.live_context_fusion import refresh_external_context
 
 
 @dataclass(slots=True, frozen=True)
@@ -41,6 +42,12 @@ class MarketWatchEngine:
         observations = 0
         while datetime.now(timezone.utc) < deadline:
             loops += 1
+            refresh_external_context(
+                database=self._database,
+                settings=self._settings,
+                symbols=symbols,
+                limit=5,
+            )
             for timeframe in active_timeframes:
                 for symbol in symbols:
                     decision = self._trading_brain.decide_for_symbol(

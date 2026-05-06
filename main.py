@@ -46,12 +46,10 @@ from core.database import (
     FeatureSnapshotRecord,
     GapRepairEventRecord,
     MarketContextRecord,
-    NewsEventRecord,
     ProviderStatusRecord,
     RejectedSignalRecord,
     RiskEventRecord,
     SignalLogRecord,
-    SentimentSnapshotRecord,
     StrategyEvaluationRecord,
     StrategyVoteRecord,
     WebsocketEventRecord,
@@ -62,9 +60,8 @@ from core.logger import configure_logging
 from core.runtime_checks import ReadinessReport, build_readiness_report, format_age_seconds, inspect_symbol_health, timeframe_to_seconds
 from data.binance_market_data import BinanceConnectivityProbe, BinanceMarketDataService
 from data.binance_websocket_provider import BinanceWebsocketProvider
+from data.live_context_fusion import refresh_external_context
 from data.market_data_provider import BinanceProvider, FutureYahooProvider, LocalSQLiteProvider, ProviderRouter
-from data.news_provider import NewsProvider, news_item_to_payload
-from data.sentiment_provider import SentimentProvider, sentiment_snapshot_to_payload
 from execution.autonomous_paper_engine import AutonomousPaperEngine
 from execution.live_paper_engine import LivePaperEngine, LivePaperEngineResult
 from execution.market_watch_engine import MarketWatchEngine
@@ -84,6 +81,28 @@ def _safe_json_loads(value: str | None) -> dict[str, object]:
     except json.JSONDecodeError:
         return {}
     return loaded if isinstance(loaded, dict) else {}
+
+
+def _resolve_provider_labels(provider_summary: dict[str, object]) -> tuple[str, str]:
+    current_live = (provider_summary.get("current_live_provider") or {})
+    last_successful = (provider_summary.get("last_successful_provider") or {})
+    latest_brain = (provider_summary.get("latest_brain_provider") or {})
+    latest_snapshot = (provider_summary.get("latest_market_snapshot_provider") or {})
+    current_provider = (
+        current_live.get("provider")
+        or last_successful.get("provider")
+        or latest_brain.get("provider_used")
+        or latest_snapshot.get("provider_used")
+        or "UNKNOWN"
+    )
+    last_successful_provider = (
+        last_successful.get("provider")
+        or latest_brain.get("provider_used")
+        or latest_snapshot.get("provider_used")
+        or current_provider
+        or "UNKNOWN"
+    )
+    return str(current_provider), str(last_successful_provider)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -790,27 +809,36 @@ def assess_cost_validation(
     average_cost_per_trade = float(trade_metrics.get("average_cost_per_trade", 0.0) or 0.0)
     closed_trades = int(trade_metrics.get("closed_trades", 0) or 0)
     target_take_profit_pct = settings.simulated_take_profit_pct * 100
-    cost_coverage_config_ok = settings.min_cost_coverage_multiple >= 2.5
+    required_config_coverage = max(settings.paper_exploration_min_cost_coverage, 1.0)
+    cost_coverage_config_ok = settings.min_cost_coverage_multiple >= required_config_coverage
     required_move_ok = average_required_move <= max(target_take_profit_pct * 0.55, 0.15)
     gross_vs_net_ok = gross_win_net_loss == 0
-    historical_net_ok = total_pnl > 0 if closed_trades else False
+    enough_sample_for_profitability = closed_trades >= settings.min_sample_size_for_profitability_claim
+    historical_net_ok = total_pnl > 0 if enough_sample_for_profitability else False
     cost_validation_ok = bool(cost_coverage_config_ok and required_move_ok and gross_vs_net_ok)
     reasons: list[str] = []
     if not cost_coverage_config_ok:
-        reasons.append("MIN_COST_COVERAGE_MULTIPLE is below the required 2.5x")
+        reasons.append(
+            f"MIN_COST_COVERAGE_MULTIPLE is below the required exploratory floor {round(required_config_coverage, 4)}x"
+        )
     if not required_move_ok:
         reasons.append(
             f"average required move to break even is {round(average_required_move, 6)}%, too high versus take profit target {round(target_take_profit_pct, 6)}%"
         )
     if not gross_vs_net_ok:
         reasons.append(f"{gross_win_net_loss} trades won gross but lost net after costs")
-    if not historical_net_ok:
+    if not enough_sample_for_profitability:
+        reasons.append(
+            f"insufficient closed-trade sample for profitability claim ({closed_trades}/{settings.min_sample_size_for_profitability_claim})"
+        )
+    elif not historical_net_ok:
         reasons.append("historical final net pnl remains non-positive")
     if not reasons:
         reasons.append("net profitability gate and historical cost drag look acceptable")
     return {
         "cost_validation_ok": cost_validation_ok,
         "historical_net_ok": historical_net_ok,
+        "enough_sample_for_profitability": enough_sample_for_profitability,
         "total_gross_pnl": total_gross_pnl,
         "total_net_pnl": total_pnl,
         "average_cost_per_trade": average_cost_per_trade,
@@ -835,50 +863,7 @@ def run_new_paper_experiment(database: Database, name: str | None) -> dict[str, 
 
 
 def collect_external_context(database: Database, settings: Settings) -> dict[str, object]:
-    news_provider = NewsProvider(settings)
-    sentiment_provider = SentimentProvider(settings)
-    news_status, news_items = news_provider.fetch_latest(symbols=settings.market_symbols, limit=5)
-    for item in news_items:
-        database.insert_news_event(
-            NewsEventRecord(
-                source=item.source,
-                headline=item.headline,
-                event_time=item.event_time,
-                detected_symbols=json.dumps(list(item.detected_symbols), ensure_ascii=True),
-                sentiment_score=item.sentiment_score,
-                confidence=item.confidence,
-                raw_payload=news_item_to_payload(item),
-            )
-        )
-    sentiment_status, sentiment_snapshot = sentiment_provider.fetch_latest()
-    if sentiment_snapshot is not None:
-        database.insert_sentiment_snapshot(
-            SentimentSnapshotRecord(
-                source=sentiment_snapshot.source,
-                sentiment_label=sentiment_snapshot.sentiment_label,
-                sentiment_score=sentiment_snapshot.sentiment_score,
-                confidence=sentiment_snapshot.confidence,
-                snapshot_time=sentiment_snapshot.snapshot_time,
-                raw_payload=sentiment_snapshot_to_payload(sentiment_snapshot),
-            )
-        )
-    return {
-        "news_status": {
-            "source": news_status.source,
-            "status": news_status.status,
-            "checked_at": news_status.checked_at,
-            "items_detected": news_status.items_detected,
-            "last_error": news_status.last_error,
-        },
-        "sentiment_status": {
-            "source": sentiment_status.source,
-            "status": sentiment_status.status,
-            "checked_at": sentiment_status.checked_at,
-            "last_error": sentiment_status.last_error,
-        },
-        "latest_news": database.get_recent_news_events(limit=10),
-        "latest_sentiment": database.get_recent_sentiment_snapshots(limit=10),
-    }
+    return refresh_external_context(database=database, settings=settings, symbols=settings.market_symbols, limit=5)
 
 
 def run_preflight_live_paper(
@@ -952,8 +937,9 @@ def run_preflight_live_paper(
         print("Reason:")
         print(f"- {reason}")
         provider_summary = database.get_current_provider_summary()
-        print(f"- Current live provider: {(provider_summary.get('current_live_provider') or {}).get('provider', 'UNKNOWN')}")
-        print(f"- Last successful provider: {(provider_summary.get('last_successful_provider') or {}).get('provider', 'UNKNOWN')}")
+        current_provider, last_successful_provider = _resolve_provider_labels(provider_summary)
+        print(f"- Current live provider: {current_provider}")
+        print(f"- Last successful provider: {last_successful_provider}")
         print(f"- Binance reachable: {'YES' if readiness.binance_reachable else 'NO'}")
         print(f"- Fresh data available: {'YES' if readiness.fresh_data_available else 'NO'}")
         print(f"- Ledger result: {ledger_report.result}")
@@ -971,7 +957,23 @@ def run_preflight_live_paper(
                 """,
                 (experiment_id, experiment_id),
             ).fetchone()
+            reject_row = conn.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN COALESCE(rejected_stage, '') = 'NET_GATE' THEN 1 ELSE 0 END) AS rejected_by_cost,
+                    SUM(CASE WHEN COALESCE(rejected_stage, '') IN ('CRITIC', 'FINAL_SCORE') THEN 1 ELSE 0 END) AS rejected_by_contradiction,
+                    SUM(CASE WHEN reason LIKE '%stale_data%' OR reason LIKE '%data_not_fresh%' THEN 1 ELSE 0 END) AS rejected_by_stale_data,
+                    SUM(CASE WHEN COALESCE(rejected_stage, '') = 'PAPER_MODE' THEN 1 ELSE 0 END) AS rejected_by_mode
+                FROM rejected_signals_log
+                WHERE (? IS NULL OR experiment_id = ?)
+                """,
+                (experiment_id, experiment_id),
+            ).fetchone()
         print(f"- Near approved exploration setups: {int(row['c'] or 0)}")
+        print(f"- Rejected by cost: {int(reject_row['rejected_by_cost'] or 0)}")
+        print(f"- Rejected by contradiction: {int(reject_row['rejected_by_contradiction'] or 0)}")
+        print(f"- Rejected by stale data: {int(reject_row['rejected_by_stale_data'] or 0)}")
+        print(f"- Rejected by mode: {int(reject_row['rejected_by_mode'] or 0)}")
         for item in cost_validation["reasons"]:
             print(f"- {item}")
     return result
@@ -1018,8 +1020,9 @@ def run_quick_audit(
     print(f"STRATEGY_NET_PROFITABLE: {'YES' if strategy_net_profitable else 'NO'}")
     print(f"PAPER_MODE: {'OBSERVE_ONLY' if not safe_short else ('PAPER_SELECTIVE' if safe_long else 'PAPER_EXPLORATION')}")
     provider_summary = database.get_current_provider_summary()
-    print(f"CURRENT_LIVE_PROVIDER: {(provider_summary.get('current_live_provider') or {}).get('provider', 'UNKNOWN')}")
-    print(f"LAST_SUCCESSFUL_PROVIDER: {(provider_summary.get('last_successful_provider') or {}).get('provider', 'UNKNOWN')}")
+    current_provider, last_successful_provider = _resolve_provider_labels(provider_summary)
+    print(f"CURRENT_LIVE_PROVIDER: {current_provider}")
+    print(f"LAST_SUCCESSFUL_PROVIDER: {last_successful_provider}")
     print("Reason:")
     for reason in reasons:
         print(f"- {reason}")
@@ -1044,7 +1047,23 @@ def run_quick_audit(
             (experiment_id, experiment_id),
         ).fetchone()
         near_approved = int(row["c"] or 0)
+        reject_row = conn.execute(
+            """
+            SELECT
+                SUM(CASE WHEN COALESCE(rejected_stage, '') = 'NET_GATE' THEN 1 ELSE 0 END) AS rejected_by_cost,
+                SUM(CASE WHEN COALESCE(rejected_stage, '') IN ('CRITIC', 'FINAL_SCORE') THEN 1 ELSE 0 END) AS rejected_by_contradiction,
+                SUM(CASE WHEN reason LIKE '%stale_data%' OR reason LIKE '%data_not_fresh%' THEN 1 ELSE 0 END) AS rejected_by_stale_data,
+                SUM(CASE WHEN COALESCE(rejected_stage, '') = 'PAPER_MODE' THEN 1 ELSE 0 END) AS rejected_by_mode
+            FROM rejected_signals_log
+            WHERE (? IS NULL OR experiment_id = ?)
+            """,
+            (experiment_id, experiment_id),
+        ).fetchone()
     print(f"- near_approved_exploration_setups={near_approved}")
+    print(f"- rejected_by_cost={int(reject_row['rejected_by_cost'] or 0)}")
+    print(f"- rejected_by_contradiction={int(reject_row['rejected_by_contradiction'] or 0)}")
+    print(f"- rejected_by_stale_data={int(reject_row['rejected_by_stale_data'] or 0)}")
+    print(f"- rejected_by_mode={int(reject_row['rejected_by_mode'] or 0)}")
     print("Recent trades:")
     if recent_trades:
         for trade in recent_trades:
@@ -1330,16 +1349,18 @@ def build_status_snapshot(
         ).fetchone()
         rejected_counts_row = conn.execute(
             """
-            SELECT
-                SUM(CASE WHEN COALESCE(rejected_stage, '') = 'NET_GATE' THEN 1 ELSE 0 END) AS rejected_by_cost,
-                SUM(CASE WHEN COALESCE(rejected_stage, '') = 'RISK' THEN 1 ELSE 0 END) AS rejected_by_risk,
-                SUM(CASE WHEN COALESCE(rejected_stage, '') IN ('CRITIC', 'FINAL_SCORE') THEN 1 ELSE 0 END) AS rejected_by_contradiction,
-                SUM(CASE WHEN COALESCE(rejected_stage, '') IN ('PAPER_MODE', 'SYMBOL_FILTER') THEN 1 ELSE 0 END) AS rejected_by_insufficient_data
-            FROM rejected_signals_log
-            WHERE (? IS NULL OR experiment_id = ?)
-            """,
-            (current_experiment_id, current_experiment_id),
-        ).fetchone()
+                SELECT
+                    SUM(CASE WHEN COALESCE(rejected_stage, '') = 'NET_GATE' THEN 1 ELSE 0 END) AS rejected_by_cost,
+                    SUM(CASE WHEN COALESCE(rejected_stage, '') = 'RISK' THEN 1 ELSE 0 END) AS rejected_by_risk,
+                    SUM(CASE WHEN COALESCE(rejected_stage, '') IN ('CRITIC', 'FINAL_SCORE') THEN 1 ELSE 0 END) AS rejected_by_contradiction,
+                    SUM(CASE WHEN COALESCE(rejected_stage, '') = 'PAPER_MODE' THEN 1 ELSE 0 END) AS rejected_by_mode,
+                    SUM(CASE WHEN reason LIKE '%stale_data%' OR reason LIKE '%data_not_fresh%' THEN 1 ELSE 0 END) AS rejected_by_stale_data,
+                    SUM(CASE WHEN COALESCE(rejected_stage, '') = 'SYMBOL_FILTER' THEN 1 ELSE 0 END) AS rejected_by_insufficient_data
+                FROM rejected_signals_log
+                WHERE (? IS NULL OR experiment_id = ?)
+                """,
+                (current_experiment_id, current_experiment_id),
+            ).fetchone()
         trade_mode_row = conn.execute(
             """
             SELECT
@@ -1458,6 +1479,8 @@ def build_status_snapshot(
         "rejected_by_cost": int(rejected_counts_row["rejected_by_cost"] or 0),
         "rejected_by_risk": int(rejected_counts_row["rejected_by_risk"] or 0),
         "rejected_by_contradiction": int(rejected_counts_row["rejected_by_contradiction"] or 0),
+        "rejected_by_mode": int(rejected_counts_row["rejected_by_mode"] or 0),
+        "rejected_by_stale_data": int(rejected_counts_row["rejected_by_stale_data"] or 0),
         "rejected_by_insufficient_data": int(rejected_counts_row["rejected_by_insufficient_data"] or 0),
         "total_paper_orders": database.count_paper_orders(),
         "open_paper_positions_count": database.count_open_paper_positions(),
@@ -1696,6 +1719,7 @@ def run_status_report(
     print(f"- rejected by cost: {snapshot['rejected_by_cost']}")
     print(f"- rejected by risk: {snapshot['rejected_by_risk']}")
     print(f"- rejected by contradiction: {snapshot['rejected_by_contradiction']}")
+    print(f"- rejected by stale data: {snapshot['rejected_by_stale_data']}")
     print(f"- rejected by insufficient data: {snapshot['rejected_by_insufficient_data']}")
     print(f"- rejected by operating mode: {snapshot['rejected_by_operating_mode']}")
     print("")
@@ -2123,6 +2147,7 @@ def run_brain_report(
     print(f"Rejected by cost: {snapshot['rejected_by_cost']}")
     print(f"Rejected by risk: {snapshot['rejected_by_risk']}")
     print(f"Rejected by contradiction: {snapshot['rejected_by_contradiction']}")
+    print(f"Rejected by stale data: {snapshot['rejected_by_stale_data']}")
     print(f"Rejected by insufficient data: {snapshot['rejected_by_insufficient_data']}")
     print(f"Near approved exploration setups: {snapshot['near_approved_exploration_setups']}")
     print(f"Rejected by operating mode: {snapshot['rejected_by_operating_mode']}")
@@ -2316,18 +2341,20 @@ def run_export_report(
             "worst_symbols": list(reversed(snapshot["performance_by_symbol"][-3:])) if snapshot["performance_by_symbol"] else [],
             "best_timeframes": snapshot["performance_by_timeframe"][:3],
             "worst_timeframes": list(reversed(snapshot["performance_by_timeframe"][-3:])) if snapshot["performance_by_timeframe"] else [],
-            "cost_analysis": {
-                "gross_winrate": snapshot["trade_metrics"]["gross_winrate"],
-                "net_winrate": snapshot["trade_metrics"]["winrate"],
-                "gross_win_net_loss": snapshot["trade_metrics"]["gross_win_net_loss"],
-                "average_cost_per_trade": snapshot["trade_metrics"]["average_cost_per_trade"],
-                "average_required_move_to_break_even": snapshot["trade_metrics"]["average_required_move_to_break_even"],
-                "breakeven_winrate_approx": snapshot["trade_metrics"]["breakeven_winrate_approx"],
-                "rejected_by_cost": snapshot["rejected_by_cost"],
-                "rejected_by_risk": snapshot["rejected_by_risk"],
-                "rejected_by_contradiction": snapshot["rejected_by_contradiction"],
-                "rejected_by_insufficient_data": snapshot["rejected_by_insufficient_data"],
-            },
+                "cost_analysis": {
+                    "gross_winrate": snapshot["trade_metrics"]["gross_winrate"],
+                    "net_winrate": snapshot["trade_metrics"]["winrate"],
+                    "gross_win_net_loss": snapshot["trade_metrics"]["gross_win_net_loss"],
+                    "average_cost_per_trade": snapshot["trade_metrics"]["average_cost_per_trade"],
+                    "average_required_move_to_break_even": snapshot["trade_metrics"]["average_required_move_to_break_even"],
+                    "breakeven_winrate_approx": snapshot["trade_metrics"]["breakeven_winrate_approx"],
+                    "rejected_by_cost": snapshot["rejected_by_cost"],
+                    "rejected_by_risk": snapshot["rejected_by_risk"],
+                    "rejected_by_contradiction": snapshot["rejected_by_contradiction"],
+                    "rejected_by_stale_data": snapshot["rejected_by_stale_data"],
+                    "rejected_by_mode": snapshot["rejected_by_mode"],
+                    "rejected_by_insufficient_data": snapshot["rejected_by_insufficient_data"],
+                },
             "brain": {
                 "recent_strategy_votes": brain_snapshot["recent_strategy_votes"],
                 "recent_strategy_evaluations": brain_snapshot["recent_strategy_evaluations"],

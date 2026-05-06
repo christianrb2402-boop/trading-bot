@@ -154,7 +154,8 @@ def build_readiness_report(
     execution_frames = set(settings.execution_timeframes)
     execution_health = [item for item in symbol_health if item.timeframe in execution_frames]
     required_health = [item for item in execution_health if item.symbol in required_symbols]
-    fresh_data_available = bool(required_health) and all(item.has_history and not item.is_stale and item.is_valid for item in required_health)
+    local_fresh_execution_data = bool(required_health) and all(item.has_history and not item.is_stale and item.is_valid for item in required_health)
+    fresh_data_available = local_fresh_execution_data or binance_reachable
 
     symbols_with_history = tuple(sorted({item.symbol for item in symbol_health if item.has_history}))
     missing_symbols = tuple(sorted({item.symbol for item in symbol_health if not item.has_history}))
@@ -171,7 +172,9 @@ def build_readiness_report(
     if not binance_reachable:
         reasons.append("Binance HTTP probes are failing in this environment")
     if not fresh_data_available:
-        reasons.append("Fresh local BTCUSDT and ETHUSDT candles are not available")
+        reasons.append("Fresh execution data is not available from Binance or local SQLite")
+    elif not local_fresh_execution_data and binance_reachable:
+        reasons.append("Local execution candles are stale, but Binance is reachable and can refresh them during a bounded run")
     if missing_symbols:
         reasons.append(f"Configured symbols without local history: {', '.join(missing_symbols)}")
     if stale_symbols:
@@ -184,7 +187,7 @@ def build_readiness_report(
     if ledger_result != "OK":
         reasons.append(f"Ledger consistency is {ledger_result}")
 
-    if binance_reachable and database_exists and fresh_data_available and not severe_execution_gap_rows and ledger_result == "OK":
+    if binance_reachable and database_exists and not severe_execution_gap_rows and ledger_result == "OK":
         current_mode = "LIVE_BINANCE"
     elif not binance_reachable and symbols_with_history and not stale_symbols:
         current_mode = "LOCAL_SQLITE_FALLBACK"
@@ -197,7 +200,7 @@ def build_readiness_report(
         and sqlite_ok
         and database_exists
         and binance_reachable
-        and fresh_data_available
+        and binance_reachable
         and not severe_execution_gap_rows
         and ledger_result == "OK"
         and current_mode == "LIVE_BINANCE"
@@ -209,7 +212,7 @@ def build_readiness_report(
         and (binance_reachable or bool(symbols_with_history))
         and ledger_result == "OK"
         and not severe_execution_gap_rows
-        and not stale_execution_rows
+        and (binance_reachable or not stale_execution_rows)
     )
     can_run_long_paper = ready_for_live_paper and not stale_rows and not insufficient_history_rows and not missing_symbols
 

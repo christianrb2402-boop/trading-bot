@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import json
 from typing import Any
@@ -39,6 +39,7 @@ from core.database import (
 )
 from core.ledger_reconciler import LedgerReconciler
 from data.market_data_provider import ProviderRouter
+from data.live_context_fusion import build_symbol_context_bias
 from features.feature_store import FeatureStore
 
 
@@ -374,6 +375,34 @@ class TradingBrainOrchestrator:
         duplicate_setup = False
         if best_proposal.proposed_decision in {"LONG", "SHORT"}:
             duplicate_setup = self._is_duplicate_setup(symbol=symbol, timeframe=timeframe, direction=best_proposal.proposed_decision, setup_signature=best_proposal.strategy_name)
+        external_context_bias = self._build_external_context_bias(
+            symbol=symbol,
+            direction=best_proposal.proposed_decision if best_proposal.proposed_decision in {"LONG", "SHORT"} else "NONE",
+        )
+        if external_context_bias["risk_event"]:
+            self._database.insert_risk_event(
+                RiskEventRecord(
+                    timestamp=timestamp,
+                    event_type="EXTERNAL_CONTEXT_RISK",
+                    severity="WARNING" if external_context_bias["news_conflict"] else "INFO",
+                    symbol=symbol,
+                    reason=external_context_bias["reason"],
+                    action_taken="CONTEXT_ONLY",
+                    raw_payload=json.dumps(external_context_bias, ensure_ascii=True),
+                )
+            )
+        best_proposal = self._apply_external_context_to_proposal(
+            proposal=best_proposal,
+            external_context_bias=external_context_bias,
+        )
+        risk_manager = self._apply_external_context_to_risk_manager(
+            risk_manager=risk_manager,
+            external_context_bias=external_context_bias,
+        )
+        tf_alignment = self._apply_external_context_to_alignment(
+            alignment=tf_alignment,
+            external_context_bias=external_context_bias,
+        )
         exploration_cost_snapshot = self._cost_model_agent.estimate(
             entry_price=recent_candles[-1].close,
             direction=best_proposal.proposed_decision if best_proposal.proposed_decision in {"LONG", "SHORT"} else "LONG",
@@ -503,7 +532,7 @@ class TradingBrainOrchestrator:
             - critic_penalty
         )
 
-        final_score_threshold = self._settings.brain_min_final_score * (0.65 if paper_mode == "PAPER_EXPLORATION" else 1.0)
+        final_score_threshold = self._settings.brain_min_final_score * (0.6 if paper_mode == "PAPER_EXPLORATION" else 1.0)
         approved = (
             best_proposal.proposed_decision in {"LONG", "SHORT"}
             and paper_mode != "OBSERVE_ONLY"
@@ -541,6 +570,7 @@ class TradingBrainOrchestrator:
                     selective_gate=selective_gate,
                 ) if paper_mode == "OBSERVE_ONLY" else "",
                 "symbol not tradable today" if not symbol_selection.tradable_today else "",
+                external_context_bias["reason"] if external_context_bias["news_used"] or external_context_bias["sentiment_used"] else "",
                 f"final score {round(final_score, 4)} below minimum {round(final_score_threshold, 4)}" if final_score < final_score_threshold else "",
                 "exploration max open positions reached" if paper_mode == "PAPER_EXPLORATION" and len(self._database.get_open_paper_positions()) >= self._settings.exploration_max_open_positions else "",
                 "exploration hourly trade cap reached" if paper_mode == "PAPER_EXPLORATION" and self._recent_trade_count_by_mode("PAPER_EXPLORATION", hours=1) >= self._settings.exploration_max_trades_per_hour else "",
@@ -588,6 +618,7 @@ class TradingBrainOrchestrator:
             "net_gate": net_gate.as_dict(),
             "exploration_gate": exploration_gate.as_dict(),
             "selective_gate": selective_gate.as_dict(),
+            "external_context": external_context_bias,
             "critic": critic.as_dict(),
             "risk_manager": risk_manager.as_dict(),
             "meta_learning": meta_learning.as_dict(),
@@ -737,6 +768,86 @@ class TradingBrainOrchestrator:
             data_stale=assessment.is_stale,
             paper_mode=paper_mode,
             raw_payload=payload,
+        )
+
+    def _build_external_context_bias(self, *, symbol: str, direction: str) -> dict[str, object]:
+        bias = build_symbol_context_bias(
+            database=self._database,
+            symbol=symbol,
+            direction=direction,
+        )
+        bias["reason"] = (
+            f"external_context news_used={bias['news_used']} sentiment_used={bias['sentiment_used']} "
+            f"news_conflict={bias['news_conflict']} risk_event={bias['risk_event']} "
+            f"confidence_adjustment={bias['confidence_adjustment']}"
+        )
+        return bias
+
+    @staticmethod
+    def _apply_external_context_to_proposal(
+        *,
+        proposal: StrategyProposal,
+        external_context_bias: dict[str, object],
+    ) -> StrategyProposal:
+        if proposal.proposed_decision not in {"LONG", "SHORT"}:
+            return proposal
+        adjusted_confidence = max(
+            0.0,
+            min(1.0, proposal.confidence + float(external_context_bias.get("confidence_adjustment", 0.0))),
+        )
+        extra_flags = list(proposal.risk_flags)
+        if external_context_bias.get("news_conflict"):
+            extra_flags.append("news_conflict")
+        if external_context_bias.get("risk_event"):
+            extra_flags.append("external_risk_event")
+        return replace(
+            proposal,
+            confidence=round(adjusted_confidence, 6),
+            entry_reason=proposal.entry_reason + f" | {external_context_bias['reason']}",
+            risk_flags=tuple(dict.fromkeys(extra_flags)),
+            raw_payload={**proposal.raw_payload, "external_context": external_context_bias},
+        )
+
+    @staticmethod
+    def _apply_external_context_to_risk_manager(
+        *,
+        risk_manager,
+        external_context_bias: dict[str, object],
+    ):
+        if not external_context_bias.get("risk_event") and not external_context_bias.get("news_conflict"):
+            return risk_manager
+        adjusted_risk_mode = risk_manager.risk_mode
+        adjusted_action = risk_manager.recommended_action
+        if external_context_bias.get("news_conflict"):
+            if adjusted_risk_mode == "BALANCED":
+                adjusted_risk_mode = "CONSERVATIVE"
+            elif adjusted_risk_mode == "AGGRESSIVE":
+                adjusted_risk_mode = "BALANCED"
+        if external_context_bias.get("risk_event") and adjusted_risk_mode not in {"DO_NOT_TRADE", "CAPITAL_PROTECTION"}:
+            adjusted_risk_mode = "CONSERVATIVE"
+        return replace(
+            risk_manager,
+            risk_mode=adjusted_risk_mode,
+            recommended_action=adjusted_action,
+            reason=risk_manager.reason + f"; {external_context_bias['reason']}",
+        )
+
+    @staticmethod
+    def _apply_external_context_to_alignment(
+        *,
+        alignment: TimeframeAlignment,
+        external_context_bias: dict[str, object],
+    ) -> TimeframeAlignment:
+        contradiction_penalty = float(external_context_bias.get("contradiction_penalty", 0.0))
+        if contradiction_penalty <= 0:
+            return alignment
+        adjusted_contradiction = min(1.0, alignment.contradiction_score + contradiction_penalty)
+        adjusted_alignment = max(0.0, alignment.alignment_score - (contradiction_penalty * 0.35))
+        return replace(
+            alignment,
+            contradiction_score=round(adjusted_contradiction, 6),
+            alignment_score=round(adjusted_alignment, 6),
+            final_timeframe_reason=alignment.final_timeframe_reason + f" {external_context_bias['reason']}",
         )
 
     def _collect_strategy_proposals(

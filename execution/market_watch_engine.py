@@ -36,11 +36,12 @@ class MarketWatchEngine:
         deadline = datetime.now(timezone.utc) + timedelta(minutes=run_minutes or 5)
         fast_validation_mode = max_loops is not None or (run_minutes or 0) <= 5
         target_loops = max_loops if max_loops is not None else (max(1, run_minutes or 5) if fast_validation_mode else None)
+        active_timeframes = self._select_execution_timeframes(timeframes=timeframes, run_minutes=run_minutes, max_loops=max_loops)
         loops = 0
         observations = 0
         while datetime.now(timezone.utc) < deadline:
             loops += 1
-            for timeframe in timeframes:
+            for timeframe in active_timeframes:
                 for symbol in symbols:
                     decision = self._trading_brain.decide_for_symbol(
                         symbol=symbol,
@@ -48,6 +49,7 @@ class MarketWatchEngine:
                         prefer_fallback=prefer_fallback,
                         allow_stale_fallback=allow_stale_fallback,
                         observer_mode=True,
+                        operating_horizon_minutes=run_minutes or (5 if max_loops is not None else None),
                     )
                     event_type = "OPPORTUNITY_OBSERVED"
                     reason = decision.entry_reason
@@ -77,3 +79,15 @@ class MarketWatchEngine:
             if not fast_validation_mode:
                 time.sleep(self._settings.market_watch_loop_seconds)
         return MarketWatchResult(loops_completed=loops, observations_recorded=observations)
+
+    def _select_execution_timeframes(
+        self,
+        *,
+        timeframes: Sequence[str],
+        run_minutes: int | None,
+        max_loops: int | None,
+    ) -> tuple[str, ...]:
+        if (run_minutes is not None and run_minutes <= 60) or max_loops is not None:
+            filtered = tuple(timeframe for timeframe in timeframes if timeframe in self._settings.execution_timeframes)
+            return filtered or tuple(self._settings.execution_timeframes)
+        return tuple(timeframes)

@@ -114,6 +114,8 @@ class RejectedSignalRecord:
     selected_strategy: str = "UNKNOWN"
     paper_mode: str = "OBSERVE_ONLY"
     would_trade_if_exploration_enabled: bool = False
+    experiment_id: int | None = None
+    experiment_name: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -168,6 +170,8 @@ class StrategyVoteRecord:
     approved: bool
     rejection_reason: str | None
     raw_payload: str
+    experiment_id: int | None = None
+    experiment_name: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -229,6 +233,8 @@ class BrainDecisionRecord:
     total_cost_pct: float = 0.0
     multi_timeframe_conflict: bool = False
     would_trade_if_exploration_enabled: bool = False
+    experiment_id: int | None = None
+    experiment_name: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -366,6 +372,39 @@ class SimulatedTradeRecord:
     cost_snapshot: str | None = None
     paper_mode: str | None = None
     exploratory_trade: int | None = None
+    experiment_id: int | None = None
+    experiment_name: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class PaperExperimentRecord:
+    id: int
+    name: str
+    status: str
+    started_at: str
+    ended_at: str | None
+    notes: str | None
+
+
+@dataclass(slots=True, frozen=True)
+class NewsEventRecord:
+    source: str
+    headline: str
+    event_time: str
+    detected_symbols: str
+    sentiment_score: float
+    confidence: float
+    raw_payload: str
+
+
+@dataclass(slots=True, frozen=True)
+class SentimentSnapshotRecord:
+    source: str
+    sentiment_label: str
+    sentiment_score: float
+    confidence: float
+    snapshot_time: str
+    raw_payload: str
 
 
 @dataclass(slots=True, frozen=True)
@@ -624,6 +663,8 @@ class Database:
                     selected_strategy TEXT NOT NULL DEFAULT 'UNKNOWN',
                     paper_mode TEXT NOT NULL DEFAULT 'OBSERVE_ONLY',
                     would_trade_if_exploration_enabled INTEGER NOT NULL DEFAULT 0,
+                    experiment_id INTEGER,
+                    experiment_name TEXT,
                     timestamp TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 )
@@ -641,6 +682,8 @@ class Database:
             self._ensure_column(conn=conn, table_name="rejected_signals_log", column_name="selected_strategy", column_sql="TEXT NOT NULL DEFAULT 'UNKNOWN'")
             self._ensure_column(conn=conn, table_name="rejected_signals_log", column_name="paper_mode", column_sql="TEXT NOT NULL DEFAULT 'OBSERVE_ONLY'")
             self._ensure_column(conn=conn, table_name="rejected_signals_log", column_name="would_trade_if_exploration_enabled", column_sql="INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn=conn, table_name="rejected_signals_log", column_name="experiment_id", column_sql="INTEGER")
+            self._ensure_column(conn=conn, table_name="rejected_signals_log", column_name="experiment_name", column_sql="TEXT")
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_rejected_signals_symbol_time
@@ -998,6 +1041,18 @@ class Database:
                 column_name="exploratory_trade",
                 column_sql="INTEGER DEFAULT 0",
             )
+            self._ensure_column(
+                conn=conn,
+                table_name="simulated_trades",
+                column_name="experiment_id",
+                column_sql="INTEGER",
+            )
+            self._ensure_column(
+                conn=conn,
+                table_name="simulated_trades",
+                column_name="experiment_name",
+                column_sql="TEXT",
+            )
             self._backfill_simulated_trades(conn=conn, timestamp=timestamp)
             conn.execute(
                 """
@@ -1193,11 +1248,15 @@ class Database:
                     risk_mode TEXT NOT NULL,
                     approved INTEGER NOT NULL,
                     rejection_reason TEXT,
+                    experiment_id INTEGER,
+                    experiment_name TEXT,
                     raw_payload TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 )
                 """
             )
+            self._ensure_column(conn=conn, table_name="strategy_votes", column_name="experiment_id", column_sql="INTEGER")
+            self._ensure_column(conn=conn, table_name="strategy_votes", column_name="experiment_name", column_sql="TEXT")
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_strategy_votes_lookup
@@ -1284,6 +1343,8 @@ class Database:
                     total_cost_pct REAL NOT NULL DEFAULT 0,
                     multi_timeframe_conflict INTEGER NOT NULL DEFAULT 0,
                     would_trade_if_exploration_enabled INTEGER NOT NULL DEFAULT 0,
+                    experiment_id INTEGER,
+                    experiment_name TEXT,
                     raw_payload TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 )
@@ -1298,6 +1359,8 @@ class Database:
             self._ensure_column(conn=conn, table_name="brain_decisions", column_name="total_cost_pct", column_sql="REAL NOT NULL DEFAULT 0")
             self._ensure_column(conn=conn, table_name="brain_decisions", column_name="multi_timeframe_conflict", column_sql="INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn=conn, table_name="brain_decisions", column_name="would_trade_if_exploration_enabled", column_sql="INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn=conn, table_name="brain_decisions", column_name="experiment_id", column_sql="INTEGER")
+            self._ensure_column(conn=conn, table_name="brain_decisions", column_name="experiment_name", column_sql="TEXT")
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_brain_decisions_lookup
@@ -1345,6 +1408,54 @@ class Database:
                 """
                 CREATE INDEX IF NOT EXISTS idx_provider_status_lookup
                 ON provider_status (provider, timestamp DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS paper_experiments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT,
+                    notes TEXT,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_paper_experiments_status
+                ON paper_experiments (status, started_at DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS news_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL,
+                    headline TEXT NOT NULL,
+                    event_time TEXT NOT NULL,
+                    detected_symbols TEXT NOT NULL,
+                    sentiment_score REAL NOT NULL,
+                    confidence REAL NOT NULL,
+                    raw_payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sentiment_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL,
+                    sentiment_label TEXT NOT NULL,
+                    sentiment_score REAL NOT NULL,
+                    confidence REAL NOT NULL,
+                    snapshot_time TEXT NOT NULL,
+                    raw_payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
                 """
             )
             conn.execute(
@@ -1625,6 +1736,11 @@ class Database:
         return InsertResult(inserted=inserted, duplicates=duplicates)
 
     def count_candles(self, symbol: str, timeframe: str) -> int:
+        if timeframe != "1m":
+            direct = self._load_direct_candles(symbol=symbol, timeframe=timeframe, descending=False, limit=None)
+            if direct:
+                return len(direct)
+            return len(self.get_candles(symbol=symbol, timeframe=timeframe))
         with self.connection() as conn:
             row = conn.execute(
                 """
@@ -1637,34 +1753,21 @@ class Database:
         return int(row["total"])
 
     def get_recent_candles(self, symbol: str, timeframe: str, limit: int = 2) -> list[StoredCandle]:
-        with self.connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT symbol, timeframe, open_time, open, high, low, close, volume, close_time, COALESCE(provider, 'UNKNOWN') AS provider
-                FROM candles
-                WHERE symbol = ? AND timeframe = ?
-                ORDER BY open_time DESC
-                LIMIT ?
-                """,
-                (symbol, timeframe, limit),
-            ).fetchall()
-
-        ordered_rows = list(reversed(rows))
-        return [self._row_to_candle(row) for row in ordered_rows]
+        direct = self._load_direct_candles(symbol=symbol, timeframe=timeframe, descending=True, limit=limit)
+        if direct:
+            return list(reversed(direct))
+        if timeframe == "1m":
+            return []
+        materialized = self._materialize_timeframe_candles(symbol=symbol, timeframe=timeframe)
+        return materialized[-limit:]
 
     def get_candles(self, symbol: str, timeframe: str) -> list[StoredCandle]:
-        with self.connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT symbol, timeframe, open_time, open, high, low, close, volume, close_time, COALESCE(provider, 'UNKNOWN') AS provider
-                FROM candles
-                WHERE symbol = ? AND timeframe = ?
-                ORDER BY open_time ASC
-                """,
-                (symbol, timeframe),
-            ).fetchall()
-
-        return [self._row_to_candle(row) for row in rows]
+        direct = self._load_direct_candles(symbol=symbol, timeframe=timeframe, descending=False, limit=None)
+        if direct:
+            return direct
+        if timeframe == "1m":
+            return []
+        return self._materialize_timeframe_candles(symbol=symbol, timeframe=timeframe)
 
     def get_candles_after_close_time(
         self,
@@ -1674,19 +1777,8 @@ class Database:
         close_time: str,
         limit: int,
     ) -> list[StoredCandle]:
-        with self.connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT symbol, timeframe, open_time, open, high, low, close, volume, close_time, COALESCE(provider, 'UNKNOWN') AS provider
-                FROM candles
-                WHERE symbol = ? AND timeframe = ? AND close_time > ?
-                ORDER BY close_time ASC
-                LIMIT ?
-                """,
-                (symbol, timeframe, close_time, limit),
-            ).fetchall()
-
-        return [self._row_to_candle(row) for row in rows]
+        candles = self.get_candles(symbol=symbol, timeframe=timeframe)
+        return [candle for candle in candles if candle.close_time > close_time][:limit]
 
     def count_candles_between(
         self,
@@ -1696,19 +1788,8 @@ class Database:
         start_time_exclusive: str,
         end_time_inclusive: str,
     ) -> int:
-        with self.connection() as conn:
-            row = conn.execute(
-                """
-                SELECT COUNT(*) AS total
-                FROM candles
-                WHERE symbol = ?
-                  AND timeframe = ?
-                  AND close_time > ?
-                  AND close_time <= ?
-                """,
-                (symbol, timeframe, start_time_exclusive, end_time_inclusive),
-            ).fetchone()
-        return int(row["total"])
+        candles = self.get_candles(symbol=symbol, timeframe=timeframe)
+        return sum(1 for candle in candles if candle.close_time > start_time_exclusive and candle.close_time <= end_time_inclusive)
 
     def get_candles_between_close_times(
         self,
@@ -1718,20 +1799,12 @@ class Database:
         start_time_inclusive: str,
         end_time_inclusive: str,
     ) -> list[StoredCandle]:
-        with self.connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT symbol, timeframe, open_time, open, high, low, close, volume, close_time, COALESCE(provider, 'UNKNOWN') AS provider
-                FROM candles
-                WHERE symbol = ?
-                  AND timeframe = ?
-                  AND close_time >= ?
-                  AND close_time <= ?
-                ORDER BY close_time ASC
-                """,
-                (symbol, timeframe, start_time_inclusive, end_time_inclusive),
-            ).fetchall()
-        return [self._row_to_candle(row) for row in rows]
+        candles = self.get_candles(symbol=symbol, timeframe=timeframe)
+        return [
+            candle
+            for candle in candles
+            if candle.close_time >= start_time_inclusive and candle.close_time <= end_time_inclusive
+        ]
 
     def upsert_signal_evaluations(self, evaluations: Sequence[SignalEvaluationRecord]) -> UpsertResult:
         inserted = 0
@@ -1936,6 +2009,9 @@ class Database:
     def insert_rejected_signal(self, record: RejectedSignalRecord) -> int:
         created_at = datetime.now(timezone.utc).isoformat()
         with self.connection() as conn:
+            active_experiment = self._get_active_experiment(conn)
+            resolved_experiment_id = record.experiment_id if record.experiment_id is not None else active_experiment["id"] if active_experiment else None
+            resolved_experiment_name = record.experiment_name if record.experiment_name is not None else active_experiment["name"] if active_experiment else None
             cursor = conn.execute(
                 """
                 INSERT INTO rejected_signals_log (
@@ -1957,9 +2033,11 @@ class Database:
                     selected_strategy,
                     paper_mode,
                     would_trade_if_exploration_enabled,
+                    experiment_id,
+                    experiment_name,
                     timestamp,
                     created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.symbol,
@@ -1980,6 +2058,8 @@ class Database:
                     record.selected_strategy,
                     record.paper_mode,
                     1 if record.would_trade_if_exploration_enabled else 0,
+                    resolved_experiment_id,
+                    resolved_experiment_name,
                     record.timestamp,
                     created_at,
                 ),
@@ -2367,9 +2447,14 @@ class Database:
         cost_snapshot: str | None = None,
         paper_mode: str = "OBSERVE_ONLY",
         exploratory_trade: bool = False,
+        experiment_id: int | None = None,
+        experiment_name: str | None = None,
     ) -> int:
         timestamp = datetime.now(timezone.utc).isoformat()
         with self.connection() as conn:
+            active_experiment = self._get_active_experiment(conn)
+            resolved_experiment_id = experiment_id if experiment_id is not None else active_experiment["id"] if active_experiment else None
+            resolved_experiment_name = experiment_name if experiment_name is not None else active_experiment["name"] if active_experiment else None
             cursor = conn.execute(
                 """
                 INSERT INTO simulated_trades (
@@ -2414,10 +2499,12 @@ class Database:
                     cost_snapshot,
                     paper_mode,
                     exploratory_trade,
+                    experiment_id,
+                    experiment_name,
                     created_at,
                     updated_at,
                     timestamp_entry
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     symbol,
@@ -2461,6 +2548,8 @@ class Database:
                     cost_snapshot,
                     paper_mode,
                     1 if exploratory_trade else 0,
+                    resolved_experiment_id,
+                    resolved_experiment_name,
                     timestamp,
                     timestamp,
                     entry_time,
@@ -2690,10 +2779,8 @@ class Database:
             rows = conn.execute(query, params).fetchall()
         return [self._row_to_simulated_trade(row) for row in rows]
 
-    def get_recent_simulated_trades(self, limit: int = 10) -> list[SimulatedTradeRecord]:
-        with self.connection() as conn:
-            rows = conn.execute(
-                """
+    def get_recent_simulated_trades(self, limit: int = 10, *, experiment_id: int | None = None) -> list[SimulatedTradeRecord]:
+        query = """
                 SELECT
                     id,
                     symbol,
@@ -2758,17 +2845,19 @@ class Database:
                     COALESCE(paper_mode, 'OBSERVE_ONLY') AS paper_mode,
                     COALESCE(exploratory_trade, 0) AS exploratory_trade
                 FROM simulated_trades
-                ORDER BY COALESCE(updated_at, created_at, COALESCE(entry_time, timestamp_entry)) DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+                """
+        params: list[Any] = []
+        if experiment_id is not None:
+            query += " WHERE experiment_id = ?"
+            params.append(experiment_id)
+        query += " ORDER BY COALESCE(updated_at, created_at, COALESCE(entry_time, timestamp_entry)) DESC LIMIT ?"
+        params.append(limit)
+        with self.connection() as conn:
+            rows = conn.execute(query, tuple(params)).fetchall()
         return [self._row_to_simulated_trade(row) for row in rows]
 
-    def get_simulated_trade_metrics(self) -> dict[str, float | int]:
-        with self.connection() as conn:
-            row = conn.execute(
-                """
+    def get_simulated_trade_metrics(self, *, experiment_id: int | None = None) -> dict[str, float | int]:
+        query = """
                 SELECT
                     COUNT(*) AS closed_trades,
                     SUM(CASE WHEN outcome IN ('WIN_NET', 'WIN') THEN 1 ELSE 0 END) AS wins,
@@ -2791,7 +2880,12 @@ class Database:
                 FROM simulated_trades
                 WHERE COALESCE(status, 'OPEN') <> 'OPEN'
                 """
-            ).fetchone()
+        params: list[Any] = []
+        if experiment_id is not None:
+            query += " AND experiment_id = ?"
+            params.append(experiment_id)
+        with self.connection() as conn:
+            row = conn.execute(query, tuple(params)).fetchone()
 
         closed_trades = int(row["closed_trades"] or 0)
         wins = int(row["wins"] or 0)
@@ -2909,10 +3003,9 @@ class Database:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def get_recent_rejected_signals(self, limit: int = 10) -> list[dict[str, Any]]:
+    def get_recent_rejected_signals(self, limit: int = 10, *, experiment_id: int | None = None) -> list[dict[str, Any]]:
         with self.connection() as conn:
-            rows = conn.execute(
-                """
+            query = """
                 SELECT
                     id,
                     symbol,
@@ -2933,13 +3026,18 @@ class Database:
                     selected_strategy,
                     paper_mode,
                     would_trade_if_exploration_enabled,
+                    experiment_id,
+                    experiment_name,
                     timestamp
                 FROM rejected_signals_log
-                ORDER BY id DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+            """
+            params: list[Any] = []
+            if experiment_id is not None:
+                query += " WHERE experiment_id = ?"
+                params.append(experiment_id)
+            query += " ORDER BY id DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(query, tuple(params)).fetchall()
         return [dict(row) for row in rows]
 
     def get_recent_error_events(self, limit: int = 10) -> list[dict[str, Any]]:
@@ -3389,13 +3487,16 @@ class Database:
     def insert_strategy_vote(self, record: StrategyVoteRecord) -> int:
         created_at = datetime.now(timezone.utc).isoformat()
         with self.connection() as conn:
+            active_experiment = self._get_active_experiment(conn)
+            resolved_experiment_id = record.experiment_id if record.experiment_id is not None else active_experiment["id"] if active_experiment else None
+            resolved_experiment_name = record.experiment_name if record.experiment_name is not None else active_experiment["name"] if active_experiment else None
             cursor = conn.execute(
                 """
                 INSERT INTO strategy_votes (
                     timestamp, symbol, timeframe, agent_name, strategy_name, decision, confidence, score,
                     expected_move_pct, expected_net_edge_pct, cost_estimate_pct, risk_reward_ratio, regime,
-                    risk_mode, approved, rejection_reason, raw_payload, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    risk_mode, approved, rejection_reason, experiment_id, experiment_name, raw_payload, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.timestamp,
@@ -3414,18 +3515,24 @@ class Database:
                     record.risk_mode,
                     1 if record.approved else 0,
                     record.rejection_reason,
+                    resolved_experiment_id,
+                    resolved_experiment_name,
                     record.raw_payload,
                     created_at,
                 ),
             )
         return int(cursor.lastrowid)
 
-    def get_recent_strategy_votes(self, limit: int = 20) -> list[dict[str, Any]]:
+    def get_recent_strategy_votes(self, limit: int = 20, *, experiment_id: int | None = None) -> list[dict[str, Any]]:
         with self.connection() as conn:
-            rows = conn.execute(
-                "SELECT * FROM strategy_votes ORDER BY id DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+            query = "SELECT * FROM strategy_votes"
+            params: list[Any] = []
+            if experiment_id is not None:
+                query += " WHERE experiment_id = ?"
+                params.append(experiment_id)
+            query += " ORDER BY id DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(query, tuple(params)).fetchall()
         return [dict(row) for row in rows]
 
     def insert_strategy_evaluation(self, record: StrategyEvaluationRecord) -> int:
@@ -3507,6 +3614,9 @@ class Database:
     def insert_brain_decision(self, record: BrainDecisionRecord) -> int:
         created_at = datetime.now(timezone.utc).isoformat()
         with self.connection() as conn:
+            active_experiment = self._get_active_experiment(conn)
+            resolved_experiment_id = record.experiment_id if record.experiment_id is not None else active_experiment["id"] if active_experiment else None
+            resolved_experiment_name = record.experiment_name if record.experiment_name is not None else active_experiment["name"] if active_experiment else None
             cursor = conn.execute(
                 """
                 INSERT INTO brain_decisions (
@@ -3514,8 +3624,9 @@ class Database:
                     risk_mode, expected_net_edge_pct, risk_reward_ratio, cost_coverage_multiple, approved,
                     reason, provider_used, paper_mode, rejected_by_agent, rejected_stage, outcome_label,
                     expected_move_pct, total_cost_pct, multi_timeframe_conflict, would_trade_if_exploration_enabled,
+                    experiment_id, experiment_name,
                     raw_payload, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.timestamp,
@@ -3540,18 +3651,24 @@ class Database:
                     record.total_cost_pct,
                     1 if record.multi_timeframe_conflict else 0,
                     1 if record.would_trade_if_exploration_enabled else 0,
+                    resolved_experiment_id,
+                    resolved_experiment_name,
                     record.raw_payload,
                     created_at,
                 ),
             )
         return int(cursor.lastrowid)
 
-    def get_recent_brain_decisions(self, limit: int = 20) -> list[dict[str, Any]]:
+    def get_recent_brain_decisions(self, limit: int = 20, *, experiment_id: int | None = None) -> list[dict[str, Any]]:
         with self.connection() as conn:
-            rows = conn.execute(
-                "SELECT * FROM brain_decisions ORDER BY id DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+            query = "SELECT * FROM brain_decisions"
+            params: list[Any] = []
+            if experiment_id is not None:
+                query += " WHERE experiment_id = ?"
+                params.append(experiment_id)
+            query += " ORDER BY id DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(query, tuple(params)).fetchall()
         return [dict(row) for row in rows]
 
     def update_brain_decision_outcome(self, *, decision_id: int, outcome_label: str) -> None:
@@ -3669,6 +3786,119 @@ class Database:
             "latest_brain_provider": dict(latest_brain) if latest_brain else None,
             "latest_market_snapshot_provider": dict(latest_snapshot) if latest_snapshot else None,
         }
+
+    def create_paper_experiment(self, name: str, notes: str | None = None) -> PaperExperimentRecord:
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with self.connection() as conn:
+            conn.execute(
+                """
+                UPDATE paper_experiments
+                SET status = 'ARCHIVED',
+                    ended_at = COALESCE(ended_at, ?)
+                WHERE status = 'ACTIVE'
+                """,
+                (timestamp,),
+            )
+            cursor = conn.execute(
+                """
+                INSERT INTO paper_experiments (
+                    name, status, started_at, ended_at, notes, created_at
+                ) VALUES (?, 'ACTIVE', ?, NULL, ?, ?)
+                """,
+                (name, timestamp, notes, timestamp),
+            )
+        return PaperExperimentRecord(
+            id=int(cursor.lastrowid),
+            name=name,
+            status="ACTIVE",
+            started_at=timestamp,
+            ended_at=None,
+            notes=notes,
+        )
+
+    def get_current_paper_experiment(self) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM paper_experiments
+                WHERE status = 'ACTIVE'
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_latest_paper_experiment(self) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM paper_experiments
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return dict(row) if row else None
+
+    def insert_news_event(self, record: NewsEventRecord) -> int:
+        created_at = datetime.now(timezone.utc).isoformat()
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO news_events (
+                    source, headline, event_time, detected_symbols, sentiment_score, confidence, raw_payload, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.source,
+                    record.headline,
+                    record.event_time,
+                    record.detected_symbols,
+                    record.sentiment_score,
+                    record.confidence,
+                    record.raw_payload,
+                    created_at,
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def get_recent_news_events(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM news_events ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def insert_sentiment_snapshot(self, record: SentimentSnapshotRecord) -> int:
+        created_at = datetime.now(timezone.utc).isoformat()
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO sentiment_snapshots (
+                    source, sentiment_label, sentiment_score, confidence, snapshot_time, raw_payload, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.source,
+                    record.sentiment_label,
+                    record.sentiment_score,
+                    record.confidence,
+                    record.snapshot_time,
+                    record.raw_payload,
+                    created_at,
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def get_recent_sentiment_snapshots(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM sentiment_snapshots ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def insert_risk_event(self, record: RiskEventRecord) -> int:
         created_at = datetime.now(timezone.utc).isoformat()
@@ -3951,6 +4181,99 @@ class Database:
             paper_mode=row["paper_mode"],
             exploratory_trade=row["exploratory_trade"],
         )
+
+    def _load_direct_candles(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        descending: bool,
+        limit: int | None,
+    ) -> list[StoredCandle]:
+        order = "DESC" if descending else "ASC"
+        query = f"""
+                SELECT symbol, timeframe, open_time, open, high, low, close, volume, close_time, COALESCE(provider, 'UNKNOWN') AS provider
+                FROM candles
+                WHERE symbol = ? AND timeframe = ?
+                ORDER BY open_time {order}
+                """
+        params: list[Any] = [symbol, timeframe]
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        with self.connection() as conn:
+            rows = conn.execute(query, tuple(params)).fetchall()
+        return [self._row_to_candle(row) for row in rows]
+
+    def _materialize_timeframe_candles(self, *, symbol: str, timeframe: str) -> list[StoredCandle]:
+        base_candles = self._load_direct_candles(symbol=symbol, timeframe="1m", descending=False, limit=None)
+        if not base_candles:
+            return []
+        minutes = self._timeframe_minutes(timeframe)
+        if minutes <= 1:
+            return base_candles
+        buckets: list[list[StoredCandle]] = []
+        current_bucket: list[StoredCandle] = []
+        current_bucket_start: int | None = None
+        for candle in base_candles:
+            open_dt = datetime.fromisoformat(candle.open_time)
+            bucket_start = int(open_dt.timestamp()) // (minutes * 60)
+            if current_bucket_start is None or bucket_start != current_bucket_start:
+                if current_bucket:
+                    buckets.append(current_bucket)
+                current_bucket = [candle]
+                current_bucket_start = bucket_start
+            else:
+                current_bucket.append(candle)
+        if current_bucket:
+            buckets.append(current_bucket)
+
+        materialized: list[StoredCandle] = []
+        for bucket in buckets:
+            first = bucket[0]
+            last = bucket[-1]
+            materialized.append(
+                StoredCandle(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    open_time=first.open_time,
+                    open=first.open,
+                    high=max(item.high for item in bucket),
+                    low=min(item.low for item in bucket),
+                    close=last.close,
+                    volume=sum(item.volume for item in bucket),
+                    close_time=last.close_time,
+                    provider="LOCAL_SQLITE",
+                )
+            )
+        return materialized
+
+    def _get_active_experiment(self, conn: sqlite3.Connection) -> sqlite3.Row | None:
+        return conn.execute(
+            """
+            SELECT id, name
+            FROM paper_experiments
+            WHERE status = 'ACTIVE'
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+    @staticmethod
+    def _timeframe_minutes(timeframe: str) -> int:
+        raw = timeframe.strip()
+        lower = raw.lower()
+        if raw.endswith("M"):
+            return 43200
+        if lower.endswith("m"):
+            return max(1, int(lower[:-1]))
+        if lower.endswith("h"):
+            return max(1, int(lower[:-1])) * 60
+        if lower.endswith("d"):
+            return max(1, int(lower[:-1])) * 1440
+        if lower.endswith("w"):
+            return max(1, int(lower[:-1])) * 10080
+        return 1
 
     @staticmethod
     def _ensure_column(

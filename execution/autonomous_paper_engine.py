@@ -50,6 +50,7 @@ class AutonomousPaperEngine:
         deadline = datetime.now(timezone.utc) + timedelta(minutes=run_minutes or 5)
         fast_validation_mode = max_loops is not None or (run_minutes or 0) <= 5
         target_loops = max_loops if max_loops is not None else (max(1, run_minutes or 5) if fast_validation_mode else None)
+        active_timeframes = self._select_execution_timeframes(timeframes=timeframes, run_minutes=run_minutes, max_loops=max_loops)
         loops = 0
         decisions = 0
         opened = 0
@@ -60,7 +61,7 @@ class AutonomousPaperEngine:
             if ledger_report.result != "OK":
                 stop_reason = f"ledger_{ledger_report.result.lower()}"
                 break
-            for timeframe in timeframes:
+            for timeframe in active_timeframes:
                 for symbol in symbols:
                     decision = self._trading_brain.decide_for_symbol(
                         symbol=symbol,
@@ -68,6 +69,7 @@ class AutonomousPaperEngine:
                         prefer_fallback=prefer_fallback,
                         allow_stale_fallback=allow_stale_fallback,
                         observer_mode=False,
+                        operating_horizon_minutes=run_minutes or (5 if max_loops is not None else None),
                     )
                     decisions += 1
                     if decision.data_stale and not allow_stale_fallback:
@@ -138,3 +140,15 @@ class AutonomousPaperEngine:
             trades_closed=closed,
             stopped_reason=stop_reason,
         )
+
+    def _select_execution_timeframes(
+        self,
+        *,
+        timeframes: Sequence[str],
+        run_minutes: int | None,
+        max_loops: int | None,
+    ) -> tuple[str, ...]:
+        if (run_minutes is not None and run_minutes <= 60) or max_loops is not None:
+            filtered = tuple(timeframe for timeframe in timeframes if timeframe in self._settings.execution_timeframes)
+            return filtered or tuple(self._settings.execution_timeframes)
+        return tuple(timeframes)

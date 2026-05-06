@@ -86,6 +86,12 @@ class Settings:
     selective_min_rr: float
     exploration_min_cost_coverage_multiple: float
     selective_min_cost_coverage_multiple: float
+    paper_exploration_min_cost_coverage: float
+    paper_selective_min_cost_coverage: float
+    paper_exploration_min_rr: float
+    paper_selective_min_rr: float
+    paper_exploration_base_win_probability: float
+    paper_selective_base_win_probability: float
     min_sample_size_for_profitability_claim: int
     brain_min_final_score: float
     autonomous_loop_seconds: int
@@ -93,6 +99,11 @@ class Settings:
     feature_store_lookback: int
     performance_learning_min_sample: int
     backtest_min_trades: int
+    news_enabled: bool
+    sentiment_enabled: bool
+    cryptopanic_token: str
+    coindesk_rss_url: str
+    alternative_me_fng_url: str
 
 
 def _load_env_file(env_file: Path) -> None:
@@ -183,11 +194,11 @@ def load_settings() -> Settings:
         os.getenv("LOGS_DIR", "logs"),
         ROOT_DIR / "logs",
     )
-    market_timeframes = _parse_timeframes(os.getenv("MARKET_TIMEFRAMES", "1m,5m,15m,30m,1h,4h,1d"))
+    market_timeframes = _parse_timeframes(os.getenv("MARKET_TIMEFRAMES", "1m,3m,5m,15m,30m,1h,4h,1d"))
     market_timeframe = os.getenv("MARKET_TIMEFRAME", market_timeframes[0] if market_timeframes else "1m")
-    execution_timeframes = _parse_timeframes(os.getenv("EXECUTION_TIMEFRAMES", "1m,5m,15m"))
-    context_timeframes = _parse_timeframes(os.getenv("CONTEXT_TIMEFRAMES", "30m,1h,4h,1d"))
-    structural_timeframes = _parse_timeframes(os.getenv("STRUCTURAL_TIMEFRAMES", "1w,1M"))
+    execution_timeframes = _parse_timeframes(os.getenv("EXECUTION_TIMEFRAMES", "1m,3m,5m,15m"))
+    context_timeframes = _parse_timeframes(os.getenv("CONTEXT_TIMEFRAMES", "15m,30m,1h"))
+    structural_timeframes = _parse_timeframes(os.getenv("STRUCTURAL_TIMEFRAMES", "4h,1d"))
 
     return Settings(
         app_name=os.getenv("APP_NAME", "multiagent-trading-system"),
@@ -272,11 +283,22 @@ def load_settings() -> Settings:
         selective_min_rr=float(os.getenv("SELECTIVE_MIN_RR", "1.50")),
         exploration_min_cost_coverage_multiple=float(os.getenv("EXPLORATION_MIN_COST_COVERAGE_MULTIPLE", "1.10")),
         selective_min_cost_coverage_multiple=float(os.getenv("SELECTIVE_MIN_COST_COVERAGE_MULTIPLE", "1.50")),
-        min_sample_size_for_profitability_claim=int(os.getenv("MIN_SAMPLE_SIZE_FOR_PROFITABILITY_CLAIM", "50")),
+        paper_exploration_min_cost_coverage=float(os.getenv("PAPER_EXPLORATION_MIN_COST_COVERAGE", "1.50")),
+        paper_selective_min_cost_coverage=float(os.getenv("PAPER_SELECTIVE_MIN_COST_COVERAGE", "2.50")),
+        paper_exploration_min_rr=float(os.getenv("PAPER_EXPLORATION_MIN_RR", "1.10")),
+        paper_selective_min_rr=float(os.getenv("PAPER_SELECTIVE_MIN_RR", "1.50")),
+        paper_exploration_base_win_probability=float(os.getenv("PAPER_EXPLORATION_BASE_WIN_PROBABILITY", "0.53")),
+        paper_selective_base_win_probability=float(os.getenv("PAPER_SELECTIVE_BASE_WIN_PROBABILITY", "0.58")),
+        min_sample_size_for_profitability_claim=int(os.getenv("MIN_SAMPLE_SIZE_FOR_PROFITABILITY_CLAIM", "30")),
         brain_min_final_score=float(os.getenv("BRAIN_MIN_FINAL_SCORE", "0.55")),
         autonomous_loop_seconds=int(os.getenv("AUTONOMOUS_LOOP_SECONDS", "60")),
         market_watch_loop_seconds=int(os.getenv("MARKET_WATCH_LOOP_SECONDS", "60")),
         feature_store_lookback=int(os.getenv("FEATURE_STORE_LOOKBACK", "60")),
         performance_learning_min_sample=int(os.getenv("PERFORMANCE_LEARNING_MIN_SAMPLE", "10")),
         backtest_min_trades=int(os.getenv("BACKTEST_MIN_TRADES", "100")),
+        news_enabled=_parse_bool(os.getenv("NEWS_ENABLED", "true"), True),
+        sentiment_enabled=_parse_bool(os.getenv("SENTIMENT_ENABLED", "true"), True),
+        cryptopanic_token=os.getenv("CRYPTOPANIC_TOKEN", ""),
+        coindesk_rss_url=os.getenv("COINDESK_RSS_URL", "https://www.coindesk.com/arc/outboundfeeds/rss/"),
+        alternative_me_fng_url=os.getenv("ALTERNATIVE_ME_FNG_URL", "https://api.alternative.me/fng/?limit=1&format=json"),
     )

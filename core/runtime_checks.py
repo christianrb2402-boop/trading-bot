@@ -150,15 +150,19 @@ def build_readiness_report(
         for symbol in symbols
         for timeframe in timeframes
     ]
-    required_symbols = {"BTCUSDT", "ETHUSDT"}
-    required_health = [item for item in symbol_health if item.symbol in required_symbols and item.timeframe in {"1m", "5m", "15m"}]
+    required_symbols = set(settings.core_symbols[:2] or ("BTCUSDT", "ETHUSDT"))
+    execution_frames = set(settings.execution_timeframes)
+    execution_health = [item for item in symbol_health if item.timeframe in execution_frames]
+    required_health = [item for item in execution_health if item.symbol in required_symbols]
     fresh_data_available = bool(required_health) and all(item.has_history and not item.is_stale and item.is_valid for item in required_health)
 
     symbols_with_history = tuple(sorted({item.symbol for item in symbol_health if item.has_history}))
     missing_symbols = tuple(sorted({item.symbol for item in symbol_health if not item.has_history}))
     stale_symbols = tuple(sorted({item.symbol for item in symbol_health if item.has_history and item.is_stale}))
     stale_rows = [item for item in symbol_health if item.has_history and item.is_stale]
+    stale_execution_rows = [item for item in execution_health if item.has_history and item.is_stale]
     severe_gap_rows = [item for item in symbol_health if item.gap_count >= 3]
+    severe_execution_gap_rows = [item for item in execution_health if item.gap_count >= 3]
     insufficient_history_rows = [item for item in symbol_health if not item.has_history]
 
     reasons: list[str] = []
@@ -180,7 +184,7 @@ def build_readiness_report(
     if ledger_result != "OK":
         reasons.append(f"Ledger consistency is {ledger_result}")
 
-    if binance_reachable and database_exists and fresh_data_available and not severe_gap_rows and ledger_result == "OK":
+    if binance_reachable and database_exists and fresh_data_available and not severe_execution_gap_rows and ledger_result == "OK":
         current_mode = "LIVE_BINANCE"
     elif not binance_reachable and symbols_with_history and not stale_symbols:
         current_mode = "LOCAL_SQLITE_FALLBACK"
@@ -194,8 +198,7 @@ def build_readiness_report(
         and database_exists
         and binance_reachable
         and fresh_data_available
-        and not missing_symbols
-        and not severe_gap_rows
+        and not severe_execution_gap_rows
         and ledger_result == "OK"
         and current_mode == "LIVE_BINANCE"
     )
@@ -205,9 +208,10 @@ def build_readiness_report(
         and database_exists
         and (binance_reachable or bool(symbols_with_history))
         and ledger_result == "OK"
-        and not severe_gap_rows
+        and not severe_execution_gap_rows
+        and not stale_execution_rows
     )
-    can_run_long_paper = ready_for_live_paper and not stale_rows and not insufficient_history_rows
+    can_run_long_paper = ready_for_live_paper and not stale_rows and not insufficient_history_rows and not missing_symbols
 
     if can_run_short_paper:
         short_run_reason = "short paper run is allowed because the runtime, SQLite and ledger are healthy enough for bounded execution"
@@ -219,12 +223,12 @@ def build_readiness_report(
         blockers: list[str] = []
         if not binance_reachable:
             blockers.append("Binance HTTP is not usable")
-        if stale_rows:
-            blockers.append("stale candles exist in required timeframes")
+        if stale_execution_rows:
+            blockers.append("stale candles exist in required execution timeframes")
         if insufficient_history_rows:
             blockers.append("one or more configured symbols/timeframes have no history")
-        if severe_gap_rows:
-            blockers.append("severe candle gaps were detected")
+        if severe_execution_gap_rows:
+            blockers.append("severe candle gaps were detected in execution timeframes")
         if ledger_result != "OK":
             blockers.append(f"ledger result is {ledger_result}")
         if not blockers:

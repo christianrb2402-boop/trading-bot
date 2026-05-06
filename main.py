@@ -46,10 +46,12 @@ from core.database import (
     FeatureSnapshotRecord,
     GapRepairEventRecord,
     MarketContextRecord,
+    NewsEventRecord,
     ProviderStatusRecord,
     RejectedSignalRecord,
     RiskEventRecord,
     SignalLogRecord,
+    SentimentSnapshotRecord,
     StrategyEvaluationRecord,
     StrategyVoteRecord,
     WebsocketEventRecord,
@@ -61,6 +63,8 @@ from core.runtime_checks import ReadinessReport, build_readiness_report, format_
 from data.binance_market_data import BinanceConnectivityProbe, BinanceMarketDataService
 from data.binance_websocket_provider import BinanceWebsocketProvider
 from data.market_data_provider import BinanceProvider, FutureYahooProvider, LocalSQLiteProvider, ProviderRouter
+from data.news_provider import NewsProvider, news_item_to_payload
+from data.sentiment_provider import SentimentProvider, sentiment_snapshot_to_payload
 from execution.autonomous_paper_engine import AutonomousPaperEngine
 from execution.live_paper_engine import LivePaperEngine, LivePaperEngineResult
 from execution.market_watch_engine import MarketWatchEngine
@@ -107,6 +111,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--readiness-check", action="store_true", help="Evalua si el sistema esta listo para correr live paper largo")
     parser.add_argument("--quick-audit", action="store_true", help="Ejecuta una auditoria operativa corta sin trading real")
     parser.add_argument("--preflight-live-paper", action="store_true", help="Bloquea o aprueba una corrida live paper antes de dejarla mas tiempo")
+    parser.add_argument("--new-paper-experiment", action="store_true", help="Crea un nuevo experimento paper sin borrar la base")
+    parser.add_argument("--name", help="Nombre del experimento paper")
     parser.add_argument("--symbols", nargs="+", help="Lista de simbolos, ejemplo BTCUSDT ETHUSDT")
     parser.add_argument("--timeframes", help="Lista separada por comas, ejemplo 1m,5m,15m")
     parser.add_argument("--timeframe", help="Timeframe, ejemplo 1m")
@@ -814,6 +820,67 @@ def assess_cost_validation(
     }
 
 
+def run_new_paper_experiment(database: Database, name: str | None) -> dict[str, object]:
+    experiment_name = (name or "").strip() or f"paper_experiment_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+    record = database.create_paper_experiment(experiment_name, notes="Created from CLI for controlled paper calibration")
+    print("New Paper Experiment")
+    print(f"current_experiment_id={record.id}")
+    print(f"current_experiment_name={record.name}")
+    print(f"current_experiment_start_time={record.started_at}")
+    return {
+        "id": record.id,
+        "name": record.name,
+        "started_at": record.started_at,
+    }
+
+
+def collect_external_context(database: Database, settings: Settings) -> dict[str, object]:
+    news_provider = NewsProvider(settings)
+    sentiment_provider = SentimentProvider(settings)
+    news_status, news_items = news_provider.fetch_latest(symbols=settings.market_symbols, limit=5)
+    for item in news_items:
+        database.insert_news_event(
+            NewsEventRecord(
+                source=item.source,
+                headline=item.headline,
+                event_time=item.event_time,
+                detected_symbols=json.dumps(list(item.detected_symbols), ensure_ascii=True),
+                sentiment_score=item.sentiment_score,
+                confidence=item.confidence,
+                raw_payload=news_item_to_payload(item),
+            )
+        )
+    sentiment_status, sentiment_snapshot = sentiment_provider.fetch_latest()
+    if sentiment_snapshot is not None:
+        database.insert_sentiment_snapshot(
+            SentimentSnapshotRecord(
+                source=sentiment_snapshot.source,
+                sentiment_label=sentiment_snapshot.sentiment_label,
+                sentiment_score=sentiment_snapshot.sentiment_score,
+                confidence=sentiment_snapshot.confidence,
+                snapshot_time=sentiment_snapshot.snapshot_time,
+                raw_payload=sentiment_snapshot_to_payload(sentiment_snapshot),
+            )
+        )
+    return {
+        "news_status": {
+            "source": news_status.source,
+            "status": news_status.status,
+            "checked_at": news_status.checked_at,
+            "items_detected": news_status.items_detected,
+            "last_error": news_status.last_error,
+        },
+        "sentiment_status": {
+            "source": sentiment_status.source,
+            "status": sentiment_status.status,
+            "checked_at": sentiment_status.checked_at,
+            "last_error": sentiment_status.last_error,
+        },
+        "latest_news": database.get_recent_news_events(limit=10),
+        "latest_sentiment": database.get_recent_sentiment_snapshots(limit=10),
+    }
+
+
 def run_preflight_live_paper(
     *,
     settings: Settings,
@@ -837,7 +904,9 @@ def run_preflight_live_paper(
         timeframes=timeframes,
         ledger_result=ledger_report.result,
     )
-    trade_metrics = database.get_simulated_trade_metrics()
+    current_experiment = database.get_current_paper_experiment() or database.get_latest_paper_experiment()
+    experiment_id = int(current_experiment["id"]) if current_experiment else None
+    trade_metrics = database.get_simulated_trade_metrics(experiment_id=experiment_id)
     cost_validation = assess_cost_validation(settings, trade_metrics)
     orphan_positions = int(ledger_report.orphan_positions)
     inconsistent_open_trades = max(0, int(ledger_report.open_simulated_trades_count) - int(ledger_report.open_positions_count))
@@ -882,6 +951,9 @@ def run_preflight_live_paper(
         print(f"PAPER_MODE: {result['paper_mode']}")
         print("Reason:")
         print(f"- {reason}")
+        provider_summary = database.get_current_provider_summary()
+        print(f"- Current live provider: {(provider_summary.get('current_live_provider') or {}).get('provider', 'UNKNOWN')}")
+        print(f"- Last successful provider: {(provider_summary.get('last_successful_provider') or {}).get('provider', 'UNKNOWN')}")
         print(f"- Binance reachable: {'YES' if readiness.binance_reachable else 'NO'}")
         print(f"- Fresh data available: {'YES' if readiness.fresh_data_available else 'NO'}")
         print(f"- Ledger result: {ledger_report.result}")
@@ -913,11 +985,13 @@ def run_quick_audit(
         timeframes=timeframes,
         ledger_result=ledger_report.result,
     )
-    trade_metrics = database.get_simulated_trade_metrics()
+    current_experiment = database.get_current_paper_experiment() or database.get_latest_paper_experiment()
+    experiment_id = int(current_experiment["id"]) if current_experiment else None
+    trade_metrics = database.get_simulated_trade_metrics(experiment_id=experiment_id)
     cost_validation = assess_cost_validation(settings, trade_metrics)
     performance_report = performance_analyzer.refresh()
-    recent_trades = database.get_recent_simulated_trades(limit=5)
-    recent_rejected = database.get_recent_rejected_signals(limit=5)
+    recent_trades = database.get_recent_simulated_trades(limit=5, experiment_id=experiment_id)
+    recent_rejected = database.get_recent_rejected_signals(limit=5, experiment_id=experiment_id)
 
     safe_short = readiness.can_run_short_paper and ledger_report.result == "OK"
     safe_long = readiness.can_run_long_paper and cost_validation["cost_validation_ok"] and cost_validation["historical_net_ok"]
@@ -929,6 +1003,9 @@ def run_quick_audit(
     print(f"SAFE_TO_RUN_LONG_PAPER: {'YES' if safe_long else 'NO'}")
     print(f"STRATEGY_NET_PROFITABLE: {'YES' if strategy_net_profitable else 'NO'}")
     print(f"PAPER_MODE: {'OBSERVE_ONLY' if not safe_short else ('PAPER_SELECTIVE' if safe_long else 'PAPER_EXPLORATION')}")
+    provider_summary = database.get_current_provider_summary()
+    print(f"CURRENT_LIVE_PROVIDER: {(provider_summary.get('current_live_provider') or {}).get('provider', 'UNKNOWN')}")
+    print(f"LAST_SUCCESSFUL_PROVIDER: {(provider_summary.get('last_successful_provider') or {}).get('provider', 'UNKNOWN')}")
     print("Reason:")
     for reason in reasons:
         print(f"- {reason}")
@@ -1088,14 +1165,14 @@ def refresh_brain_learning_tables(database: Database) -> None:
         )
 
 
-def build_brain_snapshot(database: Database) -> dict[str, object]:
+def build_brain_snapshot(database: Database, *, experiment_id: int | None = None) -> dict[str, object]:
     refresh_brain_learning_tables(database)
     recent_feature_snapshots = database.get_recent_feature_snapshots(limit=10)
-    recent_strategy_votes = database.get_recent_strategy_votes(limit=10)
+    recent_strategy_votes = database.get_recent_strategy_votes(limit=10, experiment_id=experiment_id)
     recent_strategy_evaluations = database.get_recent_strategy_evaluations(limit=10)
     recent_agent_performance = database.get_recent_agent_performance(limit=10)
-    recent_brain_decisions = database.get_recent_brain_decisions(limit=10)
-    aggregate_brain_decisions = database.get_recent_brain_decisions(limit=1000)
+    recent_brain_decisions = database.get_recent_brain_decisions(limit=10, experiment_id=experiment_id)
+    aggregate_brain_decisions = database.get_recent_brain_decisions(limit=1000, experiment_id=experiment_id)
     recent_risk_events = database.get_recent_risk_events(limit=10)
     recent_provider_status = database.get_recent_provider_status(limit=10)
     recent_data_quality_events = database.get_recent_data_quality_events(limit=10)
@@ -1154,19 +1231,23 @@ def build_status_snapshot(
     ledger_reconciler: LedgerReconciler,
     service: BinanceMarketDataService,
 ) -> dict[str, object]:
-    brain_snapshot = build_brain_snapshot(database)
+    current_experiment = database.get_current_paper_experiment() or database.get_latest_paper_experiment()
+    current_experiment_id = int(current_experiment["id"]) if current_experiment else None
+    brain_snapshot = build_brain_snapshot(database, experiment_id=current_experiment_id)
     performance_report = performance_analyzer.refresh()
+    external_context = collect_external_context(database, settings)
     candle_counts = database.list_candle_counts()
     signal_counts = database.list_signal_counts()
     recent_signals = database.get_recent_signals(limit=10)
-    recent_rejected_signals = database.get_recent_rejected_signals(limit=10)
+    recent_rejected_signals = database.get_recent_rejected_signals(limit=10, experiment_id=current_experiment_id)
     recent_market_context = database.get_recent_market_context(limit=10)
     recent_market_snapshots = database.get_recent_market_snapshots(limit=10)
     recent_decisions = database.get_recent_agent_decisions(limit=10)
     recent_insights = database.get_recent_strategy_insights(limit=10)
     open_trades = database.get_open_simulated_trades()
-    trade_metrics = database.get_simulated_trade_metrics()
-    recent_trades = database.get_recent_simulated_trades(limit=10)
+    trade_metrics = database.get_simulated_trade_metrics(experiment_id=current_experiment_id)
+    legacy_trade_metrics = database.get_simulated_trade_metrics()
+    recent_trades = database.get_recent_simulated_trades(limit=10, experiment_id=current_experiment_id)
     recent_errors = database.get_recent_error_events(limit=10)
     portfolio = database.get_paper_portfolio()
     open_positions = database.get_open_paper_positions()
@@ -1191,6 +1272,8 @@ def build_status_snapshot(
     provider_summary = database.get_current_provider_summary()
     current_provider = (
         (provider_summary.get("current_live_provider") or {}).get("provider")
+        or (provider_summary.get("last_successful_provider") or {}).get("provider")
+        or (provider_summary.get("latest_brain_provider") or {}).get("provider_used")
         or (provider_summary.get("latest_market_snapshot_provider") or {}).get("provider_used")
         or "UNKNOWN"
     )
@@ -1207,9 +1290,14 @@ def build_status_snapshot(
                 SUM(CASE WHEN COALESCE(paper_mode, 'OBSERVE_ONLY') = 'PAPER_EXPLORATION' THEN 1 ELSE 0 END) AS exploration_decisions,
                 SUM(CASE WHEN COALESCE(paper_mode, 'OBSERVE_ONLY') = 'PAPER_SELECTIVE' THEN 1 ELSE 0 END) AS selective_decisions
             FROM brain_decisions
-            """
+            WHERE (? IS NULL OR experiment_id = ?)
+            """,
+            (current_experiment_id, current_experiment_id),
         ).fetchone()
-        strategy_vote_count_row = conn.execute("SELECT COUNT(*) AS total_strategy_votes FROM strategy_votes").fetchone()
+        strategy_vote_count_row = conn.execute(
+            "SELECT COUNT(*) AS total_strategy_votes FROM strategy_votes WHERE (? IS NULL OR experiment_id = ?)",
+            (current_experiment_id, current_experiment_id),
+        ).fetchone()
         rejected_counts_row = conn.execute(
             """
             SELECT
@@ -1218,7 +1306,9 @@ def build_status_snapshot(
                 SUM(CASE WHEN COALESCE(rejected_stage, '') IN ('CRITIC', 'FINAL_SCORE') THEN 1 ELSE 0 END) AS rejected_by_contradiction,
                 SUM(CASE WHEN COALESCE(rejected_stage, '') IN ('PAPER_MODE', 'SYMBOL_FILTER') THEN 1 ELSE 0 END) AS rejected_by_insufficient_data
             FROM rejected_signals_log
-            """
+            WHERE (? IS NULL OR experiment_id = ?)
+            """,
+            (current_experiment_id, current_experiment_id),
         ).fetchone()
         trade_mode_row = conn.execute(
             """
@@ -1226,7 +1316,41 @@ def build_status_snapshot(
                 SUM(CASE WHEN COALESCE(paper_mode, 'OBSERVE_ONLY') = 'PAPER_EXPLORATION' THEN 1 ELSE 0 END) AS exploratory_trades,
                 SUM(CASE WHEN COALESCE(paper_mode, 'OBSERVE_ONLY') = 'PAPER_SELECTIVE' THEN 1 ELSE 0 END) AS selective_trades
             FROM simulated_trades
+            WHERE (? IS NULL OR experiment_id = ?)
+            """,
+            (current_experiment_id, current_experiment_id),
+        ).fetchone()
+        experiment_counts_row = conn.execute(
             """
+            SELECT
+                COUNT(*) AS total_brain_decisions
+            FROM brain_decisions
+            WHERE (? IS NULL OR experiment_id = ?)
+            """,
+            (current_experiment_id, current_experiment_id),
+        ).fetchone()
+        experiment_quality_row = conn.execute(
+            """
+            SELECT
+                SUM(CASE WHEN approved = 1 THEN 1 ELSE 0 END) AS approved_opportunities,
+                SUM(CASE WHEN approved = 0 THEN 1 ELSE 0 END) AS rejected_opportunities,
+                SUM(CASE WHEN COALESCE(rejected_stage, '') = 'PAPER_MODE' THEN 1 ELSE 0 END) AS rejected_by_operating_mode,
+                AVG(CASE WHEN approved = 1 THEN expected_move_pct END) AS average_expected_move_at_entry
+            FROM brain_decisions
+            WHERE (? IS NULL OR experiment_id = ?)
+            """,
+            (current_experiment_id, current_experiment_id),
+        ).fetchone()
+        experiment_trade_quality_row = conn.execute(
+            """
+            SELECT
+                SUM(CASE WHEN COALESCE(final_net_pnl_after_all_costs, net_pnl, pnl, 0) > 0 THEN COALESCE(final_net_pnl_after_all_costs, net_pnl, pnl, 0) ELSE 0 END) AS gross_profit,
+                ABS(SUM(CASE WHEN COALESCE(final_net_pnl_after_all_costs, net_pnl, pnl, 0) < 0 THEN COALESCE(final_net_pnl_after_all_costs, net_pnl, pnl, 0) ELSE 0 END)) AS gross_loss
+            FROM simulated_trades
+            WHERE COALESCE(status, 'OPEN') <> 'OPEN'
+              AND (? IS NULL OR experiment_id = ?)
+            """,
+            (current_experiment_id, current_experiment_id),
         ).fetchone()
     symbol_health: list[dict[str, object]] = []
     for symbol in settings.market_symbols:
@@ -1258,6 +1382,7 @@ def build_status_snapshot(
         "last_successful_provider": last_successful_provider,
         "latest_brain_provider": latest_brain_provider,
         "latest_market_snapshot_provider": latest_market_snapshot_provider,
+        "current_experiment": current_experiment,
         "current_paper_mode": brain_snapshot["current_paper_mode"],
         "candle_counts": candle_counts,
         "signal_counts": signal_counts,
@@ -1269,6 +1394,7 @@ def build_status_snapshot(
         "recent_insights": recent_insights,
         "open_trades": open_trades,
         "trade_metrics": trade_metrics,
+        "legacy_trade_metrics": legacy_trade_metrics,
         "recent_trades": recent_trades,
         "recent_errors": recent_errors,
         "performance_report": performance_report,
@@ -1282,6 +1408,15 @@ def build_status_snapshot(
         "total_agent_decisions": database.count_agent_decisions(),
         "total_brain_decisions": int(brain_counts_row["total_brain_decisions"] or 0),
         "total_strategy_votes": int(strategy_vote_count_row["total_strategy_votes"] or 0),
+        "current_experiment_brain_decisions": int(experiment_counts_row["total_brain_decisions"] or 0),
+        "approved_opportunity_count": int(experiment_quality_row["approved_opportunities"] or 0),
+        "rejected_opportunity_count": int(experiment_quality_row["rejected_opportunities"] or 0),
+        "rejected_by_operating_mode": int(experiment_quality_row["rejected_by_operating_mode"] or 0),
+        "average_expected_move_at_entry": round(float(experiment_quality_row["average_expected_move_at_entry"] or 0.0), 6),
+        "profit_factor_net": round(
+            (float(experiment_trade_quality_row["gross_profit"] or 0.0) / max(float(experiment_trade_quality_row["gross_loss"] or 0.0), 0.000001)),
+            6,
+        ) if float(experiment_trade_quality_row["gross_profit"] or 0.0) > 0 else 0.0,
         "missed_opportunities": int(brain_counts_row["missed_opportunities"] or 0),
         "good_avoidances": int(brain_counts_row["good_avoidances"] or 0),
         "exploration_decisions": int(brain_counts_row["exploration_decisions"] or 0),
@@ -1309,6 +1444,7 @@ def build_status_snapshot(
             "long_run_reason": readiness_report.long_run_reason,
             "reasons": list(readiness_report.reasons),
         },
+        "external_context": external_context,
     }
 
 
@@ -1345,9 +1481,15 @@ def run_status_report(
     ledger_report = snapshot["ledger_report"]
     readiness_report = snapshot["readiness_report"]
     brain_snapshot = snapshot["brain_snapshot"]
+    current_experiment = snapshot["current_experiment"]
+    external_context = snapshot["external_context"]
 
     print("Status Report")
     print(f"Database path: {snapshot['database_path']}")
+    if current_experiment:
+        print(f"Current experiment id: {current_experiment['id']}")
+        print(f"Current experiment name: {current_experiment['name']}")
+        print(f"Current experiment start time: {current_experiment['started_at']}")
     print(f"Current live provider: {snapshot['current_provider']}")
     print(f"Last successful provider: {snapshot['last_successful_provider']}")
     print(f"Provider used in latest brain decision: {snapshot['latest_brain_provider']}")
@@ -1363,6 +1505,15 @@ def run_status_report(
     print(f"- Current mode recommended: {readiness_report['current_mode_recommended']}")
     print(f"- Short-run reason: {readiness_report['short_run_reason']}")
     print(f"- Long-run reason: {readiness_report['long_run_reason']}")
+    if snapshot["current_paper_mode"] == "PAPER_SELECTIVE" and readiness_report["can_run_long_paper"]:
+        final_recommendation = "RUN_SELECTIVE_PAPER"
+    elif snapshot["current_paper_mode"] == "PAPER_EXPLORATION" and readiness_report["can_run_short_paper"]:
+        final_recommendation = "RUN_SHORT_EXPLORATION" if not readiness_report["can_run_long_paper"] else "RUN_60_MIN_PAPER"
+    elif readiness_report["can_run_short_paper"]:
+        final_recommendation = "RUN_MARKET_WATCH_ONLY"
+    else:
+        final_recommendation = "DO_NOT_RUN"
+    print(f"- Final recommendation: {final_recommendation}")
     print("")
 
     print("Candles by symbol/timeframe:")
@@ -1493,6 +1644,7 @@ def run_status_report(
     print("Operational counters:")
     print(f"- total agent decisions: {snapshot['total_agent_decisions']}")
     print(f"- total brain decisions: {snapshot['total_brain_decisions']}")
+    print(f"- current experiment brain decisions: {snapshot['current_experiment_brain_decisions']}")
     print(f"- total strategy votes: {snapshot['total_strategy_votes']}")
     print(f"- total paper orders: {snapshot['total_paper_orders']}")
     print(f"- open paper positions: {snapshot['open_paper_positions_count']}")
@@ -1504,10 +1656,15 @@ def run_status_report(
     print(f"- selective trades: {snapshot['selective_trades']}")
     print(f"- missed opportunities: {snapshot['missed_opportunities']}")
     print(f"- good avoidances: {snapshot['good_avoidances']}")
+    print(f"- approved opportunity count: {snapshot['approved_opportunity_count']}")
+    print(f"- rejected opportunity count: {snapshot['rejected_opportunity_count']}")
+    no_trade_rate = round((snapshot['rejected_opportunity_count'] / max(snapshot['current_experiment_brain_decisions'], 1)) * 100, 2) if snapshot['current_experiment_brain_decisions'] else 0.0
+    print(f"- no trade rate: {no_trade_rate}%")
     print(f"- rejected by cost: {snapshot['rejected_by_cost']}")
     print(f"- rejected by risk: {snapshot['rejected_by_risk']}")
     print(f"- rejected by contradiction: {snapshot['rejected_by_contradiction']}")
     print(f"- rejected by insufficient data: {snapshot['rejected_by_insufficient_data']}")
+    print(f"- rejected by operating mode: {snapshot['rejected_by_operating_mode']}")
     print("")
 
     print("Open paper positions:")
@@ -1552,7 +1709,42 @@ def run_status_report(
     print(f"- breakeven count: {trade_metrics['breakeven_count']}")
     print(f"- average cost per trade: {trade_metrics['average_cost_per_trade']}")
     print(f"- average required move to break even: {trade_metrics['average_required_move_to_break_even']}%")
+    print(f"- average expected move at entry: {snapshot['average_expected_move_at_entry']}%")
+    print(f"- profit factor net: {snapshot['profit_factor_net']}")
+    print(f"- legacy gross pnl total: {snapshot['legacy_trade_metrics']['total_gross_pnl']}")
+    print(f"- legacy final net pnl after all costs: {snapshot['legacy_trade_metrics']['total_pnl']}")
     print(f"- breakeven winrate approx: {trade_metrics['breakeven_winrate_approx']}%")
+    print("")
+
+    print("Intraday focus:")
+    print(f"- execution timeframes used: {', '.join(settings.execution_timeframes)}")
+    print(f"- context timeframes used: {', '.join(settings.context_timeframes)}")
+    print(f"- structural timeframes used: {', '.join(settings.structural_timeframes)}")
+    print("- note: 4h/1d are context only for short intraday runs")
+    print("")
+
+    print("News context:")
+    print(
+        f"- news source={external_context['news_status']['source']} status={external_context['news_status']['status']} "
+        f"items_detected={external_context['news_status']['items_detected']} last_error={external_context['news_status']['last_error'] or '-'}"
+    )
+    print(
+        f"- sentiment source={external_context['sentiment_status']['source']} status={external_context['sentiment_status']['status']} "
+        f"last_error={external_context['sentiment_status']['last_error'] or '-'}"
+    )
+    latest_sentiment = external_context["latest_sentiment"]
+    if latest_sentiment:
+        sentiment_row = latest_sentiment[0]
+        print(
+            f"- latest sentiment: {sentiment_row['sentiment_label']} score={sentiment_row['sentiment_score']} "
+            f"snapshot_time={sentiment_row['snapshot_time']}"
+        )
+    latest_news = external_context["latest_news"]
+    if latest_news:
+        for row in latest_news[:3]:
+            print(f"- news: {row['event_time']} {row['source']} {row['headline']}")
+    else:
+        print("- news: none")
     print("")
 
     print("Performance learning summary:")
@@ -1845,6 +2037,8 @@ def run_brain_report(
     symbol_health = snapshot["symbol_health"]
     readiness_report = snapshot["readiness_report"]
     portfolio = snapshot["portfolio"] or {}
+    current_experiment = snapshot["current_experiment"]
+    external_context = snapshot["external_context"]
 
     fresh_symbols = [row for row in symbol_health if not row["is_stale"] and row["is_valid"]]
     stale_symbols = [row for row in symbol_health if row["is_stale"]]
@@ -1857,25 +2051,35 @@ def run_brain_report(
 
     too_conservative = not snapshot["open_trades"] and gross_wins_net_losses == 0 and float(trade_metrics.get("closed_trades", 0) or 0.0) == 0
     too_aggressive = float(portfolio.get("drawdown", 0.0) or 0.0) < -(settings.max_daily_drawdown_pct * 100)
-    if readiness_report["can_run_long_paper"] and not too_aggressive and not stale_symbols:
-        recommendation = "PAPER_TRADE_ALLOWED"
-    elif readiness_report["can_run_short_paper"]:
-        recommendation = "OBSERVE_ONLY"
+    if not readiness_report["can_run_short_paper"]:
+        recommendation = "DO_NOT_RUN"
+    elif snapshot["current_paper_mode"] == "PAPER_SELECTIVE" and not too_aggressive:
+        recommendation = "RUN_SELECTIVE_PAPER"
+    elif snapshot["current_paper_mode"] == "PAPER_EXPLORATION" and not too_aggressive:
+        recommendation = "RUN_SHORT_EXPLORATION" if not readiness_report["can_run_long_paper"] else "RUN_60_MIN_PAPER"
     else:
-        recommendation = "DO_NOT_TRADE"
+        recommendation = "RUN_MARKET_WATCH_ONLY"
 
     print("Brain Report")
+    if current_experiment:
+        print(f"Current experiment: [{current_experiment['id']}] {current_experiment['name']} started_at={current_experiment['started_at']}")
     print(f"Current live provider: {snapshot['current_provider']}")
     print(f"Last successful provider: {snapshot['last_successful_provider']}")
     print(f"Provider used in latest brain decision: {snapshot['latest_brain_provider']}")
     print(f"Provider used in latest market snapshot: {snapshot['latest_market_snapshot_provider']}")
     print(f"Connectivity status: {'BINANCE_HTTP_OK' if readiness_report['binance_reachable'] else 'BINANCE_HTTP_FAIL'}")
     print(f"Paper mode: {snapshot['current_paper_mode']}")
+    if brain_snapshot["recent_brain_decisions"]:
+        latest_payload = _safe_json_loads(brain_snapshot["recent_brain_decisions"][0].get("raw_payload"))
+        print(f"Paper mode reason: {latest_payload.get('paper_mode_reason', '-')}")
     print(f"Fresh symbols/timeframes: {len(fresh_symbols)}")
     print(f"Stale symbols/timeframes: {len(stale_symbols)}")
     print(f"Risk mode recommended: {brain_snapshot['recent_brain_decisions'][0]['risk_mode'] if brain_snapshot['recent_brain_decisions'] else 'UNKNOWN'}")
     print(f"Gross winrate: {trade_metrics['gross_winrate']}%")
     print(f"Net winrate: {trade_metrics['winrate']}%")
+    print(f"Profit factor net: {snapshot['profit_factor_net']}")
+    print(f"Average expected move at entry: {snapshot['average_expected_move_at_entry']}%")
+    print(f"Average required move to break even: {trade_metrics['average_required_move_to_break_even']}%")
     print(f"Fees accumulated: {trade_metrics['total_fees_paid']}")
     print(f"Slippage accumulated: {trade_metrics['total_slippage_paid']}")
     print(f"Spread accumulated: {trade_metrics['total_spread_paid']}")
@@ -1887,9 +2091,22 @@ def run_brain_report(
     print(f"Rejected by risk: {snapshot['rejected_by_risk']}")
     print(f"Rejected by contradiction: {snapshot['rejected_by_contradiction']}")
     print(f"Rejected by insufficient data: {snapshot['rejected_by_insufficient_data']}")
+    print(f"Rejected by operating mode: {snapshot['rejected_by_operating_mode']}")
     print(f"Too conservative: {'YES' if too_conservative else 'NO'}")
     print(f"Too aggressive: {'YES' if too_aggressive else 'NO'}")
     print(f"Recommendation: {recommendation}")
+    print("")
+    print("News context:")
+    print(
+        f"- news source={external_context['news_status']['source']} status={external_context['news_status']['status']} "
+        f"items_detected={external_context['news_status']['items_detected']}"
+    )
+    print(
+        f"- sentiment source={external_context['sentiment_status']['source']} status={external_context['sentiment_status']['status']}"
+    )
+    if external_context["latest_sentiment"]:
+        row = external_context["latest_sentiment"][0]
+        print(f"- latest sentiment={row['sentiment_label']} score={row['sentiment_score']}")
     print("")
     print("Best symbols:")
     for row in best_symbols:
@@ -1962,8 +2179,10 @@ def run_export_report(
                 "total_cost_drag": trade_metrics["total_cost_drag"],
                 "average_cost_per_trade": trade_metrics["average_cost_per_trade"],
                 "average_required_move_to_break_even": trade_metrics["average_required_move_to_break_even"],
+                "average_expected_move_at_entry": snapshot["average_expected_move_at_entry"],
                 "breakeven_winrate_approx": trade_metrics["breakeven_winrate_approx"],
                 "gross_win_net_loss": trade_metrics["gross_win_net_loss"],
+                "profit_factor_net": snapshot["profit_factor_net"],
             }
         ]
         readiness_rows = []
@@ -1993,6 +2212,8 @@ def run_export_report(
                 "gross_win_net_loss": trade_metrics["gross_win_net_loss"],
                 "average_cost_per_trade": trade_metrics["average_cost_per_trade"],
                 "average_required_move_to_break_even": trade_metrics["average_required_move_to_break_even"],
+                "average_expected_move_at_entry": snapshot["average_expected_move_at_entry"],
+                "profit_factor_net": snapshot["profit_factor_net"],
             }
         ]
         csv_targets = {
@@ -2019,6 +2240,8 @@ def run_export_report(
             "gap_repair_events.csv": brain_snapshot["recent_gap_repairs"],
             "recent_brain_decisions.csv": brain_snapshot["recent_brain_decisions"],
             "rejected_signals.csv": snapshot["recent_rejected_signals"],
+            "news_events.csv": snapshot["external_context"]["latest_news"],
+            "sentiment_snapshots.csv": snapshot["external_context"]["latest_sentiment"],
         }
         for filename, rows in csv_targets.items():
             path = output_dir / filename
@@ -2036,9 +2259,10 @@ def run_export_report(
 
     output_path = output_dir / "report_export.json"
     enriched_snapshot = {
-        "summary": {
-            "portfolio": snapshot["portfolio"],
-            "ledger_consistency": snapshot["ledger_report"],
+            "summary": {
+                "current_experiment": snapshot["current_experiment"],
+                "portfolio": snapshot["portfolio"],
+                "ledger_consistency": snapshot["ledger_report"],
             "provider_used": snapshot["current_provider"],
             "last_successful_provider": snapshot["last_successful_provider"],
             "latest_brain_provider": snapshot["latest_brain_provider"],
@@ -2050,8 +2274,9 @@ def run_export_report(
             "supported_context_timeframes": list(settings.context_timeframes),
             "supported_structural_timeframes": list(settings.structural_timeframes),
             "gross_vs_net": snapshot["trade_metrics"],
-            "readiness": snapshot["readiness_report"],
-            "best_setups": snapshot["performance_report"].get("best_setups", []),
+                "readiness": snapshot["readiness_report"],
+                "external_context": snapshot["external_context"],
+                "best_setups": snapshot["performance_report"].get("best_setups", []),
             "worst_setups": snapshot["performance_report"].get("worst_setups", []),
             "best_symbols": snapshot["performance_by_symbol"][:3],
             "worst_symbols": list(reversed(snapshot["performance_by_symbol"][-3:])) if snapshot["performance_by_symbol"] else [],
@@ -2650,6 +2875,14 @@ def main() -> int:
                 extra={"event": "shutdown", "context": {"status": "init_only"}},
             )
             print(f"SQLite inicializada en {settings.sqlite_path}")
+            return 0
+
+        if args.new_paper_experiment:
+            run_new_paper_experiment(database, args.name)
+            logger.info(
+                "Clean shutdown",
+                extra={"event": "shutdown", "context": {"status": "new_paper_experiment_success"}},
+            )
             return 0
 
         if args.diagnose_connectivity:

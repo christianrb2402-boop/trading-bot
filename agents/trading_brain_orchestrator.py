@@ -7,7 +7,7 @@ from typing import Any
 
 from agents.breakout_agent import BreakoutAgent
 from agents.cost_model_agent import CostModelAgent
-from agents.decision_orchestrator import DecisionOrchestrator
+from agents.decision_orchestrator import DecisionOrchestrator, TimeframeAlignment
 from agents.delta_agent import DeltaAgent
 from agents.market_context_agent import MarketContextAgent
 from agents.market_data_agent import MarketDataAgent
@@ -149,6 +149,7 @@ class TradingBrainOrchestrator:
         prefer_fallback: bool,
         allow_stale_fallback: bool,
         observer_mode: bool,
+        operating_horizon_minutes: int | None = None,
     ) -> BrainDecision:
         timestamp = datetime.now(timezone.utc).isoformat()
         provider_result = self._provider_router.fetch_latest_closed_candles(
@@ -299,7 +300,12 @@ class TradingBrainOrchestrator:
                 )
             )
 
-        timeframe_contexts = self._build_timeframe_contexts(symbol=symbol, execution_timeframe=timeframe, current_context=market_context)
+        timeframe_contexts = self._build_timeframe_contexts(
+            symbol=symbol,
+            execution_timeframe=timeframe,
+            current_context=market_context,
+            operating_horizon_minutes=operating_horizon_minutes,
+        )
         direction_bias = "LONG" if market_state.trend_state == "UP" else "SHORT" if market_state.trend_state == "DOWN" else "NONE"
         proposals = self._collect_strategy_proposals(
             symbol=symbol,
@@ -343,6 +349,25 @@ class TradingBrainOrchestrator:
             execution_timeframe=timeframe,
             timeframe_contexts=timeframe_contexts,
         )
+        if operating_horizon_minutes is not None and operating_horizon_minutes <= 60:
+            intraday_rejecting = [item for item in tf_alignment.rejecting_timeframes if item in self._settings.context_timeframes]
+            structural_rejecting = [item for item in tf_alignment.rejecting_timeframes if item in self._settings.structural_timeframes]
+            if intraday_rejecting == [] and structural_rejecting and tf_alignment.supporting_timeframes:
+                tf_alignment = TimeframeAlignment(
+                    timeframe_alignment="SCALP_ONLY",
+                    dominant_trend_timeframe=tf_alignment.dominant_trend_timeframe,
+                    execution_timeframe=tf_alignment.execution_timeframe,
+                    context_timeframe_votes=tf_alignment.context_timeframe_votes,
+                    structural_bias=tf_alignment.structural_bias,
+                    alignment_score=round(max(tf_alignment.alignment_score, 0.45), 6),
+                    contradiction_score=round(max(0.0, tf_alignment.contradiction_score * 0.45), 6),
+                    final_timeframe_reason=(
+                        tf_alignment.final_timeframe_reason
+                        + " Structural frames disagree, but they are being treated only as context for this short intraday run."
+                    ),
+                    supporting_timeframes=tf_alignment.supporting_timeframes,
+                    rejecting_timeframes=tf_alignment.rejecting_timeframes,
+                )
         duplicate_setup = False
         if best_proposal.proposed_decision in {"LONG", "SHORT"}:
             duplicate_setup = self._is_duplicate_setup(symbol=symbol, timeframe=timeframe, direction=best_proposal.proposed_decision, setup_signature=best_proposal.strategy_name)
@@ -355,6 +380,21 @@ class TradingBrainOrchestrator:
         )
         exploration_signal = dict(delta_signal)
         exploration_signal["position_size_usd"] = exploration_position_size
+        similar_trade_stats = self._database.get_similar_closed_trade_stats(
+            setup_signature=best_proposal.strategy_name,
+            direction=best_proposal.proposed_decision if best_proposal.proposed_decision in {"LONG", "SHORT"} else "LONG",
+        )
+        fallback_probability = (
+            self._settings.paper_exploration_base_win_probability
+            if similar_trade_stats["total"] < self._settings.min_sample_size_for_profitability_claim
+            else max(0.05, min(0.95, float(similar_trade_stats["wins"]) / max(int(similar_trade_stats["total"]), 1)))
+        )
+        exploration_signal["probability_win"] = fallback_probability
+        delta_signal["probability_win"] = (
+            self._settings.paper_selective_base_win_probability
+            if similar_trade_stats["total"] < self._settings.min_sample_size_for_profitability_claim
+            else max(0.05, min(0.95, float(similar_trade_stats["wins"]) / max(int(similar_trade_stats["total"]), 1)))
+        )
         exploration_gate = self._net_profitability_gate.evaluate(
             signal=exploration_signal,
             cost_snapshot=exploration_cost_snapshot,
@@ -401,6 +441,8 @@ class TradingBrainOrchestrator:
             open_positions=len(self._database.get_open_paper_positions()),
             recent_exploration_trades=self._recent_trade_count_by_mode("PAPER_EXPLORATION", hours=1),
             recent_rejected_opportunities=self._recent_rejection_count(symbol=symbol, timeframe=timeframe),
+            has_positive_exploration_edge=exploration_gate.approved,
+            has_positive_selective_edge=selective_gate.approved,
         )
         meta_learning = self._meta_learning_agent.assess(
             symbol=symbol,
@@ -458,6 +500,7 @@ class TradingBrainOrchestrator:
             - critic_penalty
         )
 
+        final_score_threshold = self._settings.brain_min_final_score * (0.75 if paper_mode == "PAPER_EXPLORATION" else 1.0)
         approved = (
             best_proposal.proposed_decision in {"LONG", "SHORT"}
             and paper_mode != "OBSERVE_ONLY"
@@ -467,7 +510,7 @@ class TradingBrainOrchestrator:
             and symbol_selection.tradable_today
             and net_gate.approved
             and critic.critic_decision != "REJECT"
-            and final_score >= (self._settings.brain_min_final_score * (0.85 if paper_mode == "PAPER_EXPLORATION" else 1.0))
+            and final_score >= final_score_threshold
             and (len(self._database.get_open_paper_positions()) < self._settings.exploration_max_open_positions if paper_mode == "PAPER_EXPLORATION" else True)
             and (self._recent_trade_count_by_mode("PAPER_EXPLORATION", hours=1) < self._settings.exploration_max_trades_per_hour if paper_mode == "PAPER_EXPLORATION" else True)
             and not (assessment.is_stale and not allow_stale_fallback)
@@ -482,9 +525,20 @@ class TradingBrainOrchestrator:
                 net_gate.reason if not net_gate.approved else "",
                 risk_manager.reason if risk_manager.recommended_action == "BLOCK" else "",
                 "observer mode only" if observer_mode else "",
-                f"paper mode {paper_mode} forbids opening trades" if paper_mode == "OBSERVE_ONLY" else "",
+                self._paper_mode_reason(
+                    paper_mode=paper_mode,
+                    observer_mode=observer_mode,
+                    assessment_is_stale=assessment.is_stale and not allow_stale_fallback,
+                    provider_used=provider_result.provider_used,
+                    symbol_tradable=symbol_selection.tradable_today,
+                    contradiction_score=tf_alignment.contradiction_score,
+                    risk_manager_action=risk_manager.recommended_action,
+                    market_risk_mode=market_state.recommended_risk_mode,
+                    exploration_gate=exploration_gate,
+                    selective_gate=selective_gate,
+                ) if paper_mode == "OBSERVE_ONLY" else "",
                 "symbol not tradable today" if not symbol_selection.tradable_today else "",
-                f"final score {round(final_score, 4)} below minimum {round(self._settings.brain_min_final_score * (0.85 if paper_mode == 'PAPER_EXPLORATION' else 1.0), 4)}" if final_score < (self._settings.brain_min_final_score * (0.85 if paper_mode == "PAPER_EXPLORATION" else 1.0)) else "",
+                f"final score {round(final_score, 4)} below minimum {round(final_score_threshold, 4)}" if final_score < final_score_threshold else "",
                 "exploration max open positions reached" if paper_mode == "PAPER_EXPLORATION" and len(self._database.get_open_paper_positions()) >= self._settings.exploration_max_open_positions else "",
                 "exploration hourly trade cap reached" if paper_mode == "PAPER_EXPLORATION" and self._recent_trade_count_by_mode("PAPER_EXPLORATION", hours=1) >= self._settings.exploration_max_trades_per_hour else "",
             ]
@@ -497,7 +551,7 @@ class TradingBrainOrchestrator:
                 observer_mode=observer_mode,
                 symbol_tradable=symbol_selection.tradable_today,
                 final_score=final_score,
-                threshold=(self._settings.brain_min_final_score * (0.85 if paper_mode == "PAPER_EXPLORATION" else 1.0)),
+                threshold=final_score_threshold,
             )
         final_decision = best_proposal.proposed_decision if approved else "NO_TRADE"
         exit_reason = net_gate.close_condition if approved else rejection_reason or "no trade"
@@ -505,6 +559,19 @@ class TradingBrainOrchestrator:
         payload = {
             "provider_used": provider_result.provider_used,
             "paper_mode": paper_mode,
+            "paper_mode_reason": self._paper_mode_reason(
+                paper_mode=paper_mode,
+                observer_mode=observer_mode,
+                assessment_is_stale=assessment.is_stale and not allow_stale_fallback,
+                provider_used=provider_result.provider_used,
+                symbol_tradable=symbol_selection.tradable_today,
+                contradiction_score=tf_alignment.contradiction_score,
+                risk_manager_action=risk_manager.recommended_action,
+                market_risk_mode=market_state.recommended_risk_mode,
+                exploration_gate=exploration_gate,
+                selective_gate=selective_gate,
+            ),
+            "operating_horizon_minutes": operating_horizon_minutes,
             "position_size_usd": active_position_size,
             "market_data": assessment.as_dict(),
             "features": feature_snapshot.as_dict(),
@@ -521,6 +588,7 @@ class TradingBrainOrchestrator:
             "critic": critic.as_dict(),
             "risk_manager": risk_manager.as_dict(),
             "meta_learning": meta_learning.as_dict(),
+            "similar_trade_stats": similar_trade_stats,
             "timeframe_alignment": tf_alignment.as_dict(),
             "rejection_diagnostics": {
                 "rejected_by_agent": rejected_by_agent,
@@ -709,9 +777,19 @@ class TradingBrainOrchestrator:
             )
         return proposals
 
-    def _build_timeframe_contexts(self, *, symbol: str, execution_timeframe: str, current_context: dict[str, object]) -> dict[str, dict[str, object]]:
+    def _build_timeframe_contexts(
+        self,
+        *,
+        symbol: str,
+        execution_timeframe: str,
+        current_context: dict[str, object],
+        operating_horizon_minutes: int | None,
+    ) -> dict[str, dict[str, object]]:
         contexts: dict[str, dict[str, object]] = {execution_timeframe: current_context}
-        for timeframe in (*self._settings.context_timeframes, *self._settings.structural_timeframes):
+        allowed_contexts = list(self._settings.context_timeframes)
+        if operating_horizon_minutes is None or operating_horizon_minutes > 60:
+            allowed_contexts.extend(self._settings.structural_timeframes)
+        for timeframe in allowed_contexts:
             candles = self._database.get_recent_candles(symbol=symbol, timeframe=timeframe, limit=20)
             if len(candles) < 5:
                 continue
@@ -772,6 +850,8 @@ class TradingBrainOrchestrator:
         open_positions: int,
         recent_exploration_trades: int,
         recent_rejected_opportunities: int,
+        has_positive_exploration_edge: bool,
+        has_positive_selective_edge: bool,
     ) -> str:
         if observer_mode:
             return "OBSERVE_ONLY"
@@ -781,17 +861,62 @@ class TradingBrainOrchestrator:
             return "OBSERVE_ONLY"
         if provider_used == "LOCAL_SQLITE":
             return "OBSERVE_ONLY"
-        if contradiction_score >= 0.7 or alignment_label == "CONTRADICTED":
+        if contradiction_score >= 0.8 or alignment_label == "CONTRADICTED":
             return "OBSERVE_ONLY"
         if not self._settings.paper_mode_auto:
             return "PAPER_SELECTIVE"
         if open_positions >= self._settings.exploration_max_open_positions:
             return "OBSERVE_ONLY"
-        if meta_sample_strength in {"USABLE", "STRONG", "VERY_STRONG"} and contradiction_score <= 0.25 and alignment_label in {"FULL_ALIGNMENT", "SCALP_ONLY"}:
+        if (
+            has_positive_selective_edge
+            and meta_sample_strength in {"USABLE", "STRONG", "VERY_STRONG"}
+            and contradiction_score <= 0.25
+            and alignment_label in {"FULL_ALIGNMENT", "SCALP_ONLY"}
+        ):
             return "PAPER_SELECTIVE"
-        if recent_exploration_trades < self._settings.exploration_max_trades_per_hour and recent_rejected_opportunities >= 3:
+        if has_positive_exploration_edge and recent_exploration_trades < self._settings.exploration_max_trades_per_hour:
+            return "PAPER_EXPLORATION"
+        if recent_rejected_opportunities >= 3 and has_positive_exploration_edge:
             return "PAPER_EXPLORATION"
         return "PAPER_EXPLORATION"
+
+    @staticmethod
+    def _paper_mode_reason(
+        *,
+        paper_mode: str,
+        observer_mode: bool,
+        assessment_is_stale: bool,
+        provider_used: str,
+        symbol_tradable: bool,
+        contradiction_score: float,
+        risk_manager_action: str,
+        market_risk_mode: str,
+        exploration_gate,
+        selective_gate,
+    ) -> str:
+        if observer_mode:
+            return "technical_block: observer mode requested"
+        if assessment_is_stale:
+            return "data_not_fresh: stale market data detected"
+        if provider_used == "LOCAL_SQLITE":
+            return "technical_block: only fallback provider available"
+        if risk_manager_action == "BLOCK":
+            return "risk_too_high: risk manager blocked new entries"
+        if market_risk_mode in {"DO_NOT_TRADE", "CAPITAL_PROTECTION"}:
+            return "risk_too_high: market state recommends capital protection"
+        if not symbol_tradable:
+            return "technical_block: symbol not tradable today"
+        if contradiction_score >= 0.8:
+            return "contradiction_too_high: multi-timeframe conflict is critical"
+        if paper_mode == "PAPER_SELECTIVE":
+            return "paper_selective: historical and current conditions justify stricter execution"
+        if paper_mode == "PAPER_EXPLORATION":
+            if exploration_gate.approved and not selective_gate.approved:
+                return "operating_mode_too_restrictive: selective mode would reject, exploration allows bounded learning"
+            return "paper_exploration: setup has positive edge but still lacks stronger historical proof"
+        if not exploration_gate.approved:
+            return "no_positive_edge: exploration gate did not find a net-positive setup"
+        return "costs_too_high: setup quality is still insufficient after estimated costs"
 
     @staticmethod
     def _classify_rejection(

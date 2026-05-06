@@ -21,6 +21,8 @@ class NetProfitabilityAssessment:
     expected_net_reward_pct: float
     expected_net_risk_pct: float
     expected_net_reward_risk: float
+    expected_value_pct: float
+    probability_win: float
     cost_coverage_multiple: float
     cost_drag_pct: float
     invalidation_price: float
@@ -44,6 +46,8 @@ class NetProfitabilityAssessment:
             "expected_net_reward_pct": self.expected_net_reward_pct,
             "expected_net_risk_pct": self.expected_net_risk_pct,
             "expected_net_reward_risk": self.expected_net_reward_risk,
+            "expected_value_pct": self.expected_value_pct,
+            "probability_win": self.probability_win,
             "cost_coverage_multiple": self.cost_coverage_multiple,
             "cost_drag_pct": self.cost_drag_pct,
             "invalidation_price": self.invalidation_price,
@@ -81,6 +85,23 @@ class NetProfitabilityGate:
             expected_move_value / max(total_estimated_costs, 0.000001) if total_estimated_costs > 0 else float("inf")
         )
         volatility_pct = max(float(signal.get("volatility_pct", 0.0)), 0.0)
+        probability_win = max(
+            0.05,
+            min(
+                0.95,
+                float(
+                    signal.get(
+                        "probability_win",
+                        self._settings.paper_exploration_base_win_probability
+                        if effective_paper_mode == "PAPER_EXPLORATION"
+                        else self._settings.paper_selective_base_win_probability,
+                    )
+                ),
+            ),
+        )
+        expected_value_pct = (probability_win * float(cost_snapshot.expected_net_reward_pct)) - (
+            (1 - probability_win) * float(cost_snapshot.expected_net_risk_pct)
+        )
 
         rejection_reasons: list[str] = []
         if effective_paper_mode == "OBSERVE_ONLY":
@@ -88,12 +109,12 @@ class NetProfitabilityGate:
         if effective_risk_mode in {"CAPITAL_PROTECTION", "DO_NOT_TRADE"}:
             rejection_reasons.append(f"risk mode {effective_risk_mode} blocks new entries")
         if effective_paper_mode == "PAPER_EXPLORATION":
-            min_cost_coverage = self._settings.exploration_min_cost_coverage_multiple
-            min_rr = self._settings.exploration_min_rr
+            min_cost_coverage = self._settings.paper_exploration_min_cost_coverage
+            min_rr = self._settings.paper_exploration_min_rr
             min_net_edge_pct = 0.000001
         elif effective_paper_mode == "PAPER_SELECTIVE":
-            min_cost_coverage = self._settings.selective_min_cost_coverage_multiple
-            min_rr = self._settings.selective_min_rr
+            min_cost_coverage = self._settings.paper_selective_min_cost_coverage
+            min_rr = self._settings.paper_selective_min_rr
             min_net_edge_pct = self._settings.min_expected_net_edge_pct
         elif effective_risk_mode == "CONSERVATIVE":
             min_cost_coverage = self._settings.min_cost_coverage_multiple_conservative
@@ -115,6 +136,10 @@ class NetProfitabilityGate:
             rejection_reasons.append(
                 f"expected move {round(expected_move_pct, 4)}% does not fully cover the minimum profitable move {round(minimum_required_move_pct, 4)}%"
             )
+        if expected_move_pct <= float(cost_snapshot.estimated_total_cost_pct):
+            rejection_reasons.append(
+                f"expected move {round(expected_move_pct, 4)}% is not greater than total estimated cost {round(float(cost_snapshot.estimated_total_cost_pct), 4)}%"
+            )
         if cost_coverage_multiple < min_cost_coverage:
             rejection_reasons.append(
                 f"expected move only covers {round(cost_coverage_multiple, 4)}x estimated costs, below required {round(min_cost_coverage, 4)}x for {effective_paper_mode}/{effective_risk_mode}"
@@ -126,6 +151,10 @@ class NetProfitabilityGate:
         if expected_net_edge_pct < min_net_edge_pct:
             rejection_reasons.append(
                 f"expected net edge {round(expected_net_edge_pct, 4)}% is below minimum {min_net_edge_pct}%"
+            )
+        if expected_value_pct <= 0:
+            rejection_reasons.append(
+                f"expected value {round(expected_value_pct, 4)}% is not positive with probability_win={round(probability_win, 4)}"
             )
         if cost_drag_pct > self._settings.max_cost_drag_pct:
             rejection_reasons.append(
@@ -141,7 +170,8 @@ class NetProfitabilityGate:
             reason = (
                 f"net gate approved because expected move is {round(expected_move_pct, 4)}%, "
                 f"estimated costs are {round(total_estimated_costs, 6)}, expected net edge is "
-                f"{round(expected_net_edge_pct, 4)}%, and cost coverage is {round(cost_coverage_multiple, 4)}x."
+                f"{round(expected_net_edge_pct, 4)}%, expected value is {round(expected_value_pct, 4)}%, "
+                f"and cost coverage is {round(cost_coverage_multiple, 4)}x."
             )
             confidence = 0.9
             vote = direction
@@ -164,6 +194,8 @@ class NetProfitabilityGate:
             expected_net_reward_pct=round(float(cost_snapshot.expected_net_reward_pct), 6),
             expected_net_risk_pct=round(float(cost_snapshot.expected_net_risk_pct), 6),
             expected_net_reward_risk=round(net_reward_risk, 6),
+            expected_value_pct=round(expected_value_pct, 6),
+            probability_win=round(probability_win, 6),
             cost_coverage_multiple=round(cost_coverage_multiple, 6) if cost_coverage_multiple != float("inf") else 999999.0,
             cost_drag_pct=round(cost_drag_pct, 6),
             invalidation_price=float(cost_snapshot.stop_loss_price),

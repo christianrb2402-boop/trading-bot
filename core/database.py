@@ -3933,7 +3933,7 @@ class Database:
     def insert_provider_status(self, record: ProviderStatusRecord) -> int:
         created_at = datetime.now(timezone.utc).isoformat()
         with self.connection() as conn:
-            if record.is_current_live_provider:
+            if record.is_current_live_provider or record.source_type in {"LIVE", "FALLBACK"}:
                 conn.execute("UPDATE provider_status SET is_current_live_provider = 0")
             cursor = conn.execute(
                 """

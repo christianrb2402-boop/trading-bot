@@ -958,6 +958,20 @@ def run_preflight_live_paper(
         print(f"- Fresh data available: {'YES' if readiness.fresh_data_available else 'NO'}")
         print(f"- Ledger result: {ledger_report.result}")
         print(f"- Cost validation OK: {'YES' if cost_validation['cost_validation_ok'] else 'NO'}")
+        current_experiment = database.get_current_paper_experiment() or database.get_latest_paper_experiment()
+        experiment_id = int(current_experiment["id"]) if current_experiment else None
+        with database.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM brain_decisions
+                WHERE approved = 0
+                  AND COALESCE(would_trade_if_exploration_enabled, 0) = 1
+                  AND (? IS NULL OR experiment_id = ?)
+                """,
+                (experiment_id, experiment_id),
+            ).fetchone()
+        print(f"- Near approved exploration setups: {int(row['c'] or 0)}")
         for item in cost_validation["reasons"]:
             print(f"- {item}")
     return result
@@ -1015,6 +1029,22 @@ def run_quick_audit(
     print(f"- average_cost_per_trade={cost_validation['average_cost_per_trade']}")
     print(f"- average_required_move_to_break_even={cost_validation['average_required_move_to_break_even']}%")
     print(f"- gross_win_net_loss={cost_validation['gross_win_net_loss']}")
+    current_experiment = database.get_current_paper_experiment() or database.get_latest_paper_experiment()
+    experiment_id = int(current_experiment["id"]) if current_experiment else None
+    near_approved = 0
+    with database.connection() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM brain_decisions
+            WHERE approved = 0
+              AND COALESCE(would_trade_if_exploration_enabled, 0) = 1
+              AND (? IS NULL OR experiment_id = ?)
+            """,
+            (experiment_id, experiment_id),
+        ).fetchone()
+        near_approved = int(row["c"] or 0)
+    print(f"- near_approved_exploration_setups={near_approved}")
     print("Recent trades:")
     if recent_trades:
         for trade in recent_trades:
@@ -1335,6 +1365,7 @@ def build_status_snapshot(
                 SUM(CASE WHEN approved = 1 THEN 1 ELSE 0 END) AS approved_opportunities,
                 SUM(CASE WHEN approved = 0 THEN 1 ELSE 0 END) AS rejected_opportunities,
                 SUM(CASE WHEN COALESCE(rejected_stage, '') = 'PAPER_MODE' THEN 1 ELSE 0 END) AS rejected_by_operating_mode,
+                SUM(CASE WHEN approved = 0 AND COALESCE(would_trade_if_exploration_enabled, 0) = 1 THEN 1 ELSE 0 END) AS near_approved_exploration_setups,
                 AVG(CASE WHEN approved = 1 THEN expected_move_pct END) AS average_expected_move_at_entry
             FROM brain_decisions
             WHERE (? IS NULL OR experiment_id = ?)
@@ -1412,6 +1443,7 @@ def build_status_snapshot(
         "approved_opportunity_count": int(experiment_quality_row["approved_opportunities"] or 0),
         "rejected_opportunity_count": int(experiment_quality_row["rejected_opportunities"] or 0),
         "rejected_by_operating_mode": int(experiment_quality_row["rejected_by_operating_mode"] or 0),
+        "near_approved_exploration_setups": int(experiment_quality_row["near_approved_exploration_setups"] or 0),
         "average_expected_move_at_entry": round(float(experiment_quality_row["average_expected_move_at_entry"] or 0.0), 6),
         "profit_factor_net": round(
             (float(experiment_trade_quality_row["gross_profit"] or 0.0) / max(float(experiment_trade_quality_row["gross_loss"] or 0.0), 0.000001)),
@@ -1658,6 +1690,7 @@ def run_status_report(
     print(f"- good avoidances: {snapshot['good_avoidances']}")
     print(f"- approved opportunity count: {snapshot['approved_opportunity_count']}")
     print(f"- rejected opportunity count: {snapshot['rejected_opportunity_count']}")
+    print(f"- near approved exploration setups: {snapshot['near_approved_exploration_setups']}")
     no_trade_rate = round((snapshot['rejected_opportunity_count'] / max(snapshot['current_experiment_brain_decisions'], 1)) * 100, 2) if snapshot['current_experiment_brain_decisions'] else 0.0
     print(f"- no trade rate: {no_trade_rate}%")
     print(f"- rejected by cost: {snapshot['rejected_by_cost']}")
@@ -2091,6 +2124,7 @@ def run_brain_report(
     print(f"Rejected by risk: {snapshot['rejected_by_risk']}")
     print(f"Rejected by contradiction: {snapshot['rejected_by_contradiction']}")
     print(f"Rejected by insufficient data: {snapshot['rejected_by_insufficient_data']}")
+    print(f"Near approved exploration setups: {snapshot['near_approved_exploration_setups']}")
     print(f"Rejected by operating mode: {snapshot['rejected_by_operating_mode']}")
     print(f"Too conservative: {'YES' if too_conservative else 'NO'}")
     print(f"Too aggressive: {'YES' if too_aggressive else 'NO'}")

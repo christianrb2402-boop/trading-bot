@@ -196,7 +196,7 @@ def load_settings() -> Settings:
     )
     market_timeframes = _parse_timeframes(os.getenv("MARKET_TIMEFRAMES", "1m,3m,5m,15m,30m,1h,4h,1d"))
     market_timeframe = os.getenv("MARKET_TIMEFRAME", market_timeframes[0] if market_timeframes else "1m")
-    execution_timeframes = _parse_timeframes(os.getenv("EXECUTION_TIMEFRAMES", "1m,3m,5m,15m"))
+    execution_timeframes = _parse_timeframes(os.getenv("EXECUTION_TIMEFRAMES", "1m,3m,5m"))
     context_timeframes = _parse_timeframes(os.getenv("CONTEXT_TIMEFRAMES", "15m,30m,1h"))
     structural_timeframes = _parse_timeframes(os.getenv("STRUCTURAL_TIMEFRAMES", "4h,1d"))
 

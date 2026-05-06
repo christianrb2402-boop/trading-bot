@@ -63,6 +63,12 @@ class MarketStateAgent:
         elif regime == "TRENDING" and trend == "DOWN" and volume_state == "SPIKE":
             market_state = "BREAKOUT_CONFIRMED" if roc < -0.2 else "TREND_DOWN"
             risk_mode = "BALANCED"
+        elif regime == "TRENDING" and trend == "UP":
+            market_state = "TREND_UP"
+            risk_mode = "BALANCED" if relative_volume >= 0.9 or roc >= 0.2 else "CONSERVATIVE"
+        elif regime == "TRENDING" and trend == "DOWN":
+            market_state = "TREND_DOWN"
+            risk_mode = "BALANCED" if relative_volume >= 0.9 or roc <= -0.2 else "CONSERVATIVE"
         elif compression_state == "COMPRESSION":
             market_state = "COMPRESSION"
             risk_mode = "CONSERVATIVE"
@@ -107,4 +113,3 @@ class MarketStateAgent:
             reason=reason,
             risk_flags=tuple(risk_flags),
         )
-

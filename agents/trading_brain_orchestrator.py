@@ -350,9 +350,12 @@ class TradingBrainOrchestrator:
             timeframe_contexts=timeframe_contexts,
         )
         if operating_horizon_minutes is not None and operating_horizon_minutes <= 60:
+            primary_confirmation = self._settings.context_timeframes[0] if self._settings.context_timeframes else None
             intraday_rejecting = [item for item in tf_alignment.rejecting_timeframes if item in self._settings.context_timeframes]
+            primary_rejecting = [item for item in intraday_rejecting if item == primary_confirmation]
+            secondary_context_rejecting = [item for item in intraday_rejecting if item != primary_confirmation]
             structural_rejecting = [item for item in tf_alignment.rejecting_timeframes if item in self._settings.structural_timeframes]
-            if intraday_rejecting == [] and structural_rejecting and tf_alignment.supporting_timeframes:
+            if primary_rejecting == [] and (secondary_context_rejecting or structural_rejecting) and tf_alignment.supporting_timeframes:
                 tf_alignment = TimeframeAlignment(
                     timeframe_alignment="SCALP_ONLY",
                     dominant_trend_timeframe=tf_alignment.dominant_trend_timeframe,
@@ -360,10 +363,10 @@ class TradingBrainOrchestrator:
                     context_timeframe_votes=tf_alignment.context_timeframe_votes,
                     structural_bias=tf_alignment.structural_bias,
                     alignment_score=round(max(tf_alignment.alignment_score, 0.45), 6),
-                    contradiction_score=round(max(0.0, tf_alignment.contradiction_score * 0.45), 6),
+                    contradiction_score=round(max(0.0, tf_alignment.contradiction_score * 0.35), 6),
                     final_timeframe_reason=(
                         tf_alignment.final_timeframe_reason
-                        + " Structural frames disagree, but they are being treated only as context for this short intraday run."
+                        + " Longer intraday/context frames are being treated only as soft filters for this short intraday run."
                     ),
                     supporting_timeframes=tf_alignment.supporting_timeframes,
                     rejecting_timeframes=tf_alignment.rejecting_timeframes,
@@ -500,7 +503,7 @@ class TradingBrainOrchestrator:
             - critic_penalty
         )
 
-        final_score_threshold = self._settings.brain_min_final_score * (0.75 if paper_mode == "PAPER_EXPLORATION" else 1.0)
+        final_score_threshold = self._settings.brain_min_final_score * (0.65 if paper_mode == "PAPER_EXPLORATION" else 1.0)
         approved = (
             best_proposal.proposed_decision in {"LONG", "SHORT"}
             and paper_mode != "OBSERVE_ONLY"

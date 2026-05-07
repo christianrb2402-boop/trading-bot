@@ -85,6 +85,7 @@ class DecisionOrchestrator:
         direction: str,
         execution_timeframe: str,
         timeframe_contexts: dict[str, dict[str, object]],
+        operating_horizon_minutes: int | None = None,
     ) -> TimeframeAlignment:
         supporting: list[str] = []
         rejecting: list[str] = []
@@ -98,22 +99,32 @@ class DecisionOrchestrator:
         structural_bias = "MIXED"
         dominant_strength = -1.0
         contradiction_score = 0.0
+        support_weight = 0.0
+        total_weight = 0.0
+        short_intraday_run = operating_horizon_minutes is not None and operating_horizon_minutes <= 60
 
         for timeframe, context in timeframe_contexts.items():
             trend = str(context.get("trend_direction", "SIDEWAYS"))
             market_regime = str(context.get("market_regime", "RANGING"))
             momentum_confirmed = bool(context.get("momentum_confirmed", False))
             context_votes.append(f"{timeframe}:{trend}:{market_regime}:{'MOMENTUM' if momentum_confirmed else 'WEAK'}")
+            weight = self._timeframe_weight(
+                timeframe=timeframe,
+                execution_timeframe=execution_timeframe,
+                short_intraday_run=short_intraday_run,
+            )
 
             if trend == "SIDEWAYS":
                 continue
+            total_weight += weight
 
             aligned = (direction == "LONG" and trend == "UP") or (direction == "SHORT" and trend == "DOWN")
             if aligned:
                 supporting.append(timeframe)
+                support_weight += weight
             else:
                 rejecting.append(timeframe)
-                contradiction_score += 0.4 if timeframe in self._settings.context_timeframes else 0.25
+                contradiction_score += weight
 
             strength = float(context.get("context_score", 0.0))
             if strength > dominant_strength:
@@ -121,7 +132,7 @@ class DecisionOrchestrator:
                 dominant_trend_timeframe = timeframe
                 structural_bias = trend
 
-        context_alignment = len(supporting) / max(len(supporting) + len(rejecting), 1)
+        context_alignment = support_weight / max(total_weight, 0.000001)
         context_penalty = min(1.0, contradiction_score)
         alignment_score = max(0.0, min(1.0, context_alignment - (context_penalty * 0.35) + (0.1 if execution_timeframe in supporting else 0.0)))
 
@@ -153,6 +164,29 @@ class DecisionOrchestrator:
             supporting_timeframes=tuple(supporting),
             rejecting_timeframes=tuple(rejecting),
         )
+
+    def _timeframe_weight(
+        self,
+        *,
+        timeframe: str,
+        execution_timeframe: str,
+        short_intraday_run: bool,
+    ) -> float:
+        if timeframe == execution_timeframe:
+            return 0.45 if short_intraday_run else 0.35
+        if timeframe in self._settings.structural_timeframes:
+            return 0.0 if short_intraday_run else 0.25
+        if short_intraday_run:
+            if timeframe == "15m":
+                return 0.3
+            if timeframe == "30m":
+                return 0.12
+            if timeframe == "1h":
+                return 0.08
+            return 0.1
+        if timeframe in self._settings.context_timeframes:
+            return 0.4
+        return 0.25
 
     def decide(
         self,

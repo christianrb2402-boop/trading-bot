@@ -41,15 +41,9 @@ class StrategyCriticAgent:
         data_quality_score: float,
     ) -> StrategyCriticAssessment:
         penalties: list[str] = []
-        if expected_net_edge_pct <= 0:
-            penalties.append("non_positive_net_edge")
-        if expected_net_reward_risk < 1.0:
-            penalties.append("poor_net_reward_risk")
-        if total_cost_pct >= float(proposal.get("expected_move_pct", 0.0)):
-            penalties.append("costs_consume_target")
         if timeframe_alignment == "CONTRADICTED":
             penalties.append("multi_timeframe_contradiction")
-        if market_state in {"CHOPPY", "LOW_VOLATILITY", "UNKNOWN"}:
+        if market_state in {"CHOPPY", "LOW_VOLATILITY", "UNKNOWN", "HIGH_VOLATILITY", "NEWSLIKE_SPIKE"}:
             penalties.append("hostile_market_state")
         if is_stale:
             penalties.append("stale_data")
@@ -57,14 +51,27 @@ class StrategyCriticAgent:
             penalties.append("severe_gaps")
         if duplicate_setup:
             penalties.append("duplicate_setup")
-        if loss_streak >= 3:
-            penalties.append("loss_streak")
+        if loss_streak >= 5:
+            penalties.append("loss_streak_critical")
+        elif loss_streak >= 3:
+            penalties.append("loss_streak_elevated")
         if data_quality_score < 0.55:
             penalties.append("poor_data_quality")
-        if contradiction_score >= 0.5:
+        if contradiction_score >= 0.75:
+            penalties.append("critical_contradiction_score")
+        elif contradiction_score >= 0.5:
             penalties.append("high_contradiction_score")
 
-        if any(item in penalties for item in ("stale_data", "severe_gaps", "duplicate_setup", "non_positive_net_edge", "costs_consume_target")):
+        if any(
+            item in penalties
+            for item in (
+                "stale_data",
+                "severe_gaps",
+                "duplicate_setup",
+                "loss_streak_critical",
+                "critical_contradiction_score",
+            )
+        ) or data_quality_score < 0.4:
             return StrategyCriticAssessment(
                 critic_decision="REJECT",
                 critic_score=0.0,
@@ -90,4 +97,3 @@ class StrategyCriticAgent:
             rejection_reason=None,
             raw_payload={"proposal": proposal},
         )
-

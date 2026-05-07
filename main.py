@@ -691,6 +691,10 @@ def run_walk_forward(
     print(f"Train trades: {summary['train_trade_count']} net_pnl={summary['train_net_pnl']} winrate={summary['train_winrate']}%")
     print(f"Test trades: {summary['test_trade_count']} net_pnl={summary['test_net_pnl']} winrate={summary['test_winrate']}%")
     print(f"Survived out of sample: {summary['survived_out_of_sample']}")
+    if "model_parity" in summary:
+        print(f"Model parity: {summary['model_parity']}")
+    if "parity_notes" in summary:
+        print(f"Parity notes: {summary['parity_notes']}")
     return result
 
 
@@ -913,9 +917,21 @@ def run_preflight_live_paper(
     if not cost_validation["cost_validation_ok"]:
         blockers.append("cost validation failed")
 
-    short_ok = readiness.can_run_short_paper and ledger_report.result == "OK" and not inconsistent_open_trades and not orphan_positions
+    fallback_short_ok = bool(
+        allow_stale_fallback
+        and readiness.can_run_without_blocking
+        and ledger_report.result == "OK"
+        and not inconsistent_open_trades
+        and not orphan_positions
+    )
+    short_ok = (readiness.can_run_short_paper or fallback_short_ok) and ledger_report.result == "OK" and not inconsistent_open_trades and not orphan_positions
     long_ok = readiness.can_run_long_paper and not stale_blocked and not blockers and bool(cost_validation["historical_net_ok"])
-    reason = "preflight passed" if long_ok else "; ".join(blockers or [readiness.long_run_reason])
+    if long_ok:
+        reason = "preflight passed"
+    elif short_ok and allow_stale_fallback:
+        reason = "short paper preflight passed with stale fallback enabled; long run remains blocked by connectivity or freshness constraints"
+    else:
+        reason = "; ".join(blockers or [readiness.long_run_reason])
 
     result = {
         "safe_to_run_short_paper": short_ok,

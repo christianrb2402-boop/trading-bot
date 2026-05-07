@@ -349,29 +349,8 @@ class TradingBrainOrchestrator:
             direction=best_proposal.proposed_decision if best_proposal.proposed_decision in {"LONG", "SHORT"} else direction_bias,
             execution_timeframe=timeframe,
             timeframe_contexts=timeframe_contexts,
+            operating_horizon_minutes=operating_horizon_minutes,
         )
-        if operating_horizon_minutes is not None and operating_horizon_minutes <= 60:
-            primary_confirmation = self._settings.context_timeframes[0] if self._settings.context_timeframes else None
-            intraday_rejecting = [item for item in tf_alignment.rejecting_timeframes if item in self._settings.context_timeframes]
-            primary_rejecting = [item for item in intraday_rejecting if item == primary_confirmation]
-            secondary_context_rejecting = [item for item in intraday_rejecting if item != primary_confirmation]
-            structural_rejecting = [item for item in tf_alignment.rejecting_timeframes if item in self._settings.structural_timeframes]
-            if primary_rejecting == [] and (secondary_context_rejecting or structural_rejecting) and tf_alignment.supporting_timeframes:
-                tf_alignment = TimeframeAlignment(
-                    timeframe_alignment="SCALP_ONLY",
-                    dominant_trend_timeframe=tf_alignment.dominant_trend_timeframe,
-                    execution_timeframe=tf_alignment.execution_timeframe,
-                    context_timeframe_votes=tf_alignment.context_timeframe_votes,
-                    structural_bias=tf_alignment.structural_bias,
-                    alignment_score=round(max(tf_alignment.alignment_score, 0.45), 6),
-                    contradiction_score=round(max(0.0, tf_alignment.contradiction_score * 0.35), 6),
-                    final_timeframe_reason=(
-                        tf_alignment.final_timeframe_reason
-                        + " Longer intraday/context frames are being treated only as soft filters for this short intraday run."
-                    ),
-                    supporting_timeframes=tf_alignment.supporting_timeframes,
-                    rejecting_timeframes=tf_alignment.rejecting_timeframes,
-                )
         duplicate_setup = False
         if best_proposal.proposed_decision in {"LONG", "SHORT"}:
             duplicate_setup = self._is_duplicate_setup(symbol=symbol, timeframe=timeframe, direction=best_proposal.proposed_decision, setup_signature=best_proposal.strategy_name)
@@ -504,35 +483,40 @@ class TradingBrainOrchestrator:
             and not observer_mode
         )
 
-        strategy_score = best_proposal.confidence
-        market_alignment_score = market_state.confidence
-        multi_timeframe_alignment_score = tf_alignment.alignment_score
-        risk_reward_score = min(1.0, float(risk_reward.expected_net_reward_risk) / 2.0)
-        expected_net_edge_score = min(1.0, max(float(net_gate.expected_net_edge_pct), 0.0) / max(self._settings.min_expected_net_edge_pct, 0.000001))
-        historical_learning_score = max(0.0, 0.5 + meta_learning.confidence_adjustment)
-        cost_penalty = min(1.0, float(cost_snapshot.cost_drag_pct))
-        drawdown_penalty = min(1.0, abs(drawdown_pct) / max(self._settings.max_daily_drawdown_pct * 100, 0.000001))
-        data_quality_penalty = max(0.0, 1.0 - symbol_selection.data_quality_score)
-        contradiction_penalty = tf_alignment.contradiction_score
-        overtrading_penalty = min(1.0, len(self._database.get_open_paper_positions()) / max(self._settings.max_open_positions, 1))
-        critic_penalty = max(0.0, 1.0 - critic.critic_score)
-
-        final_score = (
-            strategy_score
-            + market_alignment_score
-            + multi_timeframe_alignment_score
-            + risk_reward_score
-            + expected_net_edge_score
-            + historical_learning_score
-            - cost_penalty
-            - drawdown_penalty
-            - data_quality_penalty
-            - contradiction_penalty
-            - overtrading_penalty
-            - critic_penalty
+        strategy_score = max(0.0, min(1.0, best_proposal.confidence))
+        market_alignment_score = max(0.0, min(1.0, market_state.confidence))
+        multi_timeframe_alignment_score = max(0.0, min(1.0, tf_alignment.alignment_score))
+        economics_score = max(
+            0.0,
+            min(
+                1.0,
+                (
+                    min(1.0, float(risk_reward.expected_net_reward_risk) / max(self._settings.paper_selective_min_rr, 0.000001))
+                    + min(1.0, max(float(net_gate.expected_net_edge_pct), 0.0) / max(self._settings.min_expected_net_edge_pct, 0.000001))
+                ) / 2.0,
+            ),
         )
-
-        final_score_threshold = self._settings.brain_min_final_score * (0.6 if paper_mode == "PAPER_EXPLORATION" else 1.0)
+        score_breakdown = self._build_final_score_breakdown(
+            strategy_score=strategy_score,
+            market_alignment_score=market_alignment_score,
+            multi_timeframe_alignment_score=multi_timeframe_alignment_score,
+            economics_score=economics_score,
+            data_quality_score=symbol_selection.data_quality_score,
+            contradiction_score=tf_alignment.contradiction_score,
+            cost_drag_pct=float(active_cost_snapshot.cost_drag_pct),
+            critic_score=critic.critic_score,
+            drawdown_pct=drawdown_pct,
+            open_positions=len(self._database.get_open_paper_positions()),
+            provider_used=provider_result.provider_used,
+        )
+        final_score = score_breakdown["final_score"]
+        final_score_threshold = (
+            self._settings.brain_min_final_score_exploration
+            if paper_mode == "PAPER_EXPLORATION"
+            else self._settings.brain_min_final_score_selective
+            if paper_mode == "PAPER_SELECTIVE"
+            else self._settings.brain_min_final_score
+        )
         approved = (
             best_proposal.proposed_decision in {"LONG", "SHORT"}
             and paper_mode != "OBSERVE_ONLY"
@@ -629,20 +613,7 @@ class TradingBrainOrchestrator:
                 "rejected_stage": rejected_stage,
                 "would_trade_if_exploration_enabled": would_trade_if_exploration_enabled,
             },
-            "score_breakdown": {
-                "strategy_score": strategy_score,
-                "market_alignment_score": market_alignment_score,
-                "multi_timeframe_alignment_score": multi_timeframe_alignment_score,
-                "risk_reward_score": risk_reward_score,
-                "expected_net_edge_score": expected_net_edge_score,
-                "historical_learning_score": historical_learning_score,
-                "cost_penalty": cost_penalty,
-                "drawdown_penalty": drawdown_penalty,
-                "data_quality_penalty": data_quality_penalty,
-                "contradiction_penalty": contradiction_penalty,
-                "overtrading_penalty": overtrading_penalty,
-                "critic_penalty": critic_penalty,
-            },
+            "score_breakdown": score_breakdown,
         }
 
         for proposal in proposals:
@@ -727,7 +698,7 @@ class TradingBrainOrchestrator:
                 symbol=symbol,
                 timeframe=timeframe,
                 decision=final_decision,
-                confidence=round(max(0.0, min(1.0, best_proposal.confidence + meta_learning.confidence_adjustment - critic_penalty * 0.1)), 6),
+                confidence=round(max(0.0, min(1.0, best_proposal.confidence + meta_learning.confidence_adjustment - (score_breakdown["critic_penalty"] * 0.5))), 6),
                 inputs_used=json.dumps(
                     {
                         "provider": provider_result.provider_used,
@@ -753,7 +724,7 @@ class TradingBrainOrchestrator:
             selected_strategy=best_proposal.strategy_name,
             market_state=market_state.market_state,
             risk_mode=risk_manager.risk_mode,
-            confidence=round(max(0.0, min(1.0, best_proposal.confidence + meta_learning.confidence_adjustment - critic_penalty * 0.1)), 6),
+            confidence=round(max(0.0, min(1.0, best_proposal.confidence + meta_learning.confidence_adjustment - (score_breakdown["critic_penalty"] * 0.5))), 6),
             final_score=round(final_score, 6),
             expected_move_pct=float(best_proposal.expected_move_pct),
             total_cost_pct=float(cost_snapshot.minimum_profitable_move_pct),
@@ -973,18 +944,18 @@ class TradingBrainOrchestrator:
             return "OBSERVE_ONLY"
         if market_risk_mode in {"DO_NOT_TRADE", "CAPITAL_PROTECTION"}:
             return "OBSERVE_ONLY"
-        if provider_used == "LOCAL_SQLITE":
+        if contradiction_score >= 0.9 or alignment_label == "CONTRADICTED":
             return "OBSERVE_ONLY"
-        if contradiction_score >= 0.8 or alignment_label == "CONTRADICTED":
-            return "OBSERVE_ONLY"
-        if not self._settings.paper_mode_auto:
-            return "PAPER_SELECTIVE"
         if open_positions >= self._settings.exploration_max_open_positions:
             return "OBSERVE_ONLY"
+        if not has_positive_exploration_edge:
+            return "OBSERVE_ONLY"
+        if not self._settings.paper_mode_auto:
+            return "PAPER_SELECTIVE" if has_positive_selective_edge else "PAPER_EXPLORATION"
         if (
             has_positive_selective_edge
             and meta_sample_strength in {"USABLE", "STRONG", "VERY_STRONG"}
-            and contradiction_score <= 0.25
+            and contradiction_score <= 0.32
             and alignment_label in {"FULL_ALIGNMENT", "SCALP_ONLY"}
         ):
             return "PAPER_SELECTIVE"
@@ -992,7 +963,7 @@ class TradingBrainOrchestrator:
             return "PAPER_EXPLORATION"
         if recent_rejected_opportunities >= 3 and has_positive_exploration_edge:
             return "PAPER_EXPLORATION"
-        return "PAPER_EXPLORATION"
+        return "OBSERVE_ONLY"
 
     @staticmethod
     def _paper_mode_reason(
@@ -1012,25 +983,96 @@ class TradingBrainOrchestrator:
             return "technical_block: observer mode requested"
         if assessment_is_stale:
             return "data_not_fresh: stale market data detected"
-        if provider_used == "LOCAL_SQLITE":
-            return "technical_block: only fallback provider available"
         if risk_manager_action == "BLOCK":
             return "risk_too_high: risk manager blocked new entries"
         if market_risk_mode in {"DO_NOT_TRADE", "CAPITAL_PROTECTION"}:
             return "risk_too_high: market state recommends capital protection"
         if not symbol_tradable:
             return "technical_block: symbol not tradable today"
-        if contradiction_score >= 0.8:
+        if contradiction_score >= 0.9:
             return "contradiction_too_high: multi-timeframe conflict is critical"
         if paper_mode == "PAPER_SELECTIVE":
+            if provider_used == "LOCAL_SQLITE":
+                return "paper_selective_with_fallback: setup is strong enough despite fallback data, but confidence is penalized"
             return "paper_selective: historical and current conditions justify stricter execution"
         if paper_mode == "PAPER_EXPLORATION":
             if exploration_gate.approved and not selective_gate.approved:
+                if provider_used == "LOCAL_SQLITE":
+                    return "paper_exploration_with_fallback: bounded exploration is allowed on fallback data with reduced confidence"
                 return "operating_mode_too_restrictive: selective mode would reject, exploration allows bounded learning"
+            if provider_used == "LOCAL_SQLITE":
+                return "paper_exploration_with_fallback: fallback provider is acceptable for paper exploration when the setup remains net-positive"
             return "paper_exploration: setup has positive edge but still lacks stronger historical proof"
         if not exploration_gate.approved:
             return "no_positive_edge: exploration gate did not find a net-positive setup"
         return "costs_too_high: setup quality is still insufficient after estimated costs"
+
+    def _build_final_score_breakdown(
+        self,
+        *,
+        strategy_score: float,
+        market_alignment_score: float,
+        multi_timeframe_alignment_score: float,
+        economics_score: float,
+        data_quality_score: float,
+        contradiction_score: float,
+        cost_drag_pct: float,
+        critic_score: float,
+        drawdown_pct: float,
+        open_positions: int,
+        provider_used: str,
+    ) -> dict[str, float]:
+        positive_strategy = round(strategy_score * 0.3, 6)
+        positive_market = round(market_alignment_score * 0.2, 6)
+        positive_timeframe = round(multi_timeframe_alignment_score * 0.2, 6)
+        positive_economics = round(economics_score * 0.3, 6)
+
+        cost_penalty = round(min(0.18, max(0.0, cost_drag_pct) * 0.25), 6)
+        contradiction_penalty = round(min(0.22, max(0.0, contradiction_score) * 0.28), 6)
+        data_quality_penalty = round(min(0.18, max(0.0, 1.0 - data_quality_score) * 0.2), 6)
+        drawdown_penalty = round(
+            min(0.08, (abs(drawdown_pct) / max(self._settings.max_daily_drawdown_pct * 100, 0.000001)) * 0.08),
+            6,
+        )
+        overtrading_penalty = round(
+            min(0.06, (open_positions / max(self._settings.exploration_max_open_positions, 1)) * 0.06),
+            6,
+        )
+        critic_penalty = round(min(0.08, max(0.0, 1.0 - critic_score) * 0.08), 6)
+        provider_penalty = 0.04 if provider_used == "LOCAL_SQLITE" else 0.0
+
+        final_score = round(
+            positive_strategy
+            + positive_market
+            + positive_timeframe
+            + positive_economics
+            - cost_penalty
+            - contradiction_penalty
+            - data_quality_penalty
+            - drawdown_penalty
+            - overtrading_penalty
+            - critic_penalty
+            - provider_penalty,
+            6,
+        )
+        return {
+            "strategy_score": round(strategy_score, 6),
+            "market_alignment_score": round(market_alignment_score, 6),
+            "multi_timeframe_alignment_score": round(multi_timeframe_alignment_score, 6),
+            "economics_score": round(economics_score, 6),
+            "positive_strategy": positive_strategy,
+            "positive_market": positive_market,
+            "positive_timeframe": positive_timeframe,
+            "positive_economics": positive_economics,
+            "cost_penalty": cost_penalty,
+            "contradiction_penalty": contradiction_penalty,
+            "data_quality_penalty": data_quality_penalty,
+            "drawdown_penalty": drawdown_penalty,
+            "overtrading_penalty": overtrading_penalty,
+            "critic_penalty": critic_penalty,
+            "provider_penalty": provider_penalty,
+            "final_score": final_score,
+        }
 
     @staticmethod
     def _classify_rejection(

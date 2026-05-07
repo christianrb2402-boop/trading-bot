@@ -23,8 +23,10 @@ class WalkForwardSummary:
     train_winrate: float
     test_winrate: float
     survived_out_of_sample: bool
+    model_parity: str
+    parity_notes: str
 
-    def as_dict(self) -> dict[str, float | int | bool]:
+    def as_dict(self) -> dict[str, float | int | bool | str]:
         return {
             "selected_relaxation": self.selected_relaxation,
             "train_trade_count": self.train_trade_count,
@@ -34,6 +36,8 @@ class WalkForwardSummary:
             "train_winrate": self.train_winrate,
             "test_winrate": self.test_winrate,
             "survived_out_of_sample": self.survived_out_of_sample,
+            "model_parity": self.model_parity,
+            "parity_notes": self.parity_notes,
         }
 
 
@@ -102,6 +106,11 @@ class WalkForwardEngine:
             train_winrate=best_train["winrate"],
             test_winrate=round((test_aggregate["wins"] / max(test_aggregate["trade_count"], 1)) * 100, 2) if test_aggregate["trade_count"] else 0.0,
             survived_out_of_sample=bool(test_aggregate["trade_count"] and test_aggregate["net_pnl"] >= 0),
+            model_parity="PARTIAL_APPROXIMATION",
+            parity_notes=(
+                "Walk-forward now uses the exploration net gate plus a lightweight structural screen, "
+                "but it still does not fully replicate the live brain, risk manager, provider fallback policy, or external context."
+            ),
         )
         self._persist(symbols=symbols, timeframes=timeframes, limit=limit, train_pct=train_pct, summary=summary)
         return {"summary": summary.as_dict()}
@@ -142,13 +151,21 @@ class WalkForwardEngine:
             if str(signal["signal_type"]) not in {"LONG", "SHORT"}:
                 index += 1
                 continue
+            if self._structural_screen(context=context):
+                index += 1
+                continue
             cost = self._cost_model_agent.estimate(
                 entry_price=current.close,
                 direction=str(signal["signal_type"]),
                 position_size_usd=self._settings.simulated_position_size_usd,
                 volatility_pct=float(signal.get("volatility_pct", 0.0)),
             )
-            gate = self._net_profitability_gate.evaluate(signal=signal, cost_snapshot=cost)
+            gate = self._net_profitability_gate.evaluate(
+                signal=signal,
+                cost_snapshot=cost,
+                risk_mode="BALANCED",
+                paper_mode="PAPER_EXPLORATION",
+            )
             if not gate.approved:
                 index += 1
                 continue
@@ -161,6 +178,18 @@ class WalkForwardEngine:
             wins += 1 if pnl_pct > 0 else 0
             index = exit_index + 1
         return {"trade_count": trade_count, "wins": wins, "net_pnl": net_pnl}
+
+    @staticmethod
+    def _structural_screen(*, context: dict[str, object]) -> bool:
+        trend = str(context.get("trend_direction", "SIDEWAYS"))
+        regime = str(context.get("market_regime", "RANGING"))
+        volatility_pct = float(context.get("volatility_pct", 0.0) or 0.0)
+        momentum_confirmed = bool(context.get("momentum_confirmed", False))
+        if trend == "SIDEWAYS" and regime == "RANGING" and volatility_pct < 0.1:
+            return True
+        if not momentum_confirmed and volatility_pct < 0.08:
+            return True
+        return False
 
     def _persist(
         self,

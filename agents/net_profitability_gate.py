@@ -111,55 +111,48 @@ class NetProfitabilityGate:
         if effective_paper_mode == "PAPER_EXPLORATION":
             min_cost_coverage = self._settings.paper_exploration_min_cost_coverage
             min_rr = self._settings.paper_exploration_min_rr
-            min_net_edge_pct = 0.000001
-            volatility_headroom = 1.35
+            min_net_edge_pct = max(self._settings.min_expected_net_edge_pct * 0.5, 0.000001)
+            volatility_headroom = 1.55
+            rr_tolerance = 0.03
         elif effective_paper_mode == "PAPER_SELECTIVE":
             min_cost_coverage = self._settings.paper_selective_min_cost_coverage
             min_rr = self._settings.paper_selective_min_rr
             min_net_edge_pct = self._settings.min_expected_net_edge_pct
-            volatility_headroom = 1.15
+            volatility_headroom = 1.3
+            rr_tolerance = 0.0
         elif effective_risk_mode == "CONSERVATIVE":
             min_cost_coverage = self._settings.min_cost_coverage_multiple_conservative
             min_rr = self._settings.min_net_reward_risk_ratio
             min_net_edge_pct = self._settings.min_expected_net_edge_pct
             volatility_headroom = 1.05
+            rr_tolerance = 0.0
         elif effective_risk_mode in {"BALANCED", ""}:
             min_cost_coverage = self._settings.min_cost_coverage_multiple_balanced
             min_rr = self._settings.min_net_reward_risk_ratio
             min_net_edge_pct = self._settings.min_expected_net_edge_pct
             volatility_headroom = 1.15
+            rr_tolerance = 0.0
         else:
             min_cost_coverage = self._settings.min_cost_coverage_multiple_aggressive
             min_rr = self._settings.min_net_reward_risk_ratio
             min_net_edge_pct = self._settings.min_expected_net_edge_pct
             volatility_headroom = 1.25
+            rr_tolerance = 0.0
         if direction not in {"LONG", "SHORT"}:
             rejection_reasons.append("signal is not actionable")
         if expected_net_edge_value <= 0 or expected_net_edge_pct <= 0:
             rejection_reasons.append("expected net edge is not positive after estimated costs")
-        if expected_move_pct <= minimum_required_move_pct:
-            rejection_reasons.append(
-                f"expected move {round(expected_move_pct, 4)}% does not fully cover the minimum profitable move {round(minimum_required_move_pct, 4)}%"
-            )
-        if expected_move_pct <= float(cost_snapshot.estimated_total_cost_pct):
-            rejection_reasons.append(
-                f"expected move {round(expected_move_pct, 4)}% is not greater than total estimated cost {round(float(cost_snapshot.estimated_total_cost_pct), 4)}%"
-            )
         if cost_coverage_multiple < min_cost_coverage:
             rejection_reasons.append(
                 f"expected move only covers {round(cost_coverage_multiple, 4)}x estimated costs, below required {round(min_cost_coverage, 4)}x for {effective_paper_mode}/{effective_risk_mode}"
             )
-        if net_reward_risk < min_rr:
+        if (net_reward_risk + rr_tolerance) < min_rr:
             rejection_reasons.append(
                 f"net reward/risk {round(net_reward_risk, 4)} is below minimum {min_rr}"
             )
         if expected_net_edge_pct < min_net_edge_pct:
             rejection_reasons.append(
                 f"expected net edge {round(expected_net_edge_pct, 4)}% is below minimum {min_net_edge_pct}%"
-            )
-        if expected_value_pct <= 0:
-            rejection_reasons.append(
-                f"expected value {round(expected_value_pct, 4)}% is not positive with probability_win={round(probability_win, 4)}"
             )
         if cost_drag_pct > self._settings.max_cost_drag_pct:
             rejection_reasons.append(

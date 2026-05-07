@@ -56,6 +56,7 @@ class AutonomousPaperEngine:
         decisions = 0
         opened = 0
         closed = 0
+        exploration_opened_this_run = 0
         stop_reason = "completed_requested_run"
         while datetime.now(timezone.utc) < deadline:
             ledger_report = self._ledger_reconciler.inspect()
@@ -108,6 +109,15 @@ class AutonomousPaperEngine:
                         "agent_votes": decision.raw_payload.get("strategy_votes", []),
                         "position_size_usd": decision.raw_payload.get("position_size_usd", 0.0),
                     }
+                    if (
+                        decision.paper_mode == "PAPER_EXPLORATION"
+                        and decision.final_decision in {"LONG", "SHORT"}
+                        and exploration_opened_this_run >= self._settings.exploration_max_trades_per_short_run
+                    ):
+                        signal["signal_type"] = "NONE"
+                        signal["decision_type"] = "NO_TRADE"
+                        signal["direction"] = "NONE"
+                        signal["explanation"] = "short run exploration cap reached"
                     result = self._execution_agent.process_cycle(
                         symbol=symbol,
                         timeframe=timeframe,
@@ -119,6 +129,8 @@ class AutonomousPaperEngine:
                     )
                     opened += int(result.cycle_result.opened)
                     closed += int(result.cycle_result.closed)
+                    if decision.paper_mode == "PAPER_EXPLORATION" and result.cycle_result.opened:
+                        exploration_opened_this_run += 1
                 if stop_reason != "completed_requested_run":
                     break
             loops += 1

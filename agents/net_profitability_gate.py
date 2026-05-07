@@ -113,7 +113,7 @@ class NetProfitabilityGate:
             min_rr = self._settings.paper_exploration_min_rr
             min_net_edge_pct = max(self._settings.min_expected_net_edge_pct * 0.5, 0.000001)
             volatility_headroom = 1.55
-            rr_tolerance = 0.03
+            rr_tolerance = 0.08
         elif effective_paper_mode == "PAPER_SELECTIVE":
             min_cost_coverage = self._settings.paper_selective_min_cost_coverage
             min_rr = self._settings.paper_selective_min_rr
@@ -162,6 +162,8 @@ class NetProfitabilityGate:
             rejection_reasons.append(
                 f"minimum profitable move {round(minimum_required_move_pct, 4)}% exceeds current volatility headroom {round(volatility_pct * volatility_headroom, 4)}%"
             )
+        if effective_paper_mode == "PAPER_EXPLORATION" and len(rejection_reasons) > 1 and "signal is not actionable" in rejection_reasons:
+            rejection_reasons = [reason for reason in rejection_reasons if reason != "signal is not actionable"]
 
         approved = not rejection_reasons
         if approved:

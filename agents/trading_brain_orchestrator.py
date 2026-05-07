@@ -319,7 +319,12 @@ class TradingBrainOrchestrator:
         best_proposal = max(proposals, key=lambda item: item.confidence)
 
         exploration_position_size = max(
-            min(total_equity * self._settings.exploration_risk_per_trade_pct, self._settings.simulated_position_size_usd),
+            min(
+                self._settings.exploration_position_size_usd,
+                total_equity * self._settings.exploration_risk_per_trade_pct,
+                self._settings.simulated_position_size_usd * 0.6,
+                total_equity * max(risk_manager.position_size_pct, 0.03),
+            ),
             1.0,
         )
         cost_snapshot = self._cost_model_agent.estimate(
@@ -354,6 +359,7 @@ class TradingBrainOrchestrator:
         duplicate_setup = False
         if best_proposal.proposed_decision in {"LONG", "SHORT"}:
             duplicate_setup = self._is_duplicate_setup(symbol=symbol, timeframe=timeframe, direction=best_proposal.proposed_decision, setup_signature=best_proposal.strategy_name)
+        symbol_has_open_trade = self._has_open_trade_for_symbol(symbol=symbol)
         external_context_bias = self._build_external_context_bias(
             symbol=symbol,
             direction=best_proposal.proposed_decision if best_proposal.proposed_decision in {"LONG", "SHORT"} else "NONE",
@@ -406,6 +412,11 @@ class TradingBrainOrchestrator:
             if similar_trade_stats["total"] < self._settings.min_sample_size_for_profitability_claim
             else max(0.05, min(0.95, float(similar_trade_stats["wins"]) / max(int(similar_trade_stats["total"]), 1)))
         )
+        signal_actionability = self._classify_signal_actionability(
+            proposed_direction=best_proposal.proposed_decision,
+            signal_tier=str(delta_signal.get("signal_tier", "REJECTED")),
+            confidence=best_proposal.confidence,
+        )
         exploration_gate = self._net_profitability_gate.evaluate(
             signal=exploration_signal,
             cost_snapshot=exploration_cost_snapshot,
@@ -439,6 +450,7 @@ class TradingBrainOrchestrator:
             market_state=market_state.market_state,
             paper_mode="PAPER_EXPLORATION",
         )
+        cooldown_state = self._symbol_cooldown_state(symbol=symbol, paper_mode="PAPER_EXPLORATION")
         paper_mode = self._select_paper_mode(
             observer_mode=observer_mode,
             assessment_is_stale=assessment.is_stale and not allow_stale_fallback,
@@ -454,6 +466,9 @@ class TradingBrainOrchestrator:
             recent_rejected_opportunities=self._recent_rejection_count(symbol=symbol, timeframe=timeframe),
             has_positive_exploration_edge=exploration_gate.approved,
             has_positive_selective_edge=selective_gate.approved,
+            symbol_has_open_trade=symbol_has_open_trade,
+            symbol_in_cooldown=bool(cooldown_state["active"]),
+            signal_actionability=signal_actionability,
         )
         meta_learning = self._meta_learning_agent.assess(
             symbol=symbol,
@@ -479,6 +494,7 @@ class TradingBrainOrchestrator:
             and risk_manager.recommended_action != "BLOCK"
             and critic.critic_decision != "REJECT"
             and exploration_gate.approved
+            and signal_actionability != "NO_SIGNAL"
             and not (assessment.is_stale and not allow_stale_fallback)
             and not observer_mode
         )
@@ -508,6 +524,7 @@ class TradingBrainOrchestrator:
             drawdown_pct=drawdown_pct,
             open_positions=len(self._database.get_open_paper_positions()),
             provider_used=provider_result.provider_used,
+            paper_mode=paper_mode,
         )
         final_score = score_breakdown["final_score"]
         final_score_threshold = (
@@ -524,6 +541,8 @@ class TradingBrainOrchestrator:
             and market_state.recommended_risk_mode != "DO_NOT_TRADE"
             and risk_manager.recommended_action != "BLOCK"
             and symbol_selection.tradable_today
+            and not symbol_has_open_trade
+            and not bool(cooldown_state["active"])
             and net_gate.approved
             and critic.critic_decision != "REJECT"
             and final_score >= final_score_threshold
@@ -535,12 +554,43 @@ class TradingBrainOrchestrator:
         rejection_reason = ""
         rejected_by_agent = ""
         rejected_stage = ""
+        near_approval = self._build_near_approval_snapshot(
+            approved=approved,
+            paper_mode=paper_mode,
+            final_score=final_score,
+            threshold=final_score_threshold,
+            net_gate=net_gate,
+            active_cost_snapshot=active_cost_snapshot,
+            signal_actionability=signal_actionability,
+            tf_alignment=tf_alignment,
+            score_breakdown=score_breakdown,
+            risk_manager=risk_manager,
+            symbol_has_open_trade=symbol_has_open_trade,
+            cooldown_state=cooldown_state,
+            symbol_tradable=symbol_selection.tradable_today,
+            stale_blocked=assessment.is_stale and not allow_stale_fallback,
+            observer_mode=observer_mode,
+        )
         if not approved:
-            reasons = [
-                critic.rejection_reason or "",
-                net_gate.reason if not net_gate.approved else "",
-                risk_manager.reason if risk_manager.recommended_action == "BLOCK" else "",
-                "observer mode only" if observer_mode else "",
+            simple_reasons = self._build_simple_rejection_reasons(
+                signal_actionability=signal_actionability,
+                paper_mode=paper_mode,
+                observer_mode=observer_mode,
+                stale_blocked=assessment.is_stale and not allow_stale_fallback,
+                symbol_tradable=symbol_selection.tradable_today,
+                symbol_has_open_trade=symbol_has_open_trade,
+                cooldown_state=cooldown_state,
+                risk_manager=risk_manager,
+                market_risk_mode=market_state.recommended_risk_mode,
+                net_gate=net_gate,
+                critic=critic,
+                contradiction_score=tf_alignment.contradiction_score,
+                alignment_label=tf_alignment.timeframe_alignment,
+                final_score=final_score,
+                threshold=final_score_threshold,
+                open_positions=len(self._database.get_open_paper_positions()),
+            )
+            detailed_reasons = [
                 self._paper_mode_reason(
                     paper_mode=paper_mode,
                     observer_mode=observer_mode,
@@ -552,14 +602,16 @@ class TradingBrainOrchestrator:
                     market_risk_mode=market_state.recommended_risk_mode,
                     exploration_gate=exploration_gate,
                     selective_gate=selective_gate,
-                ) if paper_mode == "OBSERVE_ONLY" else "",
-                "symbol not tradable today" if not symbol_selection.tradable_today else "",
+                    symbol_has_open_trade=symbol_has_open_trade,
+                    symbol_in_cooldown=bool(cooldown_state["active"]),
+                ),
+                critic.rejection_reason or "",
+                net_gate.reason if not net_gate.approved else "",
+                risk_manager.reason if risk_manager.recommended_action == "BLOCK" else "",
                 external_context_bias["reason"] if external_context_bias["news_used"] or external_context_bias["sentiment_used"] else "",
                 f"final score {round(final_score, 4)} below minimum {round(final_score_threshold, 4)}" if final_score < final_score_threshold else "",
-                "exploration max open positions reached" if paper_mode == "PAPER_EXPLORATION" and len(self._database.get_open_paper_positions()) >= self._settings.exploration_max_open_positions else "",
-                "exploration hourly trade cap reached" if paper_mode == "PAPER_EXPLORATION" and self._recent_trade_count_by_mode("PAPER_EXPLORATION", hours=1) >= self._settings.exploration_max_trades_per_hour else "",
             ]
-            rejection_reason = "; ".join(reason for reason in reasons if reason)
+            rejection_reason = " | ".join(simple_reasons)
             rejected_by_agent, rejected_stage = self._classify_rejection(
                 critic=critic,
                 net_gate=net_gate,
@@ -587,6 +639,8 @@ class TradingBrainOrchestrator:
                 market_risk_mode=market_state.recommended_risk_mode,
                 exploration_gate=exploration_gate,
                 selective_gate=selective_gate,
+                symbol_has_open_trade=symbol_has_open_trade,
+                symbol_in_cooldown=bool(cooldown_state["active"]),
             ),
             "operating_horizon_minutes": operating_horizon_minutes,
             "position_size_usd": active_position_size,
@@ -612,6 +666,12 @@ class TradingBrainOrchestrator:
                 "rejected_by_agent": rejected_by_agent,
                 "rejected_stage": rejected_stage,
                 "would_trade_if_exploration_enabled": would_trade_if_exploration_enabled,
+                "signal_actionability": signal_actionability,
+                "simple_reasons": simple_reasons if not approved else [],
+                "primary_reason": simple_reasons[0] if not approved and simple_reasons else "",
+                "secondary_reason": simple_reasons[1] if not approved and len(simple_reasons) > 1 else "",
+                "detailed_reasons": [reason for reason in detailed_reasons if reason] if not approved else [],
+                "near_approval": near_approval,
             },
             "score_breakdown": score_breakdown,
         }
@@ -920,6 +980,190 @@ class TradingBrainOrchestrator:
                 count += 1
         return count
 
+    def _has_open_trade_for_symbol(self, *, symbol: str) -> bool:
+        return any(trade.symbol == symbol for trade in self._database.get_open_simulated_trades())
+
+    def _symbol_cooldown_state(self, *, symbol: str, paper_mode: str) -> dict[str, object]:
+        cooldown_minutes = (
+            self._settings.exploration_symbol_cooldown_minutes
+            if paper_mode == "PAPER_EXPLORATION"
+            else self._settings.selective_symbol_cooldown_minutes
+        )
+        now_ts = datetime.now(timezone.utc).timestamp()
+        cutoff = now_ts - (cooldown_minutes * 60)
+        for trade in self._database.get_recent_simulated_trades(limit=100):
+            if trade.symbol != symbol or trade.status == "OPEN":
+                continue
+            realized = trade.final_net_pnl_after_all_costs if trade.final_net_pnl_after_all_costs is not None else (
+                trade.net_pnl if trade.net_pnl is not None else (trade.pnl or 0.0)
+            )
+            if realized >= 0:
+                continue
+            timestamp_value = trade.exit_time or trade.updated_at or trade.entry_time
+            if not timestamp_value:
+                continue
+            try:
+                trade_ts = datetime.fromisoformat(timestamp_value).timestamp()
+            except ValueError:
+                continue
+            if trade_ts >= cutoff:
+                cooldown_expiry = trade_ts + (cooldown_minutes * 60)
+                remaining_minutes = max(0, int((cooldown_expiry - now_ts) / 60))
+                return {
+                    "active": True,
+                    "cooldown_minutes": cooldown_minutes,
+                    "remaining_minutes": remaining_minutes,
+                    "trade_id": trade.id,
+                }
+        return {
+            "active": False,
+            "cooldown_minutes": cooldown_minutes,
+            "remaining_minutes": 0,
+            "trade_id": None,
+        }
+
+    @staticmethod
+    def _classify_signal_actionability(
+        *,
+        proposed_direction: str,
+        signal_tier: str,
+        confidence: float,
+    ) -> str:
+        if proposed_direction not in {"LONG", "SHORT"}:
+            return "NO_SIGNAL"
+        if signal_tier == "REJECTED":
+            return "WEAK_EXPLORABLE" if confidence >= 0.48 else "NO_SIGNAL"
+        if signal_tier == "WEAK":
+            return "WEAK_EXPLORABLE"
+        if signal_tier == "MEDIUM":
+            return "VALID_NON_SELECTIVE"
+        return "VALID_STRONG"
+
+    @staticmethod
+    def _build_simple_rejection_reasons(
+        *,
+        signal_actionability: str,
+        paper_mode: str,
+        observer_mode: bool,
+        stale_blocked: bool,
+        symbol_tradable: bool,
+        symbol_has_open_trade: bool,
+        cooldown_state: dict[str, object],
+        risk_manager,
+        market_risk_mode: str,
+        net_gate,
+        critic,
+        contradiction_score: float,
+        alignment_label: str,
+        final_score: float,
+        threshold: float,
+        open_positions: int,
+    ) -> list[str]:
+        simple_reasons: list[str] = []
+        if signal_actionability == "NO_SIGNAL":
+            simple_reasons.append("signal_not_actionable")
+        if stale_blocked:
+            simple_reasons.append("stale_data")
+        if "poor_data_quality" in critic.penalties_applied or "severe_gaps" in critic.penalties_applied:
+            simple_reasons.append("poor_data_quality")
+        if (
+            alignment_label == "CONTRADICTED"
+            or contradiction_score >= 0.75
+            or "critical_contradiction_score" in critic.penalties_applied
+            or "high_contradiction_score" in critic.penalties_applied
+        ):
+            simple_reasons.append("multi_timeframe_contradiction")
+        if market_risk_mode == "CAPITAL_PROTECTION" or risk_manager.risk_mode == "CAPITAL_PROTECTION":
+            simple_reasons.append("risk_too_high_capital_protection")
+        if any("net reward/risk" in reason for reason in net_gate.rejection_reasons):
+            simple_reasons.append("net_reward_risk_too_low")
+        if any(
+            marker in reason
+            for reason in net_gate.rejection_reasons
+            for marker in (
+                "expected net edge",
+                "cost drag",
+                "covers",
+                "minimum profitable move",
+            )
+        ):
+            simple_reasons.append("costs_consume_target")
+        if final_score < threshold:
+            simple_reasons.append("final_score_below_threshold")
+        if observer_mode or paper_mode == "OBSERVE_ONLY":
+            simple_reasons.append("mode_restriction")
+        if not symbol_tradable:
+            simple_reasons.append("poor_data_quality")
+        if symbol_has_open_trade:
+            simple_reasons.append("symbol_open_trade_exists")
+        if bool(cooldown_state.get("active")):
+            simple_reasons.append("cooldown_active")
+        if risk_manager.recommended_action == "BLOCK" and "risk_too_high_capital_protection" not in simple_reasons:
+            simple_reasons.append("risk_blocked")
+        if open_positions <= 0 and "mode_restriction" in simple_reasons and len(simple_reasons) == 1:
+            simple_reasons.append("signal_not_actionable")
+        return list(dict.fromkeys(simple_reasons)) or ["general_rejection"]
+
+    @staticmethod
+    def _build_near_approval_snapshot(
+        *,
+        approved: bool,
+        paper_mode: str,
+        final_score: float,
+        threshold: float,
+        net_gate,
+        active_cost_snapshot,
+        signal_actionability: str,
+        tf_alignment: TimeframeAlignment,
+        score_breakdown: dict[str, float],
+        risk_manager,
+        symbol_has_open_trade: bool,
+        cooldown_state: dict[str, object],
+        symbol_tradable: bool,
+        stale_blocked: bool,
+        observer_mode: bool,
+    ) -> dict[str, object]:
+        with_laxer_threshold = final_score >= (threshold * 0.95)
+        without_secondary_contradiction = (
+            any(timeframe in {"30m", "1h"} for timeframe in tf_alignment.rejecting_timeframes)
+            and (final_score + score_breakdown.get("contradiction_penalty", 0.0)) >= threshold
+        )
+        with_smaller_size = (
+            paper_mode == "PAPER_EXPLORATION"
+            and not symbol_has_open_trade
+            and not bool(cooldown_state.get("active"))
+            and symbol_tradable
+            and not stale_blocked
+            and not observer_mode
+            and signal_actionability != "NO_SIGNAL"
+            and net_gate.approved
+            and risk_manager.risk_mode == "CAPITAL_PROTECTION"
+            and risk_manager.position_size_pct > 0
+        )
+        near_approved = (
+            not approved
+            and paper_mode == "PAPER_EXPLORATION"
+            and signal_actionability != "NO_SIGNAL"
+            and net_gate.approved
+            and symbol_tradable
+            and not stale_blocked
+            and not observer_mode
+            and (
+                with_laxer_threshold
+                or with_smaller_size
+                or without_secondary_contradiction
+            )
+        )
+        return {
+            "near_approved_exploration": near_approved,
+            "expected_net_edge_pct": round(float(net_gate.expected_net_edge_pct), 6),
+            "required_break_even_move_pct": round(float(active_cost_snapshot.minimum_profitable_move_pct), 6),
+            "expected_move_pct": round(float(net_gate.expected_move_pct), 6),
+            "would_open_with_5pct_laxer_threshold": with_laxer_threshold,
+            "would_open_with_smaller_size": with_smaller_size,
+            "would_open_without_secondary_contradiction": without_secondary_contradiction,
+        }
+
     def _select_paper_mode(
         self,
         *,
@@ -937,12 +1181,19 @@ class TradingBrainOrchestrator:
         recent_rejected_opportunities: int,
         has_positive_exploration_edge: bool,
         has_positive_selective_edge: bool,
+        symbol_has_open_trade: bool,
+        symbol_in_cooldown: bool,
+        signal_actionability: str,
     ) -> str:
         if observer_mode:
             return "OBSERVE_ONLY"
         if assessment_is_stale or risk_manager_action == "BLOCK" or not symbol_tradable:
             return "OBSERVE_ONLY"
-        if market_risk_mode in {"DO_NOT_TRADE", "CAPITAL_PROTECTION"}:
+        if market_risk_mode == "DO_NOT_TRADE":
+            return "OBSERVE_ONLY"
+        if signal_actionability == "NO_SIGNAL":
+            return "OBSERVE_ONLY"
+        if symbol_has_open_trade or symbol_in_cooldown:
             return "OBSERVE_ONLY"
         if contradiction_score >= 0.9 or alignment_label == "CONTRADICTED":
             return "OBSERVE_ONLY"
@@ -952,10 +1203,12 @@ class TradingBrainOrchestrator:
             return "OBSERVE_ONLY"
         if not self._settings.paper_mode_auto:
             return "PAPER_SELECTIVE" if has_positive_selective_edge else "PAPER_EXPLORATION"
+        if market_risk_mode == "CAPITAL_PROTECTION":
+            return "PAPER_EXPLORATION"
         if (
             has_positive_selective_edge
             and meta_sample_strength in {"USABLE", "STRONG", "VERY_STRONG"}
-            and contradiction_score <= 0.32
+            and contradiction_score <= 0.28
             and alignment_label in {"FULL_ALIGNMENT", "SCALP_ONLY"}
         ):
             return "PAPER_SELECTIVE"
@@ -963,7 +1216,7 @@ class TradingBrainOrchestrator:
             return "PAPER_EXPLORATION"
         if recent_rejected_opportunities >= 3 and has_positive_exploration_edge:
             return "PAPER_EXPLORATION"
-        return "OBSERVE_ONLY"
+        return "PAPER_EXPLORATION"
 
     @staticmethod
     def _paper_mode_reason(
@@ -978,15 +1231,23 @@ class TradingBrainOrchestrator:
         market_risk_mode: str,
         exploration_gate,
         selective_gate,
+        symbol_has_open_trade: bool,
+        symbol_in_cooldown: bool,
     ) -> str:
         if observer_mode:
             return "technical_block: observer mode requested"
         if assessment_is_stale:
             return "data_not_fresh: stale market data detected"
+        if symbol_has_open_trade:
+            return "mode_restriction: symbol already has an open paper trade"
+        if symbol_in_cooldown:
+            return "mode_restriction: symbol is cooling down after a recent loss"
         if risk_manager_action == "BLOCK":
             return "risk_too_high: risk manager blocked new entries"
-        if market_risk_mode in {"DO_NOT_TRADE", "CAPITAL_PROTECTION"}:
+        if market_risk_mode == "DO_NOT_TRADE":
             return "risk_too_high: market state recommends capital protection"
+        if market_risk_mode == "CAPITAL_PROTECTION" and paper_mode == "PAPER_EXPLORATION":
+            return "risk_reduced_exploration: capital protection reduced the size, but bounded exploration remains allowed"
         if not symbol_tradable:
             return "technical_block: symbol not tradable today"
         if contradiction_score >= 0.9:
@@ -1021,25 +1282,27 @@ class TradingBrainOrchestrator:
         drawdown_pct: float,
         open_positions: int,
         provider_used: str,
+        paper_mode: str,
     ) -> dict[str, float]:
-        positive_strategy = round(strategy_score * 0.3, 6)
-        positive_market = round(market_alignment_score * 0.2, 6)
-        positive_timeframe = round(multi_timeframe_alignment_score * 0.2, 6)
-        positive_economics = round(economics_score * 0.3, 6)
+        exploration_mode = paper_mode == "PAPER_EXPLORATION"
+        positive_strategy = round(strategy_score * (0.32 if exploration_mode else 0.3), 6)
+        positive_market = round(market_alignment_score * (0.22 if exploration_mode else 0.2), 6)
+        positive_timeframe = round(multi_timeframe_alignment_score * (0.18 if exploration_mode else 0.2), 6)
+        positive_economics = round(economics_score * (0.28 if exploration_mode else 0.3), 6)
 
-        cost_penalty = round(min(0.18, max(0.0, cost_drag_pct) * 0.25), 6)
-        contradiction_penalty = round(min(0.22, max(0.0, contradiction_score) * 0.28), 6)
-        data_quality_penalty = round(min(0.18, max(0.0, 1.0 - data_quality_score) * 0.2), 6)
+        cost_penalty = round(min(0.15 if exploration_mode else 0.18, max(0.0, cost_drag_pct) * 0.22), 6)
+        contradiction_penalty = round(min(0.14 if exploration_mode else 0.22, max(0.0, contradiction_score) * (0.18 if exploration_mode else 0.28)), 6)
+        data_quality_penalty = round(min(0.14 if exploration_mode else 0.18, max(0.0, 1.0 - data_quality_score) * 0.18), 6)
         drawdown_penalty = round(
-            min(0.08, (abs(drawdown_pct) / max(self._settings.max_daily_drawdown_pct * 100, 0.000001)) * 0.08),
+            min(0.06 if exploration_mode else 0.08, (abs(drawdown_pct) / max(self._settings.max_daily_drawdown_pct * 100, 0.000001)) * 0.06),
             6,
         )
         overtrading_penalty = round(
-            min(0.06, (open_positions / max(self._settings.exploration_max_open_positions, 1)) * 0.06),
+            min(0.04 if exploration_mode else 0.06, (open_positions / max(self._settings.exploration_max_open_positions, 1)) * 0.04),
             6,
         )
-        critic_penalty = round(min(0.08, max(0.0, 1.0 - critic_score) * 0.08), 6)
-        provider_penalty = 0.04 if provider_used == "LOCAL_SQLITE" else 0.0
+        critic_penalty = round(min(0.06 if exploration_mode else 0.08, max(0.0, 1.0 - critic_score) * 0.06), 6)
+        provider_penalty = 0.03 if exploration_mode and provider_used == "LOCAL_SQLITE" else (0.04 if provider_used == "LOCAL_SQLITE" else 0.0)
 
         final_score = round(
             positive_strategy

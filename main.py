@@ -105,6 +105,97 @@ def _resolve_provider_labels(provider_summary: dict[str, object]) -> tuple[str, 
     return str(current_provider), str(last_successful_provider)
 
 
+def _extract_rejection_diagnostics(row: dict[str, object]) -> dict[str, object]:
+    payload = _safe_json_loads(str(row.get("raw_payload") or row.get("context_payload") or ""))
+    rejection_diagnostics = payload.get("rejection_diagnostics", {}) if isinstance(payload, dict) else {}
+    if not isinstance(rejection_diagnostics, dict):
+        rejection_diagnostics = {}
+    simple_reasons = [str(item) for item in rejection_diagnostics.get("simple_reasons", []) if str(item).strip()]
+    if not simple_reasons:
+        reason_text = str(row.get("reason") or "")
+        lowered = reason_text.lower()
+        if "signal_not_actionable" in lowered or "signal is not actionable" in lowered:
+            simple_reasons.append("signal_not_actionable")
+        if "capital protection" in lowered or "risk_too_high_capital_protection" in lowered:
+            simple_reasons.append("risk_too_high_capital_protection")
+        if "net reward/risk" in lowered or "poor_net_reward_risk" in lowered or "net_reward_risk_too_low" in lowered:
+            simple_reasons.append("net_reward_risk_too_low")
+        if any(marker in lowered for marker in ("costs_consume_target", "expected net edge", "cost drag", "minimum profitable move", "covers ")):
+            simple_reasons.append("costs_consume_target")
+        if "final score" in lowered or "final_score_below_threshold" in lowered:
+            simple_reasons.append("final_score_below_threshold")
+        if "stale_data" in lowered or "data_not_fresh" in lowered or "latest candle is stale" in lowered:
+            simple_reasons.append("stale_data")
+        if any(marker in lowered for marker in ("poor_data_quality", "severe_gaps", "symbol not tradable today")):
+            simple_reasons.append("poor_data_quality")
+        if any(marker in lowered for marker in ("multi_timeframe_contradiction", "high_contradiction_score", "contradiction_too_high")):
+            simple_reasons.append("multi_timeframe_contradiction")
+        if any(marker in lowered for marker in ("observer mode", "paper mode observe_only", "mode_restriction", "technical_block")):
+            simple_reasons.append("mode_restriction")
+        if any(marker in lowered for marker in ("risk manager blocked", "risk mode do_not_trade blocks new entries", "risk_blocked")):
+            simple_reasons.append("risk_blocked")
+        if "duplicate_setup" in lowered:
+            simple_reasons.append("symbol_open_trade_exists")
+        if not simple_reasons:
+            simple_reasons = [part.strip() for part in reason_text.split("|") if part.strip()]
+    near_approval = rejection_diagnostics.get("near_approval", {})
+    if not isinstance(near_approval, dict):
+        near_approval = {}
+    return {
+        "simple_reasons": simple_reasons,
+        "primary_reason": str(rejection_diagnostics.get("primary_reason") or (simple_reasons[0] if simple_reasons else "general_rejection")),
+        "secondary_reason": str(rejection_diagnostics.get("secondary_reason") or (simple_reasons[1] if len(simple_reasons) > 1 else "")),
+        "combination": " | ".join(simple_reasons) if simple_reasons else "general_rejection",
+        "near_approval": near_approval,
+    }
+
+
+def _build_rejection_reason_summary(rows: list[dict[str, object]]) -> dict[str, object]:
+    simple_counts: dict[str, int] = defaultdict(int)
+    combination_counts: dict[str, int] = defaultdict(int)
+    primary_counts: dict[str, int] = defaultdict(int)
+    secondary_counts: dict[str, int] = defaultdict(int)
+    near_approved_rows: list[dict[str, object]] = []
+    for row in rows:
+        diagnostics = _extract_rejection_diagnostics(row)
+        simple_reasons = diagnostics["simple_reasons"]
+        for reason in simple_reasons:
+            simple_counts[str(reason)] += 1
+        primary_counts[str(diagnostics["primary_reason"])] += 1
+        if diagnostics["secondary_reason"]:
+            secondary_counts[str(diagnostics["secondary_reason"])] += 1
+        combination_counts[str(diagnostics["combination"])] += 1
+        near_approval = diagnostics["near_approval"]
+        if bool(near_approval.get("near_approved_exploration")):
+            near_approved_rows.append(
+                {
+                    "id": row.get("id"),
+                    "symbol": row.get("symbol"),
+                    "timeframe": row.get("timeframe"),
+                    "reason": row.get("reason"),
+                    "primary_reason": diagnostics["primary_reason"],
+                    "secondary_reason": diagnostics["secondary_reason"],
+                    "expected_net_edge_pct": near_approval.get("expected_net_edge_pct", 0.0),
+                    "required_break_even_move_pct": near_approval.get("required_break_even_move_pct", 0.0),
+                    "expected_move_pct": near_approval.get("expected_move_pct", 0.0),
+                    "would_open_with_5pct_laxer_threshold": near_approval.get("would_open_with_5pct_laxer_threshold", False),
+                    "would_open_with_smaller_size": near_approval.get("would_open_with_smaller_size", False),
+                    "would_open_without_secondary_contradiction": near_approval.get("would_open_without_secondary_contradiction", False),
+                }
+            )
+    return {
+        "simple_counts": dict(simple_counts),
+        "combination_counts": dict(combination_counts),
+        "primary_counts": dict(primary_counts),
+        "secondary_counts": dict(secondary_counts),
+        "top_simple_reasons": sorted(simple_counts.items(), key=lambda item: item[1], reverse=True)[:10],
+        "top_combinations": sorted(combination_counts.items(), key=lambda item: item[1], reverse=True)[:10],
+        "top_primary_reasons": sorted(primary_counts.items(), key=lambda item: item[1], reverse=True)[:10],
+        "top_secondary_reasons": sorted(secondary_counts.items(), key=lambda item: item[1], reverse=True)[:10],
+        "near_approved_rows": near_approved_rows,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Market data reader for Binance")
     parser.add_argument("--init-only", action="store_true", help="Inicializa SQLite y termina")
@@ -962,17 +1053,10 @@ def run_preflight_live_paper(
         print(f"- Cost validation OK: {'YES' if cost_validation['cost_validation_ok'] else 'NO'}")
         current_experiment = database.get_current_paper_experiment() or database.get_latest_paper_experiment()
         experiment_id = int(current_experiment["id"]) if current_experiment else None
+        rejection_summary = _build_rejection_reason_summary(
+            [row for row in database.get_recent_brain_decisions(limit=1000, experiment_id=experiment_id) if str(row.get("final_decision")) == "NO_TRADE"]
+        )
         with database.connection() as conn:
-            row = conn.execute(
-                """
-                SELECT COUNT(*) AS c
-                FROM brain_decisions
-                WHERE approved = 0
-                  AND COALESCE(would_trade_if_exploration_enabled, 0) = 1
-                  AND (? IS NULL OR experiment_id = ?)
-                """,
-                (experiment_id, experiment_id),
-            ).fetchone()
             reject_row = conn.execute(
                 """
                 SELECT
@@ -985,11 +1069,17 @@ def run_preflight_live_paper(
                 """,
                 (experiment_id, experiment_id),
             ).fetchone()
-        print(f"- Near approved exploration setups: {int(row['c'] or 0)}")
+        print(f"- Near approved exploration setups: {len(rejection_summary['near_approved_rows'])}")
         print(f"- Rejected by cost: {int(reject_row['rejected_by_cost'] or 0)}")
         print(f"- Rejected by contradiction: {int(reject_row['rejected_by_contradiction'] or 0)}")
         print(f"- Rejected by stale data: {int(reject_row['rejected_by_stale_data'] or 0)}")
         print(f"- Rejected by mode: {int(reject_row['rejected_by_mode'] or 0)}")
+        if rejection_summary["top_simple_reasons"]:
+            print(f"- Top primary rejection reason: {rejection_summary['top_primary_reasons'][0][0]} ({rejection_summary['top_primary_reasons'][0][1]})")
+            if rejection_summary["top_secondary_reasons"]:
+                print(f"- Top secondary rejection reason: {rejection_summary['top_secondary_reasons'][0][0]} ({rejection_summary['top_secondary_reasons'][0][1]})")
+            else:
+                print("- Top secondary rejection reason: none")
         for item in cost_validation["reasons"]:
             print(f"- {item}")
     return result
@@ -1050,19 +1140,10 @@ def run_quick_audit(
     print(f"- gross_win_net_loss={cost_validation['gross_win_net_loss']}")
     current_experiment = database.get_current_paper_experiment() or database.get_latest_paper_experiment()
     experiment_id = int(current_experiment["id"]) if current_experiment else None
-    near_approved = 0
+    rejection_summary = _build_rejection_reason_summary(
+        [row for row in database.get_recent_brain_decisions(limit=1000, experiment_id=experiment_id) if str(row.get("final_decision")) == "NO_TRADE"]
+    )
     with database.connection() as conn:
-        row = conn.execute(
-            """
-            SELECT COUNT(*) AS c
-            FROM brain_decisions
-            WHERE approved = 0
-              AND COALESCE(would_trade_if_exploration_enabled, 0) = 1
-              AND (? IS NULL OR experiment_id = ?)
-            """,
-            (experiment_id, experiment_id),
-        ).fetchone()
-        near_approved = int(row["c"] or 0)
         reject_row = conn.execute(
             """
             SELECT
@@ -1075,11 +1156,14 @@ def run_quick_audit(
             """,
             (experiment_id, experiment_id),
         ).fetchone()
-    print(f"- near_approved_exploration_setups={near_approved}")
+    print(f"- near_approved_exploration_setups={len(rejection_summary['near_approved_rows'])}")
     print(f"- rejected_by_cost={int(reject_row['rejected_by_cost'] or 0)}")
     print(f"- rejected_by_contradiction={int(reject_row['rejected_by_contradiction'] or 0)}")
     print(f"- rejected_by_stale_data={int(reject_row['rejected_by_stale_data'] or 0)}")
     print(f"- rejected_by_mode={int(reject_row['rejected_by_mode'] or 0)}")
+    print(f"- signal_not_actionable={int(rejection_summary['simple_counts'].get('signal_not_actionable', 0))}")
+    print(f"- risk_capital_protection={int(rejection_summary['simple_counts'].get('risk_too_high_capital_protection', 0))}")
+    print(f"- final_score_below_threshold={int(rejection_summary['simple_counts'].get('final_score_below_threshold', 0))}")
     print("Recent trades:")
     if recent_trades:
         for trade in recent_trades:
@@ -1244,6 +1328,8 @@ def build_brain_snapshot(database: Database, *, experiment_id: int | None = None
     recent_websocket_events = database.get_recent_websocket_events(limit=10)
     recent_gap_repairs = database.get_recent_gap_repair_events(limit=10)
     provider_summary = database.get_current_provider_summary()
+    rejection_rows = [row for row in aggregate_brain_decisions if str(row.get("final_decision")) == "NO_TRADE"]
+    rejection_summary = _build_rejection_reason_summary(rejection_rows)
     top_rejection_reasons: dict[str, int] = defaultdict(int)
     rejected_symbols: dict[str, int] = defaultdict(int)
     rejected_timeframes: dict[str, int] = defaultdict(int)
@@ -1277,7 +1363,15 @@ def build_brain_snapshot(database: Database, *, experiment_id: int | None = None
         "recent_data_quality_events": recent_data_quality_events,
         "recent_websocket_events": recent_websocket_events,
         "recent_gap_repairs": recent_gap_repairs,
+        "aggregate_brain_decisions": aggregate_brain_decisions,
         "top_rejection_reasons": sorted(top_rejection_reasons.items(), key=lambda item: item[1], reverse=True)[:10],
+        "top_simple_reasons": rejection_summary["top_simple_reasons"],
+        "top_rejection_combinations": rejection_summary["top_combinations"],
+        "top_primary_reasons": rejection_summary["top_primary_reasons"],
+        "top_secondary_reasons": rejection_summary["top_secondary_reasons"],
+        "simple_reason_counts": rejection_summary["simple_counts"],
+        "combination_reason_counts": rejection_summary["combination_counts"],
+        "near_approved_rows": rejection_summary["near_approved_rows"],
         "rejected_symbols": sorted(rejected_symbols.items(), key=lambda item: item[1], reverse=True)[:10],
         "rejected_timeframes": sorted(rejected_timeframes.items(), key=lambda item: item[1], reverse=True)[:10],
         "rejected_strategies": sorted(rejected_strategies.items(), key=lambda item: item[1], reverse=True)[:10],
@@ -1313,6 +1407,7 @@ def build_status_snapshot(
     trade_metrics = database.get_simulated_trade_metrics(experiment_id=current_experiment_id)
     legacy_trade_metrics = database.get_simulated_trade_metrics()
     recent_trades = database.get_recent_simulated_trades(limit=10, experiment_id=current_experiment_id)
+    all_recent_trades = database.get_recent_simulated_trades(limit=1000, experiment_id=current_experiment_id)
     recent_errors = database.get_recent_error_events(limit=10)
     portfolio = database.get_paper_portfolio()
     open_positions = database.get_open_paper_positions()
@@ -1345,6 +1440,30 @@ def build_status_snapshot(
     last_successful_provider = (provider_summary.get("last_successful_provider") or {}).get("provider", "UNKNOWN")
     latest_brain_provider = (provider_summary.get("latest_brain_provider") or {}).get("provider_used", "UNKNOWN")
     latest_market_snapshot_provider = (provider_summary.get("latest_market_snapshot_provider") or {}).get("provider_used", "UNKNOWN")
+    trades_per_timeframe: dict[str, int] = defaultdict(int)
+    for trade in all_recent_trades:
+        trades_per_timeframe[str(trade.timeframe or "UNKNOWN")] += 1
+    approved_trade_count = sum(1 for trade in all_recent_trades if str(trade.status or "") in {"OPEN", "CLOSED", "STOP_LOSS", "TAKE_PROFIT", "EXPIRED"})
+    aggregate_cost_drag_values: list[float] = []
+    aggregate_expected_edge_values: list[float] = []
+    aggregate_required_move_values: list[float] = []
+    for row in brain_snapshot["aggregate_brain_decisions"]:
+        payload = _safe_json_loads(str(row.get("raw_payload") or ""))
+        cost_snapshot = payload.get("cost_snapshot", {}) if isinstance(payload, dict) else {}
+        if not isinstance(cost_snapshot, dict):
+            cost_snapshot = {}
+        cost_drag = float(cost_snapshot.get("cost_drag_pct", 0.0) or 0.0)
+        required_move = float(cost_snapshot.get("minimum_profitable_move_pct", row.get("total_cost_pct") or 0.0) or 0.0)
+        expected_edge = float(row.get("expected_net_edge_pct") or 0.0)
+        if cost_drag > 0:
+            aggregate_cost_drag_values.append(cost_drag)
+        if required_move > 0:
+            aggregate_required_move_values.append(required_move)
+        if expected_edge > 0:
+            aggregate_expected_edge_values.append(expected_edge)
+    rejection_reason_summary = _build_rejection_reason_summary(
+        [row for row in brain_snapshot["aggregate_brain_decisions"] if str(row.get("final_decision")) == "NO_TRADE"]
+    )
     with database.connection() as conn:
         brain_counts_row = conn.execute(
             """
@@ -1478,10 +1597,14 @@ def build_status_snapshot(
         "total_strategy_votes": int(strategy_vote_count_row["total_strategy_votes"] or 0),
         "current_experiment_brain_decisions": int(experiment_counts_row["total_brain_decisions"] or 0),
         "approved_opportunity_count": int(experiment_quality_row["approved_opportunities"] or 0),
+        "approved_trade_count": approved_trade_count,
         "rejected_opportunity_count": int(experiment_quality_row["rejected_opportunities"] or 0),
         "rejected_by_operating_mode": int(experiment_quality_row["rejected_by_operating_mode"] or 0),
-        "near_approved_exploration_setups": int(experiment_quality_row["near_approved_exploration_setups"] or 0),
+        "near_approved_exploration_setups": len(rejection_reason_summary["near_approved_rows"]),
         "average_expected_move_at_entry": round(float(experiment_quality_row["average_expected_move_at_entry"] or 0.0), 6),
+        "expected_net_edge_average": round(sum(aggregate_expected_edge_values) / len(aggregate_expected_edge_values), 6) if aggregate_expected_edge_values else 0.0,
+        "required_break_even_move_average": round(sum(aggregate_required_move_values) / len(aggregate_required_move_values), 6) if aggregate_required_move_values else 0.0,
+        "average_cost_drag_pct": round(sum(aggregate_cost_drag_values) / len(aggregate_cost_drag_values), 6) if aggregate_cost_drag_values else 0.0,
         "profit_factor_net": round(
             (float(experiment_trade_quality_row["gross_profit"] or 0.0) / max(float(experiment_trade_quality_row["gross_loss"] or 0.0), 0.000001)),
             6,
@@ -1498,6 +1621,18 @@ def build_status_snapshot(
         "rejected_by_mode": int(rejected_counts_row["rejected_by_mode"] or 0),
         "rejected_by_stale_data": int(rejected_counts_row["rejected_by_stale_data"] or 0),
         "rejected_by_insufficient_data": int(rejected_counts_row["rejected_by_insufficient_data"] or 0),
+        "rejection_simple_counts": rejection_reason_summary["simple_counts"],
+        "rejection_combination_counts": rejection_reason_summary["combination_counts"],
+        "top_simple_reasons": rejection_reason_summary["top_simple_reasons"],
+        "top_rejection_combinations": rejection_reason_summary["top_combinations"],
+        "top_primary_reasons": rejection_reason_summary["top_primary_reasons"],
+        "top_secondary_reasons": rejection_reason_summary["top_secondary_reasons"],
+        "near_approved_rows": rejection_reason_summary["near_approved_rows"],
+        "signal_not_actionable_count": int(rejection_reason_summary["simple_counts"].get("signal_not_actionable", 0)),
+        "risk_capital_protection_count": int(rejection_reason_summary["simple_counts"].get("risk_too_high_capital_protection", 0)),
+        "final_score_below_threshold_count": int(rejection_reason_summary["simple_counts"].get("final_score_below_threshold", 0)),
+        "opportunity_count": int(experiment_quality_row["approved_opportunities"] or 0) + int(experiment_quality_row["rejected_opportunities"] or 0),
+        "trades_per_timeframe": dict(trades_per_timeframe),
         "total_paper_orders": database.count_paper_orders(),
         "open_paper_positions_count": database.count_open_paper_positions(),
         "symbol_health": symbol_health,
@@ -1728,6 +1863,7 @@ def run_status_report(
     print(f"- missed opportunities: {snapshot['missed_opportunities']}")
     print(f"- good avoidances: {snapshot['good_avoidances']}")
     print(f"- approved opportunity count: {snapshot['approved_opportunity_count']}")
+    print(f"- approved trades count: {snapshot['approved_trade_count']}")
     print(f"- rejected opportunity count: {snapshot['rejected_opportunity_count']}")
     print(f"- near approved exploration setups: {snapshot['near_approved_exploration_setups']}")
     no_trade_rate = round((snapshot['rejected_opportunity_count'] / max(snapshot['current_experiment_brain_decisions'], 1)) * 100, 2) if snapshot['current_experiment_brain_decisions'] else 0.0
@@ -1738,6 +1874,9 @@ def run_status_report(
     print(f"- rejected by stale data: {snapshot['rejected_by_stale_data']}")
     print(f"- rejected by insufficient data: {snapshot['rejected_by_insufficient_data']}")
     print(f"- rejected by operating mode: {snapshot['rejected_by_operating_mode']}")
+    print(f"- signal_not_actionable count: {snapshot['signal_not_actionable_count']}")
+    print(f"- risk_capital_protection count: {snapshot['risk_capital_protection_count']}")
+    print(f"- final_score_below_threshold count: {snapshot['final_score_below_threshold_count']}")
     print("")
 
     print("Open paper positions:")
@@ -1783,6 +1922,8 @@ def run_status_report(
     print(f"- average cost per trade: {trade_metrics['average_cost_per_trade']}")
     print(f"- average required move to break even: {trade_metrics['average_required_move_to_break_even']}%")
     print(f"- average expected move at entry: {snapshot['average_expected_move_at_entry']}%")
+    print(f"- average expected net edge: {snapshot['expected_net_edge_average']}%")
+    print(f"- average cost drag pct: {snapshot['average_cost_drag_pct']}")
     print(f"- profit factor net: {snapshot['profit_factor_net']}")
     print(f"- legacy gross pnl total: {snapshot['legacy_trade_metrics']['total_gross_pnl']}")
     print(f"- legacy final net pnl after all costs: {snapshot['legacy_trade_metrics']['total_pnl']}")
@@ -1923,6 +2064,14 @@ def run_status_report(
                 f"- {row['timeframe']} trades={trade_count} winrate={winrate}% "
                 f"avg_net_pnl={round(float(row['average_net_pnl'] or 0.0), 6)} total_net_pnl={round(float(row['total_net_pnl'] or 0.0), 6)}"
             )
+    else:
+        print("- none")
+    print("")
+
+    print("Trades by timeframe:")
+    if snapshot["trades_per_timeframe"]:
+        for timeframe_name, count in sorted(snapshot["trades_per_timeframe"].items()):
+            print(f"- {timeframe_name}: {count}")
     else:
         print("- none")
     print("")
@@ -2071,6 +2220,52 @@ def run_status_report(
         print("- none")
     print("")
 
+    print("Top simple rejection reasons:")
+    if snapshot["top_simple_reasons"]:
+        for reason, count in snapshot["top_simple_reasons"]:
+            print(f"- count={count} reason={reason}")
+    else:
+        print("- none")
+    print("")
+
+    print("Top rejection combinations:")
+    if snapshot["top_rejection_combinations"]:
+        for reason, count in snapshot["top_rejection_combinations"]:
+            print(f"- count={count} combination={reason}")
+    else:
+        print("- none")
+    print("")
+
+    print("Top primary rejection reasons:")
+    if snapshot["top_primary_reasons"]:
+        for reason, count in snapshot["top_primary_reasons"]:
+            print(f"- count={count} reason={reason}")
+    else:
+        print("- none")
+    print("")
+
+    print("Top secondary rejection reasons:")
+    if snapshot["top_secondary_reasons"]:
+        for reason, count in snapshot["top_secondary_reasons"]:
+            print(f"- count={count} reason={reason}")
+    else:
+        print("- none")
+    print("")
+
+    print("Near approved exploration setups detail:")
+    if snapshot["near_approved_rows"]:
+        for row in snapshot["near_approved_rows"][:5]:
+            print(
+                f"- [{row['id']}] {row['symbol']} {row['timeframe']} primary={row['primary_reason']} "
+                f"secondary={row['secondary_reason'] or '-'} edge={row['expected_net_edge_pct']} "
+                f"break_even={row['required_break_even_move_pct']} expected_move={row['expected_move_pct']} "
+                f"lax_5pct={row['would_open_with_5pct_laxer_threshold']} smaller_size={row['would_open_with_smaller_size']} "
+                f"no_secondary_contradiction={row['would_open_without_secondary_contradiction']}"
+            )
+    else:
+        print("- none")
+    print("")
+
     print("Last 10 errors:")
     if recent_errors:
         for error in recent_errors:
@@ -2153,6 +2348,8 @@ def run_brain_report(
     print(f"Profit factor net: {snapshot['profit_factor_net']}")
     print(f"Average expected move at entry: {snapshot['average_expected_move_at_entry']}%")
     print(f"Average required move to break even: {trade_metrics['average_required_move_to_break_even']}%")
+    print(f"Average expected net edge: {snapshot['expected_net_edge_average']}%")
+    print(f"Average cost drag pct: {snapshot['average_cost_drag_pct']}")
     print(f"Fees accumulated: {trade_metrics['total_fees_paid']}")
     print(f"Slippage accumulated: {trade_metrics['total_slippage_paid']}")
     print(f"Spread accumulated: {trade_metrics['total_spread_paid']}")
@@ -2160,6 +2357,7 @@ def run_brain_report(
     print(f"Gross wins that became net losses: {gross_wins_net_losses}")
     print(f"Missed opportunities: {snapshot['missed_opportunities']}")
     print(f"Good avoidances: {snapshot['good_avoidances']}")
+    print(f"Approved trades count: {snapshot['approved_trade_count']}")
     print(f"Rejected by cost: {snapshot['rejected_by_cost']}")
     print(f"Rejected by risk: {snapshot['rejected_by_risk']}")
     print(f"Rejected by contradiction: {snapshot['rejected_by_contradiction']}")
@@ -2167,6 +2365,9 @@ def run_brain_report(
     print(f"Rejected by insufficient data: {snapshot['rejected_by_insufficient_data']}")
     print(f"Near approved exploration setups: {snapshot['near_approved_exploration_setups']}")
     print(f"Rejected by operating mode: {snapshot['rejected_by_operating_mode']}")
+    print(f"signal_not_actionable count: {snapshot['signal_not_actionable_count']}")
+    print(f"risk_capital_protection count: {snapshot['risk_capital_protection_count']}")
+    print(f"final_score_below_threshold count: {snapshot['final_score_below_threshold_count']}")
     print(f"Too conservative: {'YES' if too_conservative else 'NO'}")
     print(f"Too aggressive: {'YES' if too_aggressive else 'NO'}")
     print(f"Recommendation: {recommendation}")
@@ -2205,6 +2406,27 @@ def run_brain_report(
     for row in best_strategies[:5]:
         print(f"- {row['strategy_name']} {row['symbol']} {row['timeframe']} avg_net_pnl={row['avg_net_pnl']} net_winrate={row['net_winrate']}% recommendation={row['recommendation']}")
     if not best_strategies:
+        print("- none")
+    print("")
+    print("Top simple rejection reasons:")
+    for reason, count in snapshot["top_simple_reasons"][:10]:
+        print(f"- count={count} reason={reason}")
+    if not snapshot["top_simple_reasons"]:
+        print("- none")
+    print("Top rejection combinations:")
+    for reason, count in snapshot["top_rejection_combinations"][:10]:
+        print(f"- count={count} combination={reason}")
+    if not snapshot["top_rejection_combinations"]:
+        print("- none")
+    print("Top primary rejection reasons:")
+    for reason, count in snapshot["top_primary_reasons"][:10]:
+        print(f"- count={count} reason={reason}")
+    if not snapshot["top_primary_reasons"]:
+        print("- none")
+    print("Top secondary rejection reasons:")
+    for reason, count in snapshot["top_secondary_reasons"][:10]:
+        print(f"- count={count} reason={reason}")
+    if not snapshot["top_secondary_reasons"]:
         print("- none")
     print("")
     print("Main rejection reasons:")
@@ -2291,6 +2513,21 @@ def run_export_report(
                 "profit_factor_net": snapshot["profit_factor_net"],
             }
         ]
+        rejection_summary_rows = [
+            {
+                "simple_reason": reason,
+                "simple_count": count,
+                "primary_count": snapshot["rejection_simple_counts"].get(reason, 0),
+            }
+            for reason, count in snapshot["top_simple_reasons"]
+        ]
+        rejection_combination_rows = [
+            {
+                "combination": reason,
+                "count": count,
+            }
+            for reason, count in snapshot["top_rejection_combinations"]
+        ]
         csv_targets = {
             "trades.csv": snapshot["recent_trades"],
             "decisions.csv": snapshot["recent_decisions"],
@@ -2315,6 +2552,9 @@ def run_export_report(
             "gap_repair_events.csv": brain_snapshot["recent_gap_repairs"],
             "recent_brain_decisions.csv": brain_snapshot["recent_brain_decisions"],
             "rejected_signals.csv": snapshot["recent_rejected_signals"],
+            "rejection_reason_summary.csv": rejection_summary_rows,
+            "rejection_combinations.csv": rejection_combination_rows,
+            "near_approved_setups.csv": snapshot["near_approved_rows"],
             "news_events.csv": snapshot["external_context"]["latest_news"],
             "sentiment_snapshots.csv": snapshot["external_context"]["latest_sentiment"],
         }
@@ -2363,6 +2603,8 @@ def run_export_report(
                     "gross_win_net_loss": snapshot["trade_metrics"]["gross_win_net_loss"],
                     "average_cost_per_trade": snapshot["trade_metrics"]["average_cost_per_trade"],
                     "average_required_move_to_break_even": snapshot["trade_metrics"]["average_required_move_to_break_even"],
+                    "average_expected_net_edge": snapshot["expected_net_edge_average"],
+                    "average_cost_drag_pct": snapshot["average_cost_drag_pct"],
                     "breakeven_winrate_approx": snapshot["trade_metrics"]["breakeven_winrate_approx"],
                     "rejected_by_cost": snapshot["rejected_by_cost"],
                     "rejected_by_risk": snapshot["rejected_by_risk"],
@@ -2370,6 +2612,9 @@ def run_export_report(
                     "rejected_by_stale_data": snapshot["rejected_by_stale_data"],
                     "rejected_by_mode": snapshot["rejected_by_mode"],
                     "rejected_by_insufficient_data": snapshot["rejected_by_insufficient_data"],
+                    "signal_not_actionable_count": snapshot["signal_not_actionable_count"],
+                    "risk_capital_protection_count": snapshot["risk_capital_protection_count"],
+                    "final_score_below_threshold_count": snapshot["final_score_below_threshold_count"],
                 },
             "brain": {
                 "recent_strategy_votes": brain_snapshot["recent_strategy_votes"],
@@ -2382,12 +2627,17 @@ def run_export_report(
                 "recent_websocket_events": brain_snapshot["recent_websocket_events"],
                 "recent_gap_repairs": brain_snapshot["recent_gap_repairs"],
                 "top_rejection_reasons": brain_snapshot["top_rejection_reasons"],
+                "top_simple_reasons": snapshot["top_simple_reasons"],
+                "top_rejection_combinations": snapshot["top_rejection_combinations"],
+                "top_primary_reasons": snapshot["top_primary_reasons"],
+                "top_secondary_reasons": snapshot["top_secondary_reasons"],
                 "rejected_symbols": brain_snapshot["rejected_symbols"],
                 "rejected_timeframes": brain_snapshot["rejected_timeframes"],
                 "rejected_strategies": brain_snapshot["rejected_strategies"],
                 "paper_modes": brain_snapshot["paper_modes"],
                 "missed_opportunities": snapshot["missed_opportunities"],
                 "good_avoidances": snapshot["good_avoidances"],
+                "near_approved_rows": snapshot["near_approved_rows"],
             },
         },
         "details": snapshot,

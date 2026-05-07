@@ -54,33 +54,43 @@ class RiskManagerAgent:
     ) -> RiskManagerAssessment:
         risk_mode = market_risk_mode
         recommended_action = "ALLOW"
+        hard_block = False
         if ledger_report.result != "OK":
             risk_mode = "CAPITAL_PROTECTION"
             recommended_action = "BLOCK"
+            hard_block = True
         if stale_data:
             risk_mode = "DO_NOT_TRADE"
             recommended_action = "BLOCK"
+            hard_block = True
         if loss_streak >= 5:
             risk_mode = "CAPITAL_PROTECTION"
             recommended_action = "BLOCK"
+            hard_block = True
         elif loss_streak >= 3 and risk_mode not in {"DO_NOT_TRADE", "CAPITAL_PROTECTION"}:
             risk_mode = "CONSERVATIVE"
         if current_drawdown_pct <= -(self._settings.max_daily_drawdown_pct * 100):
             risk_mode = "CAPITAL_PROTECTION"
             recommended_action = "BLOCK"
+            hard_block = True
         if open_positions >= self._settings.max_open_positions:
             recommended_action = "BLOCK"
+            hard_block = True
+        if risk_mode == "CAPITAL_PROTECTION" and not hard_block:
+            recommended_action = "ALLOW"
         size_pct = self._settings.max_position_size_pct
         if risk_mode == "CONSERVATIVE":
             size_pct *= 0.6
         elif risk_mode == "CAPITAL_PROTECTION":
-            size_pct *= 0.25
+            size_pct *= 0.18
         elif risk_mode == "DO_NOT_TRADE":
             size_pct = 0.0
         elif risk_mode == "AGGRESSIVE":
             size_pct *= 1.0
         else:
             size_pct *= 0.8
+        if recommended_action == "BLOCK":
+            size_pct = min(size_pct, self._settings.max_position_size_pct * 0.1)
         reason = (
             f"risk mode {risk_mode}, drawdown {round(current_drawdown_pct, 4)}%, "
             f"loss streak {loss_streak}, ledger {ledger_report.result}, open positions {open_positions}"
@@ -99,4 +109,3 @@ class RiskManagerAgent:
             recommended_action=recommended_action,
             reason=reason,
         )
-

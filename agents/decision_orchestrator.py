@@ -178,12 +178,12 @@ class DecisionOrchestrator:
             return 0.0 if short_intraday_run else 0.25
         if short_intraday_run:
             if timeframe == "15m":
-                return 0.3
+                return 0.34
             if timeframe == "30m":
-                return 0.12
-            if timeframe == "1h":
                 return 0.08
-            return 0.1
+            if timeframe == "1h":
+                return 0.04
+            return 0.08
         if timeframe in self._settings.context_timeframes:
             return 0.4
         return 0.25

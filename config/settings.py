@@ -79,9 +79,13 @@ class Settings:
     min_cost_coverage_multiple_aggressive: float
     paper_mode_auto: bool
     exploration_max_trades_per_hour: int
+    exploration_max_trades_per_short_run: int
     exploration_max_open_positions: int
     exploration_risk_per_trade_pct: float
+    exploration_position_size_usd: float
     exploration_max_daily_drawdown_pct: float
+    exploration_symbol_cooldown_minutes: int
+    selective_symbol_cooldown_minutes: int
     exploration_min_rr: float
     selective_min_rr: float
     exploration_min_cost_coverage_multiple: float
@@ -279,9 +283,13 @@ def load_settings() -> Settings:
         min_cost_coverage_multiple_aggressive=float(os.getenv("MIN_COST_COVERAGE_MULTIPLE_AGGRESSIVE", "2.0")),
         paper_mode_auto=_parse_bool(os.getenv("PAPER_MODE_AUTO", "true"), True),
         exploration_max_trades_per_hour=int(os.getenv("EXPLORATION_MAX_TRADES_PER_HOUR", "5")),
+        exploration_max_trades_per_short_run=int(os.getenv("EXPLORATION_MAX_TRADES_PER_SHORT_RUN", "3")),
         exploration_max_open_positions=int(os.getenv("EXPLORATION_MAX_OPEN_POSITIONS", "2")),
         exploration_risk_per_trade_pct=float(os.getenv("EXPLORATION_RISK_PER_TRADE_PCT", "0.10")),
+        exploration_position_size_usd=float(os.getenv("EXPLORATION_POSITION_SIZE_USD", "50")),
         exploration_max_daily_drawdown_pct=float(os.getenv("EXPLORATION_MAX_DAILY_DRAWDOWN_PCT", "1.00")),
+        exploration_symbol_cooldown_minutes=int(os.getenv("EXPLORATION_SYMBOL_COOLDOWN_MINUTES", "15")),
+        selective_symbol_cooldown_minutes=int(os.getenv("SELECTIVE_SYMBOL_COOLDOWN_MINUTES", "45")),
         exploration_min_rr=float(os.getenv("EXPLORATION_MIN_RR", "0.85")),
         selective_min_rr=float(os.getenv("SELECTIVE_MIN_RR", "1.20")),
         exploration_min_cost_coverage_multiple=float(os.getenv("EXPLORATION_MIN_COST_COVERAGE_MULTIPLE", "1.10")),
@@ -294,7 +302,7 @@ def load_settings() -> Settings:
         paper_selective_base_win_probability=float(os.getenv("PAPER_SELECTIVE_BASE_WIN_PROBABILITY", "0.58")),
         min_sample_size_for_profitability_claim=int(os.getenv("MIN_SAMPLE_SIZE_FOR_PROFITABILITY_CLAIM", "30")),
         brain_min_final_score=float(os.getenv("BRAIN_MIN_FINAL_SCORE", "0.55")),
-        brain_min_final_score_exploration=float(os.getenv("BRAIN_MIN_FINAL_SCORE_EXPLORATION", "0.42")),
+        brain_min_final_score_exploration=float(os.getenv("BRAIN_MIN_FINAL_SCORE_EXPLORATION", "0.38")),
         brain_min_final_score_selective=float(os.getenv("BRAIN_MIN_FINAL_SCORE_SELECTIVE", "0.58")),
         autonomous_loop_seconds=int(os.getenv("AUTONOMOUS_LOOP_SECONDS", "60")),
         market_watch_loop_seconds=int(os.getenv("MARKET_WATCH_LOOP_SECONDS", "60")),

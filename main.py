@@ -63,6 +63,7 @@ from data.binance_websocket_provider import BinanceWebsocketProvider
 from data.live_context_fusion import refresh_external_context
 from data.market_data_provider import BinanceProvider, FutureYahooProvider, LocalSQLiteProvider, ProviderRouter
 from execution.autonomous_paper_engine import AutonomousPaperEngine
+from execution.intraday_core_engine import IntradayCoreEngine, IntradayCoreEngineResult
 from execution.live_paper_engine import LivePaperEngine, LivePaperEngineResult
 from execution.market_watch_engine import MarketWatchEngine
 from execution.paper_trader import PaperTrader
@@ -210,6 +211,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--live-paper-engine", action="store_true", help="Ejecuta el motor live paper trading con comite y ledger simulado")
     parser.add_argument("--market-watch-engine", action="store_true", help="Observa el mercado con el brain sin abrir trades")
     parser.add_argument("--autonomous-paper-engine", action="store_true", help="Ejecuta paper trading autonomo usando el brain multiagente")
+    parser.add_argument("--intraday-core-engine", action="store_true", help="Ejecuta el motor paper simple INTRADAY_CORE_RECOVERY usando solo BINANCE vivo")
     parser.add_argument("--backtest", action="store_true", help="Ejecuta backtest historico candle by candle sin fuga de datos")
     parser.add_argument("--benchmark", action="store_true", help="Compara la estrategia contra benchmarks basicos")
     parser.add_argument("--walk-forward", action="store_true", help="Ejecuta validacion walk-forward sin fuga de datos")
@@ -217,6 +219,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--status-report", action="store_true", help="Muestra el estado persistido del sistema")
     parser.add_argument("--export-report", action="store_true", help="Exporta un reporte auditable en JSON")
     parser.add_argument("--brain-report", action="store_true", help="Muestra el estado del cerebro multiagente y su memoria reciente")
+    parser.add_argument("--intraday-core-report", action="store_true", help="Muestra el estado y resultados del motor INTRADAY_CORE_RECOVERY")
     parser.add_argument("--diagnose-connectivity", action="store_true", help="Prueba conectividad HTTP real hacia Binance")
     parser.add_argument("--readiness-check", action="store_true", help="Evalua si el sistema esta listo para correr live paper largo")
     parser.add_argument("--quick-audit", action="store_true", help="Ejecuta una auditoria operativa corta sin trading real")
@@ -961,6 +964,197 @@ def collect_external_context(database: Database, settings: Settings) -> dict[str
     return refresh_external_context(database=database, settings=settings, symbols=settings.market_symbols, limit=5)
 
 
+def build_intraday_core_snapshot(
+    database: Database,
+    settings: Settings,
+    service: BinanceMarketDataService,
+) -> dict[str, object]:
+    current_experiment = database.get_current_paper_experiment() or database.get_latest_paper_experiment()
+    current_experiment_id = int(current_experiment["id"]) if current_experiment else None
+    mode_name = settings.intraday_core_mode_name
+    probes = service.diagnose_connectivity()
+    provider_live_binance = all(probe.ok for probe in probes[:2]) if len(probes) >= 2 else all(probe.ok for probe in probes)
+    provider_summary = database.get_current_provider_summary()
+    current_provider, last_successful_provider = _resolve_provider_labels(provider_summary)
+    required_timeframes = (
+        *settings.intraday_core_execution_timeframes,
+        settings.intraday_core_confirmation_timeframe,
+        *settings.intraday_core_soft_context_timeframes,
+    )
+    required_timeframes = tuple(dict.fromkeys(required_timeframes))
+    market_data_agent = MarketDataAgent()
+    symbol_health: list[dict[str, object]] = []
+    for symbol in settings.core_symbols:
+        for timeframe in required_timeframes:
+            health = inspect_symbol_health(
+                database=database,
+                market_data_agent=market_data_agent,
+                symbol=symbol,
+                timeframe=timeframe,
+            )
+            symbol_health.append(
+                {
+                    "symbol": health.symbol,
+                    "timeframe": health.timeframe,
+                    "latest_provider": health.latest_provider,
+                    "latest_close_time": health.latest_close_time,
+                    "age_seconds": health.age_seconds,
+                    "age_human": format_age_seconds(health.age_seconds),
+                    "is_stale": health.is_stale,
+                    "gap_count": health.gap_count,
+                    "is_valid": health.is_valid,
+                    "note": health.note,
+                }
+            )
+    fresh_data_available = bool(symbol_health) and all(
+        (not bool(row["is_stale"])) and bool(row["is_valid"]) and str(row["latest_provider"]) == "BINANCE"
+        for row in symbol_health
+        if str(row["timeframe"]) in required_timeframes
+    )
+
+    with database.connection() as conn:
+        filter_sql = "WHERE COALESCE(paper_mode, 'OBSERVE_ONLY') = ?"
+        params: list[object] = [mode_name]
+        if current_experiment_id is not None:
+            filter_sql += " AND experiment_id = ?"
+            params.append(current_experiment_id)
+
+        metrics_row = conn.execute(
+            f"""
+            SELECT
+                COUNT(*) AS closed_trades,
+                SUM(CASE WHEN outcome IN ('WIN_NET', 'WIN') THEN 1 ELSE 0 END) AS net_wins,
+                SUM(CASE WHEN COALESCE(gross_pnl, pnl, 0) > 0 THEN 1 ELSE 0 END) AS gross_wins,
+                SUM(COALESCE(gross_pnl, pnl, 0)) AS gross_pnl,
+                SUM(COALESCE(final_net_pnl_after_all_costs, net_pnl, pnl, 0)) AS net_pnl,
+                SUM(COALESCE(total_fees, fees_paid, 0)) AS fees,
+                SUM(COALESCE(slippage_cost, 0)) AS slippage,
+                SUM(COALESCE(spread_cost, 0)) AS spread,
+                SUM(COALESCE(funding_cost_estimate, 0)) AS funding,
+                AVG(COALESCE(final_net_pnl_after_all_costs, net_pnl, pnl, 0)) AS expectancy_net,
+                AVG(COALESCE(duration_seconds, 0)) AS average_trade_duration_seconds,
+                AVG(COALESCE(total_cost_drag, 0)) AS average_cost_drag,
+                AVG(COALESCE(minimum_required_move_to_profit, 0)) AS average_break_even_move_pct
+            FROM simulated_trades
+            {filter_sql}
+              AND COALESCE(status, 'OPEN') <> 'OPEN'
+            """,
+            tuple(params),
+        ).fetchone()
+        trades_by_symbol_rows = conn.execute(
+            f"""
+            SELECT symbol, COUNT(*) AS trade_count
+            FROM simulated_trades
+            {filter_sql}
+            GROUP BY symbol
+            ORDER BY trade_count DESC, symbol ASC
+            """,
+            tuple(params),
+        ).fetchall()
+        trades_by_timeframe_rows = conn.execute(
+            f"""
+            SELECT COALESCE(timeframe, '1m') AS timeframe, COUNT(*) AS trade_count
+            FROM simulated_trades
+            {filter_sql}
+            GROUP BY COALESCE(timeframe, '1m')
+            ORDER BY trade_count DESC, timeframe ASC
+            """,
+            tuple(params),
+        ).fetchall()
+        recent_rejection_rows = conn.execute(
+            f"""
+            SELECT *
+            FROM rejected_signals_log
+            {filter_sql}
+            ORDER BY id DESC
+            LIMIT 200
+            """,
+            tuple(params),
+        ).fetchall()
+        recent_core_trades = conn.execute(
+            f"""
+            SELECT *
+            FROM simulated_trades
+            {filter_sql}
+            ORDER BY COALESCE(updated_at, created_at, COALESCE(entry_time, timestamp_entry)) DESC
+            LIMIT 50
+            """,
+            tuple(params),
+        ).fetchall()
+        core_decisions = conn.execute(
+            """
+            SELECT *
+            FROM agent_decisions
+            WHERE agent_name = 'IntradayCoreEngine'
+            ORDER BY id DESC
+            LIMIT 50
+            """
+        ).fetchall()
+
+    open_core_trades = [
+        trade for trade in database.get_open_simulated_trades()
+        if trade.paper_mode == mode_name and (current_experiment_id is None or getattr(trade, "experiment_id", current_experiment_id) == current_experiment_id)
+    ]
+    rejection_summary = _build_rejection_reason_summary([dict(row) for row in recent_rejection_rows])
+    closed_trades = int(metrics_row["closed_trades"] or 0)
+    gross_wins = int(metrics_row["gross_wins"] or 0)
+    net_wins = int(metrics_row["net_wins"] or 0)
+    gross_winrate = round((gross_wins / closed_trades) * 100, 2) if closed_trades else 0.0
+    net_winrate = round((net_wins / closed_trades) * 100, 2) if closed_trades else 0.0
+    gross_pnl = round(float(metrics_row["gross_pnl"] or 0.0), 6)
+    net_pnl = round(float(metrics_row["net_pnl"] or 0.0), 6)
+    fees = round(float(metrics_row["fees"] or 0.0), 6)
+    slippage = round(float(metrics_row["slippage"] or 0.0), 6)
+    spread = round(float(metrics_row["spread"] or 0.0), 6)
+    funding = round(float(metrics_row["funding"] or 0.0), 6)
+    expectancy_net = round(float(metrics_row["expectancy_net"] or 0.0), 6)
+    average_trade_duration_seconds = round(float(metrics_row["average_trade_duration_seconds"] or 0.0), 2)
+    average_trade_duration_minutes = round(average_trade_duration_seconds / 60, 2) if average_trade_duration_seconds else 0.0
+    average_cost_drag = round(float(metrics_row["average_cost_drag"] or 0.0), 6)
+    average_break_even_move_pct = round(float(metrics_row["average_break_even_move_pct"] or 0.0), 6)
+
+    if not provider_live_binance or current_provider != "BINANCE" or not fresh_data_available:
+        verdict = "DO_NOT_RUN"
+    elif closed_trades > 0 and net_pnl >= 0:
+        verdict = "RUN_INTRADAY_CORE_30MIN"
+    else:
+        verdict = "RUN_INTRADAY_CORE_SHORT"
+
+    return {
+        "mode_name": mode_name,
+        "current_experiment": current_experiment,
+        "provider_live_binance": provider_live_binance,
+        "current_provider": current_provider,
+        "last_successful_provider": last_successful_provider,
+        "fresh_data_available": fresh_data_available,
+        "symbol_health": symbol_health,
+        "closed_trades": closed_trades,
+        "open_trades": len(open_core_trades),
+        "gross_winrate": gross_winrate,
+        "net_winrate": net_winrate,
+        "gross_pnl": gross_pnl,
+        "net_pnl": net_pnl,
+        "fees": fees,
+        "slippage": slippage,
+        "spread": spread,
+        "funding": funding,
+        "expectancy_net": expectancy_net,
+        "average_trade_duration_minutes": average_trade_duration_minutes,
+        "average_cost_drag": average_cost_drag,
+        "average_break_even_move_pct": average_break_even_move_pct,
+        "trades_by_symbol": [dict(row) for row in trades_by_symbol_rows],
+        "trades_by_timeframe": [dict(row) for row in trades_by_timeframe_rows],
+        "recent_rejections": [dict(row) for row in recent_rejection_rows[:10]],
+        "recent_trades": [dict(row) for row in recent_core_trades[:10]],
+        "recent_decisions": [dict(row) for row in core_decisions[:10]],
+        "rejection_simple_counts": rejection_summary["simple_counts"],
+        "rejection_combination_counts": rejection_summary["combination_counts"],
+        "top_simple_reasons": rejection_summary["top_simple_reasons"],
+        "top_rejection_combinations": rejection_summary["top_combinations"],
+        "verdict": verdict,
+    }
+
+
 def run_preflight_live_paper(
     *,
     settings: Settings,
@@ -1395,6 +1589,7 @@ def build_status_snapshot(
     brain_snapshot = build_brain_snapshot(database, experiment_id=current_experiment_id)
     performance_report = performance_analyzer.refresh()
     external_context = collect_external_context(database, settings)
+    intraday_core_snapshot = build_intraday_core_snapshot(database, settings, service)
     candle_counts = database.list_candle_counts()
     signal_counts = database.list_signal_counts()
     recent_signals = database.get_recent_signals(limit=10)
@@ -1651,6 +1846,7 @@ def build_status_snapshot(
             "reasons": list(readiness_report.reasons),
         },
         "external_context": external_context,
+        "intraday_core": intraday_core_snapshot,
     }
 
 
@@ -1689,6 +1885,7 @@ def run_status_report(
     brain_snapshot = snapshot["brain_snapshot"]
     current_experiment = snapshot["current_experiment"]
     external_context = snapshot["external_context"]
+    intraday_core = snapshot["intraday_core"]
 
     print("Status Report")
     print(f"Database path: {snapshot['database_path']}")
@@ -1720,6 +1917,16 @@ def run_status_report(
     else:
         final_recommendation = "DO_NOT_RUN"
     print(f"- Final recommendation: {final_recommendation}")
+    print("")
+
+    print("Intraday core snapshot:")
+    print(f"- mode: {intraday_core['mode_name']}")
+    print(f"- provider live BINANCE: {'YES' if intraday_core['provider_live_binance'] else 'NO'}")
+    print(f"- fresh data available: {'YES' if intraday_core['fresh_data_available'] else 'NO'}")
+    print(f"- intraday core verdict: {intraday_core['verdict']}")
+    print(f"- intraday core closed trades: {intraday_core['closed_trades']}")
+    print(f"- intraday core open trades: {intraday_core['open_trades']}")
+    print(f"- intraday core net pnl: {intraday_core['net_pnl']}")
     print("")
 
     print("Candles by symbol/timeframe:")
@@ -2458,6 +2665,7 @@ def run_export_report(
 ) -> str:
     snapshot = build_status_snapshot(database, settings, performance_analyzer, ledger_reconciler, service)
     brain_snapshot = snapshot["brain_snapshot"]
+    intraday_core = snapshot["intraday_core"]
     output_dir = settings.sqlite_path.parent
     if export_format == "csv":
         trade_metrics = snapshot["trade_metrics"]
@@ -2528,6 +2736,38 @@ def run_export_report(
             }
             for reason, count in snapshot["top_rejection_combinations"]
         ]
+        intraday_core_summary_rows = [
+            {
+                "mode_name": intraday_core["mode_name"],
+                "current_provider": intraday_core["current_provider"],
+                "last_successful_provider": intraday_core["last_successful_provider"],
+                "provider_live_binance": intraday_core["provider_live_binance"],
+                "fresh_data_available": intraday_core["fresh_data_available"],
+                "open_trades": intraday_core["open_trades"],
+                "closed_trades": intraday_core["closed_trades"],
+                "gross_winrate": intraday_core["gross_winrate"],
+                "net_winrate": intraday_core["net_winrate"],
+                "gross_pnl": intraday_core["gross_pnl"],
+                "net_pnl": intraday_core["net_pnl"],
+                "fees": intraday_core["fees"],
+                "slippage": intraday_core["slippage"],
+                "spread": intraday_core["spread"],
+                "funding": intraday_core["funding"],
+                "expectancy_net": intraday_core["expectancy_net"],
+                "average_trade_duration_minutes": intraday_core["average_trade_duration_minutes"],
+                "average_cost_drag": intraday_core["average_cost_drag"],
+                "average_break_even_move_pct": intraday_core["average_break_even_move_pct"],
+                "verdict": intraday_core["verdict"],
+            }
+        ]
+        intraday_core_rejection_rows = [
+            {"simple_reason": reason, "count": count}
+            for reason, count in intraday_core["top_simple_reasons"]
+        ]
+        intraday_core_combination_rows = [
+            {"combination": reason, "count": count}
+            for reason, count in intraday_core["top_rejection_combinations"]
+        ]
         csv_targets = {
             "trades.csv": snapshot["recent_trades"],
             "decisions.csv": snapshot["recent_decisions"],
@@ -2557,6 +2797,11 @@ def run_export_report(
             "near_approved_setups.csv": snapshot["near_approved_rows"],
             "news_events.csv": snapshot["external_context"]["latest_news"],
             "sentiment_snapshots.csv": snapshot["external_context"]["latest_sentiment"],
+            "intraday_core_summary.csv": intraday_core_summary_rows,
+            "intraday_core_trades.csv": intraday_core["recent_trades"],
+            "intraday_core_rejections.csv": intraday_core["recent_rejections"],
+            "intraday_core_rejection_summary.csv": intraday_core_rejection_rows,
+            "intraday_core_rejection_combinations.csv": intraday_core_combination_rows,
         }
         for filename, rows in csv_targets.items():
             path = output_dir / filename
@@ -2591,6 +2836,7 @@ def run_export_report(
             "gross_vs_net": snapshot["trade_metrics"],
                 "readiness": snapshot["readiness_report"],
                 "external_context": snapshot["external_context"],
+                "intraday_core": intraday_core,
                 "best_setups": snapshot["performance_report"].get("best_setups", []),
             "worst_setups": snapshot["performance_report"].get("worst_setups", []),
             "best_symbols": snapshot["performance_by_symbol"][:3],
@@ -2675,6 +2921,34 @@ def run_live_paper_engine(
     return result
 
 
+def run_intraday_core_engine(
+    intraday_core_engine: IntradayCoreEngine,
+    *,
+    symbols: tuple[str, ...],
+    max_loops: int | None,
+    run_minutes: int | None,
+) -> IntradayCoreEngineResult:
+    result = intraday_core_engine.run(
+        symbols=symbols,
+        max_loops=max_loops,
+        run_minutes=run_minutes,
+    )
+    print("Intraday Core Engine Summary")
+    print(f"Mode: INTRADAY_CORE_RECOVERY")
+    print(f"Symbols: {', '.join(symbols)}")
+    print(f"Loops completed: {result.loops_completed}")
+    print(f"Provider live BINANCE: {'YES' if result.provider_live_binance else 'NO'}")
+    print(f"Fresh data OK: {'YES' if result.fresh_data_ok else 'NO'}")
+    print(f"Trades opened: {result.trades_opened}")
+    print(f"Trades closed: {result.trades_closed}")
+    print(f"Stopped reason: {result.stopped_reason}")
+    if result.rejection_counts:
+        print("Rejection counts:")
+        for reason, count in sorted(result.rejection_counts.items(), key=lambda item: item[1], reverse=True):
+            print(f"- {reason}: {count}")
+    return result
+
+
 def run_market_watch_engine(
     market_watch_engine: MarketWatchEngine,
     *,
@@ -2727,6 +3001,68 @@ def run_autonomous_paper_engine(
     print(f"Trades closed: {result.trades_closed}")
     print(f"Stopped reason: {result.stopped_reason}")
     return result
+
+
+def run_intraday_core_report(
+    database: Database,
+    settings: Settings,
+    service: BinanceMarketDataService,
+) -> None:
+    snapshot = build_intraday_core_snapshot(database, settings, service)
+    print("Intraday Core Report")
+    if snapshot["current_experiment"]:
+        print(
+            f"Current experiment: [{snapshot['current_experiment']['id']}] "
+            f"{snapshot['current_experiment']['name']}"
+        )
+    print(f"Mode: {snapshot['mode_name']}")
+    print(f"Current live provider: {snapshot['current_provider']}")
+    print(f"Last successful provider: {snapshot['last_successful_provider']}")
+    print(f"Provider live BINANCE: {'YES' if snapshot['provider_live_binance'] else 'NO'}")
+    print(f"Fresh data available: {'YES' if snapshot['fresh_data_available'] else 'NO'}")
+    print(f"Trades opened: {snapshot['open_trades']}")
+    print(f"Trades closed: {snapshot['closed_trades']}")
+    print(f"Gross winrate: {snapshot['gross_winrate']}%")
+    print(f"Net winrate: {snapshot['net_winrate']}%")
+    print(f"Gross pnl: {snapshot['gross_pnl']}")
+    print(f"Net pnl: {snapshot['net_pnl']}")
+    print(f"Fees: {snapshot['fees']}")
+    print(f"Slippage: {snapshot['slippage']}")
+    print(f"Spread: {snapshot['spread']}")
+    print(f"Funding: {snapshot['funding']}")
+    print(f"Net expectancy: {snapshot['expectancy_net']}")
+    print(f"Average trade duration minutes: {snapshot['average_trade_duration_minutes']}")
+    print(f"Average cost drag: {snapshot['average_cost_drag']}")
+    print(f"Average required break-even move: {snapshot['average_break_even_move_pct']}%")
+    print(f"Verdict: {snapshot['verdict']}")
+    print("")
+    print("Trades by symbol:")
+    if snapshot["trades_by_symbol"]:
+        for row in snapshot["trades_by_symbol"]:
+            print(f"- {row['symbol']}: {row['trade_count']}")
+    else:
+        print("- none")
+    print("")
+    print("Trades by timeframe:")
+    if snapshot["trades_by_timeframe"]:
+        for row in snapshot["trades_by_timeframe"]:
+            print(f"- {row['timeframe']}: {row['trade_count']}")
+    else:
+        print("- none")
+    print("")
+    print("Top rejection reasons:")
+    if snapshot["top_simple_reasons"]:
+        for reason, count in snapshot["top_simple_reasons"][:10]:
+            print(f"- {reason}: {count}")
+    else:
+        print("- none")
+    print("")
+    print("Top rejection combinations:")
+    if snapshot["top_rejection_combinations"]:
+        for reason, count in snapshot["top_rejection_combinations"][:10]:
+            print(f"- {reason}: {count}")
+    else:
+        print("- none")
 
 
 def run_continuous_engine(
@@ -3137,6 +3473,17 @@ def main() -> int:
         decision_orchestrator=decision_orchestrator,
         performance_analyzer=performance_analyzer,
     )
+    intraday_core_engine = IntradayCoreEngine(
+        database=database,
+        settings=settings,
+        service=service,
+        market_data_agent=market_data_agent,
+        market_context_agent=market_context_agent,
+        cost_model_agent=cost_model_agent,
+        net_profitability_gate=net_profitability_gate,
+        execution_agent=execution_simulator_agent,
+        ledger_reconciler=ledger_reconciler,
+    )
     backtest_engine = BacktestEngine(
         database=database,
         settings=settings,
@@ -3292,6 +3639,14 @@ def main() -> int:
             logger.info(
                 "Clean shutdown",
                 extra={"event": "shutdown", "context": {"status": "brain_report_success"}},
+            )
+            return 0
+
+        if args.intraday_core_report:
+            run_intraday_core_report(database, settings, service)
+            logger.info(
+                "Clean shutdown",
+                extra={"event": "shutdown", "context": {"status": "intraday_core_report_success"}},
             )
             return 0
 
@@ -3578,6 +3933,30 @@ def main() -> int:
                 extra={"event": "shutdown", "context": {"status": "autonomous_paper_engine_success"}},
             )
             return 0
+
+        if args.intraday_core_engine:
+            core_symbols = tuple(symbol.upper() for symbol in args.symbols) if args.symbols else settings.core_symbols
+            result = run_intraday_core_engine(
+                intraday_core_engine,
+                symbols=core_symbols,
+                max_loops=args.max_loops,
+                run_minutes=args.run_minutes,
+            )
+            run_export_report(database, settings, performance_analyzer, ledger_reconciler, service, "json")
+            logger.info(
+                "Clean shutdown",
+                extra={
+                    "event": "shutdown",
+                    "context": {
+                        "status": "intraday_core_engine_success" if result.provider_live_binance else "intraday_core_engine_blocked",
+                        "provider_live_binance": result.provider_live_binance,
+                        "fresh_data_ok": result.fresh_data_ok,
+                        "trades_opened": result.trades_opened,
+                        "trades_closed": result.trades_closed,
+                    },
+                },
+            )
+            return 0 if result.provider_live_binance and result.fresh_data_ok else 1
 
         if args.delta_only:
             for symbol in symbols:

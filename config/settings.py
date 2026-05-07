@@ -100,6 +100,17 @@ class Settings:
     brain_min_final_score: float
     brain_min_final_score_exploration: float
     brain_min_final_score_selective: float
+    intraday_core_mode_name: str
+    intraday_core_execution_timeframes: tuple[str, ...]
+    intraday_core_confirmation_timeframe: str
+    intraday_core_soft_context_timeframes: tuple[str, ...]
+    intraday_core_position_size_usd: float
+    intraday_core_max_open_positions: int
+    intraday_core_max_open_positions_per_symbol: int
+    intraday_core_symbol_cooldown_minutes: int
+    intraday_core_max_trades_per_short_run: int
+    intraday_core_min_trend_strength_pct: float
+    intraday_core_pullback_tolerance_pct: float
     autonomous_loop_seconds: int
     market_watch_loop_seconds: int
     feature_store_lookback: int
@@ -304,6 +315,17 @@ def load_settings() -> Settings:
         brain_min_final_score=float(os.getenv("BRAIN_MIN_FINAL_SCORE", "0.55")),
         brain_min_final_score_exploration=float(os.getenv("BRAIN_MIN_FINAL_SCORE_EXPLORATION", "0.38")),
         brain_min_final_score_selective=float(os.getenv("BRAIN_MIN_FINAL_SCORE_SELECTIVE", "0.58")),
+        intraday_core_mode_name=os.getenv("INTRADAY_CORE_MODE_NAME", "INTRADAY_CORE_RECOVERY"),
+        intraday_core_execution_timeframes=_parse_timeframes(os.getenv("INTRADAY_CORE_EXECUTION_TIMEFRAMES", "1m,5m")),
+        intraday_core_confirmation_timeframe=os.getenv("INTRADAY_CORE_CONFIRMATION_TIMEFRAME", "15m"),
+        intraday_core_soft_context_timeframes=_parse_timeframes(os.getenv("INTRADAY_CORE_SOFT_CONTEXT_TIMEFRAMES", "30m")),
+        intraday_core_position_size_usd=float(os.getenv("INTRADAY_CORE_POSITION_SIZE_USD", "40")),
+        intraday_core_max_open_positions=int(os.getenv("INTRADAY_CORE_MAX_OPEN_POSITIONS", "2")),
+        intraday_core_max_open_positions_per_symbol=int(os.getenv("INTRADAY_CORE_MAX_OPEN_POSITIONS_PER_SYMBOL", "1")),
+        intraday_core_symbol_cooldown_minutes=int(os.getenv("INTRADAY_CORE_SYMBOL_COOLDOWN_MINUTES", "20")),
+        intraday_core_max_trades_per_short_run=int(os.getenv("INTRADAY_CORE_MAX_TRADES_PER_SHORT_RUN", "3")),
+        intraday_core_min_trend_strength_pct=float(os.getenv("INTRADAY_CORE_MIN_TREND_STRENGTH_PCT", "0.18")),
+        intraday_core_pullback_tolerance_pct=float(os.getenv("INTRADAY_CORE_PULLBACK_TOLERANCE_PCT", "0.15")),
         autonomous_loop_seconds=int(os.getenv("AUTONOMOUS_LOOP_SECONDS", "60")),
         market_watch_loop_seconds=int(os.getenv("MARKET_WATCH_LOOP_SECONDS", "60")),
         feature_store_lookback=int(os.getenv("FEATURE_STORE_LOOKBACK", "60")),

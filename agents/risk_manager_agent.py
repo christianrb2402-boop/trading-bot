@@ -55,10 +55,12 @@ class RiskManagerAgent:
         risk_mode = market_risk_mode
         recommended_action = "ALLOW"
         hard_block = False
-        if ledger_report.result != "OK":
+        if ledger_report.result == "FAIL":
             risk_mode = "CAPITAL_PROTECTION"
             recommended_action = "BLOCK"
             hard_block = True
+        elif ledger_report.result == "WARNING" and risk_mode not in {"DO_NOT_TRADE", "CAPITAL_PROTECTION"}:
+            risk_mode = "CONSERVATIVE"
         if stale_data:
             risk_mode = "DO_NOT_TRADE"
             recommended_action = "BLOCK"

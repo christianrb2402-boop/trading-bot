@@ -6,7 +6,7 @@ import json
 import logging
 
 from config.settings import Settings
-from core.database import Database, SimulatedTradeRecord, StoredCandle
+from core.database import Database, PaperOrderRecord, PaperPortfolioRecord, PaperPositionRecord, SimulatedTradeRecord, StoredCandle
 
 
 logger = logging.getLogger(__name__)
@@ -37,6 +37,7 @@ class SimulatedTradeCycleResult:
 class SimulatedTradeTracker:
     def __init__(self, database: Database, settings: Settings) -> None:
         self._database = database
+        self._settings = settings
         self._position_size_usd = settings.simulated_position_size_usd
         self._fee_pct = settings.simulated_fee_pct
         self._slippage_pct = settings.simulated_slippage_pct
@@ -54,6 +55,133 @@ class SimulatedTradeTracker:
             max(settings.simulated_max_leverage, 1.0),
         )
         self._funding_rate_estimate = max(settings.simulated_funding_rate_estimate, 0.0)
+
+    def _ensure_portfolio_initialized(self) -> dict[str, float | int | str]:
+        portfolio = self._database.get_paper_portfolio()
+        if portfolio is not None:
+            return portfolio
+        now = datetime.now(timezone.utc).isoformat()
+        record = PaperPortfolioRecord(
+            timestamp=now,
+            starting_capital=self._settings.simulated_initial_capital,
+            available_cash=self._settings.simulated_initial_capital,
+            realized_pnl=0.0,
+            unrealized_pnl=0.0,
+            total_equity=self._settings.simulated_initial_capital,
+            drawdown=0.0,
+            max_drawdown=0.0,
+            gross_exposure=0.0,
+            net_exposure=0.0,
+            open_positions=0,
+            total_fees_paid=0.0,
+            total_slippage_paid=0.0,
+        )
+        self._database.upsert_paper_portfolio(record)
+        self._database.append_paper_equity_curve(record)
+        return self._database.get_paper_portfolio() or {
+            "starting_capital": self._settings.simulated_initial_capital,
+            "available_cash": self._settings.simulated_initial_capital,
+            "realized_pnl": 0.0,
+            "unrealized_pnl": 0.0,
+            "total_equity": self._settings.simulated_initial_capital,
+            "drawdown": 0.0,
+            "max_drawdown": 0.0,
+            "gross_exposure": 0.0,
+            "net_exposure": 0.0,
+            "open_positions": 0,
+            "total_fees_paid": 0.0,
+            "total_slippage_paid": 0.0,
+        }
+
+    def _sync_portfolio_snapshot(self, *, timestamp: str) -> dict[str, float]:
+        portfolio = self._database.get_paper_portfolio() or self._ensure_portfolio_initialized()
+        starting_capital = float(portfolio.get("starting_capital", self._settings.simulated_initial_capital))
+        open_trades = self._database.get_open_simulated_trades()
+        closed_trades = self._database.get_closed_simulated_trades()
+
+        unrealized_pnl = 0.0
+        gross_exposure = 0.0
+        net_exposure = 0.0
+        reserved_cash = 0.0
+        open_entry_fees = 0.0
+        open_slippage_cost = 0.0
+        open_spread_cost = 0.0
+
+        for trade in open_trades:
+            latest_candle = self._database.get_recent_candles(symbol=trade.symbol, timeframe=trade.timeframe, limit=1)
+            mark_price = latest_candle[-1].close if latest_candle else trade.entry_price
+            quantity = (trade.notional_exposure or 0.0) / trade.entry_price if trade.entry_price else 0.0
+            trade_unrealized = ((trade.entry_price - mark_price) * quantity) if trade.direction == "SHORT" else ((mark_price - trade.entry_price) * quantity)
+            unrealized_pnl += trade_unrealized
+            gross_exposure += trade.notional_exposure or 0.0
+            net_exposure += -(trade.notional_exposure or 0.0) if trade.direction == "SHORT" else (trade.notional_exposure or 0.0)
+            reserved_cash += trade.margin_used or self._position_size_usd
+            open_entry_fees += trade.fees_open or trade.fees_paid or 0.0
+            open_slippage_cost += trade.slippage_cost or 0.0
+            open_spread_cost += trade.spread_cost or 0.0
+            exposure_pct = (trade.notional_exposure or 0.0) / max(starting_capital + unrealized_pnl, 1.0)
+            self._database.upsert_paper_position(
+                PaperPositionRecord(
+                    symbol=trade.symbol,
+                    timeframe=trade.timeframe,
+                    trade_id=trade.id,
+                    direction=trade.direction,
+                    quantity=round(quantity, 8),
+                    entry_price=trade.entry_price,
+                    current_price=round(mark_price, 6),
+                    market_value=round(quantity * mark_price, 6),
+                    unrealized_pnl=round(trade_unrealized, 6),
+                    exposure_pct=round(exposure_pct, 6),
+                    status="OPEN",
+                    opened_at=trade.entry_time,
+                    updated_at=timestamp,
+                    provider_used=trade.provider_used or (latest_candle[-1].provider if latest_candle else "UNKNOWN"),
+                )
+            )
+
+        realized_pnl = sum(
+            float(
+                trade.final_net_pnl_after_all_costs
+                if trade.final_net_pnl_after_all_costs is not None
+                else (trade.net_pnl if trade.net_pnl is not None else (trade.pnl or 0.0))
+            )
+            for trade in closed_trades
+        )
+        closed_total_fees = sum(float(trade.total_fees or trade.fees_paid or 0.0) for trade in closed_trades)
+        closed_total_slippage = sum(float(trade.slippage_cost or 0.0) for trade in closed_trades)
+        total_equity = starting_capital + realized_pnl + unrealized_pnl
+        available_cash = starting_capital + realized_pnl - reserved_cash
+        peak_equity = max(float(portfolio.get("total_equity", starting_capital)), total_equity, starting_capital)
+        drawdown = total_equity - peak_equity
+        max_drawdown = min(float(portfolio.get("max_drawdown", 0.0)), drawdown)
+
+        record = PaperPortfolioRecord(
+            timestamp=timestamp,
+            starting_capital=round(starting_capital, 6),
+            available_cash=round(available_cash, 6),
+            realized_pnl=round(realized_pnl, 6),
+            unrealized_pnl=round(unrealized_pnl, 6),
+            total_equity=round(total_equity, 6),
+            drawdown=round(drawdown, 6),
+            max_drawdown=round(max_drawdown, 6),
+            gross_exposure=round(gross_exposure, 6),
+            net_exposure=round(net_exposure, 6),
+            open_positions=len(open_trades),
+            total_fees_paid=round(closed_total_fees + open_entry_fees, 6),
+            total_slippage_paid=round(closed_total_slippage + open_slippage_cost + open_spread_cost, 6),
+        )
+        self._database.upsert_paper_portfolio(record)
+        self._database.append_paper_equity_curve(record)
+        return {
+            "starting_capital": round(starting_capital, 6),
+            "available_cash": round(available_cash, 6),
+            "reserved_cash": round(reserved_cash, 6),
+            "realized_pnl": round(realized_pnl, 6),
+            "unrealized_pnl": round(unrealized_pnl, 6),
+            "total_equity": round(total_equity, 6),
+            "gross_exposure": round(gross_exposure, 6),
+            "net_exposure": round(net_exposure, 6),
+        }
 
     def process_cycle(
         self,
@@ -261,6 +389,8 @@ class SimulatedTradeTracker:
         signal: dict[str, str | float | bool],
         signal_id: int | None,
     ) -> int:
+        portfolio_before = self._ensure_portfolio_initialized()
+        open_trades_before = self._database.get_open_simulated_trades()
         direction = str(signal.get("signal_type", "LONG"))
         entry_price = self._entry_fill_price(direction=direction, mark_price=latest_candle.close)
         risk_reward_snapshot = signal.get("risk_reward_snapshot", {})
@@ -291,6 +421,11 @@ class SimulatedTradeTracker:
                 notional_exposure * self._funding_rate_estimate if self._market_type == "FUTURES_SIMULATED" else 0.0,
             )
         )
+        available_cash_before_open = float(portfolio_before.get("available_cash", self._settings.simulated_initial_capital))
+        equity_before_open = float(portfolio_before.get("total_equity", self._settings.simulated_initial_capital))
+        reserved_cash_before_open = sum((trade.margin_used or self._position_size_usd) for trade in open_trades_before)
+        reserved_cash_after_open = reserved_cash_before_open + position_size_usd
+        expected_cash_after_open = available_cash_before_open - position_size_usd
         minimum_required_move = ((fees_open * 2) + slippage_cost + spread_cost + funding_cost_estimate) / quantity if quantity else 0.0
         break_even_price = entry_price - minimum_required_move if direction == "SHORT" else entry_price + minimum_required_move
         liquidation_price_estimate = (
@@ -306,6 +441,26 @@ class SimulatedTradeTracker:
             "funding_cost_estimate": round(funding_cost_estimate, 6),
             "break_even_price": round(break_even_price, 6),
             "minimum_required_move_to_profit": round((minimum_required_move / entry_price) * 100, 6) if entry_price else 0.0,
+        }
+
+        entry_context = {
+            "trend_direction": signal.get("trend_direction"),
+            "volatility_regime": signal.get("volatility_regime"),
+            "momentum_strength": signal.get("momentum_strength"),
+            "volume_regime": signal.get("volume_regime"),
+            "market_regime": signal.get("market_regime"),
+            "provider_used": signal.get("provider_used", latest_candle.provider),
+            "accounting": {
+                "available_cash_before_open": round(available_cash_before_open, 6),
+                "expected_cash_after_open": round(expected_cash_after_open, 6),
+                "reserved_cash_before_open": round(reserved_cash_before_open, 6),
+                "reserved_cash_after_open": round(reserved_cash_after_open, 6),
+                "equity_before_open": round(equity_before_open, 6),
+                "position_notional": round(notional_exposure, 6),
+                "entry_fees": round(fees_open, 6),
+                "entry_slippage": round(slippage_cost, 6),
+                "entry_spread": round(spread_cost, 6),
+            },
         }
 
         trade_id = self._database.insert_simulated_trade(
@@ -343,23 +498,35 @@ class SimulatedTradeTracker:
             spread_cost=round(spread_cost, 6),
             break_even_price=round(break_even_price, 6),
             minimum_required_move_to_profit=cost_snapshot["minimum_required_move_to_profit"],
-            entry_context=json.dumps(
-                {
-                    "trend_direction": signal.get("trend_direction"),
-                    "volatility_regime": signal.get("volatility_regime"),
-                    "momentum_strength": signal.get("momentum_strength"),
-                    "volume_regime": signal.get("volume_regime"),
-                    "market_regime": signal.get("market_regime"),
-                    "provider_used": signal.get("provider_used", latest_candle.provider),
-                },
-                ensure_ascii=True,
-            ),
+            entry_context=json.dumps(entry_context, ensure_ascii=True),
             agent_votes=json.dumps(signal.get("agent_votes", []), ensure_ascii=True),
             risk_reward_snapshot=json.dumps(signal.get("risk_reward_snapshot", {}), ensure_ascii=True),
             cost_snapshot=json.dumps(cost_snapshot, ensure_ascii=True),
             paper_mode=str(signal.get("paper_mode", "OBSERVE_ONLY")),
             exploratory_trade=str(signal.get("paper_mode", "OBSERVE_ONLY")) == "PAPER_EXPLORATION",
         )
+        side = "SELL" if direction == "SHORT" else "BUY"
+        self._database.insert_paper_order(
+            PaperOrderRecord(
+                timestamp=latest_candle.close_time,
+                trade_id=trade_id,
+                symbol=symbol,
+                timeframe=timeframe,
+                side=side,
+                order_type="MARKET",
+                requested_price=round(latest_candle.close, 6),
+                filled_price=round(entry_price, 6),
+                quantity=round(quantity, 8),
+                notional=round(notional_exposure, 6),
+                fees=round(fees_open, 6),
+                slippage_cost=round(slippage_cost, 6),
+                spread_cost=round(spread_cost, 6),
+                status="FILLED",
+                provider_used=str(signal.get("provider_used", latest_candle.provider)),
+                reason="paper_trade_open",
+            )
+        )
+        portfolio_after = self._sync_portfolio_snapshot(timestamp=latest_candle.close_time)
         logger.info(
             "Simulated trade opened",
             extra={
@@ -377,6 +544,9 @@ class SimulatedTradeTracker:
                     "market_type": self._market_type,
                     "leverage_simulated": leverage_simulated,
                     "signal_id": signal_id,
+                    "available_cash_before_open": round(available_cash_before_open, 6),
+                    "available_cash_after_open": portfolio_after["available_cash"],
+                    "reserved_cash_after_open": portfolio_after["reserved_cash"],
                 },
             },
         )
@@ -495,6 +665,7 @@ class SimulatedTradeTracker:
         reason_exit: str,
         exit_context: dict[str, object] | None = None,
     ) -> None:
+        self._ensure_portfolio_initialized()
         notional_exposure = trade.notional_exposure or (self._position_size_usd * (trade.leverage_simulated or 1.0))
         quantity = notional_exposure / trade.entry_price if trade.entry_price else 0.0
         exit_notional = quantity * exit_price
@@ -550,6 +721,28 @@ class SimulatedTradeTracker:
         else:
             outcome = "BREAKEVEN_NET"
 
+        close_side = "BUY" if trade.direction == "SHORT" else "SELL"
+        self._database.insert_paper_order(
+            PaperOrderRecord(
+                timestamp=exit_time,
+                trade_id=trade.id,
+                symbol=trade.symbol,
+                timeframe=trade.timeframe,
+                side=close_side,
+                order_type="MARKET",
+                requested_price=round(exit_price, 6),
+                filled_price=round(exit_price, 6),
+                quantity=round(quantity, 8),
+                notional=round(exit_notional, 6),
+                fees=round(fees_close, 6),
+                slippage_cost=0.0,
+                spread_cost=0.0,
+                status="FILLED",
+                provider_used=trade.provider_used or "UNKNOWN",
+                reason=f"paper_trade_close:{status}",
+            )
+        )
+
         self._database.close_simulated_trade(
             trade_id=trade.id,
             status=status,
@@ -590,6 +783,8 @@ class SimulatedTradeTracker:
                 ensure_ascii=True,
             ),
         )
+        self._database.close_paper_position(trade.id, exit_time)
+        portfolio_after = self._sync_portfolio_snapshot(timestamp=exit_time)
         logger.info(
             "Simulated trade closed",
             extra={
@@ -611,6 +806,8 @@ class SimulatedTradeTracker:
                     "max_favorable_excursion": round(max_favorable_excursion, 6),
                     "max_adverse_excursion": round(max_adverse_excursion, 6),
                     "exit_time": exit_time,
+                    "available_cash_after_close": portfolio_after["available_cash"],
+                    "equity_after_close": portfolio_after["total_equity"],
                 },
             },
         )

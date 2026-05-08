@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 from typing import Any
 
 from config.settings import Settings
@@ -18,10 +19,25 @@ class LedgerConsistencyReport:
     net_exposure: float
     unrealized_pnl: float
     available_cash: float
+    actual_available_cash: float
+    reserved_capital_total: float
+    notional_open_positions: float
+    fees_paid_total: float
     realized_pnl: float
     total_equity: float
+    actual_total_equity: float
     cash_check: float
     equity_check: float
+    latest_position_notional: float
+    latest_entry_fees: float
+    latest_entry_slippage: float
+    latest_entry_spread: float
+    latest_available_cash_before_open: float
+    latest_available_cash_after_open: float
+    latest_reserved_cash_after_open: float
+    latest_equity_before_open: float
+    latest_equity_after_open: float
+    ledger_fail_reason: str
     reconciled_positions: int
     reconciled_duplicates: int
     result: str
@@ -37,10 +53,25 @@ class LedgerConsistencyReport:
             "net_exposure": self.net_exposure,
             "unrealized_pnl": self.unrealized_pnl,
             "available_cash": self.available_cash,
+            "actual_available_cash": self.actual_available_cash,
+            "reserved_capital_total": self.reserved_capital_total,
+            "notional_open_positions": self.notional_open_positions,
+            "fees_paid_total": self.fees_paid_total,
             "realized_pnl": self.realized_pnl,
             "total_equity": self.total_equity,
+            "actual_total_equity": self.actual_total_equity,
             "cash_check": self.cash_check,
             "equity_check": self.equity_check,
+            "latest_position_notional": self.latest_position_notional,
+            "latest_entry_fees": self.latest_entry_fees,
+            "latest_entry_slippage": self.latest_entry_slippage,
+            "latest_entry_spread": self.latest_entry_spread,
+            "latest_available_cash_before_open": self.latest_available_cash_before_open,
+            "latest_available_cash_after_open": self.latest_available_cash_after_open,
+            "latest_reserved_cash_after_open": self.latest_reserved_cash_after_open,
+            "latest_equity_before_open": self.latest_equity_before_open,
+            "latest_equity_after_open": self.latest_equity_after_open,
+            "ledger_fail_reason": self.ledger_fail_reason,
             "reconciled_positions": self.reconciled_positions,
             "reconciled_duplicates": self.reconciled_duplicates,
             "result": self.result,
@@ -64,7 +95,6 @@ class LedgerReconciler:
         open_trades = self._database.get_open_simulated_trades()
         open_positions = self._database.get_open_paper_positions()
         portfolio = self._database.get_paper_portfolio() or {}
-        trade_metrics = self._database.get_simulated_trade_metrics()
         notes: list[str] = []
 
         open_trade_ids = {trade.id for trade in open_trades}
@@ -83,28 +113,38 @@ class LedgerReconciler:
                 reconciled_duplicates += 1
 
         open_trades = self._database.get_open_simulated_trades()
-        total_equity_seed = float(portfolio.get("total_equity", self._settings.simulated_initial_capital))
         starting_capital = float(portfolio.get("starting_capital", self._settings.simulated_initial_capital))
-        realized_pnl = float(trade_metrics["total_pnl"])
+        closed_trades = self._database.get_closed_simulated_trades()
+        realized_pnl = sum(
+            float(
+                trade.final_net_pnl_after_all_costs
+                if trade.final_net_pnl_after_all_costs is not None
+                else (trade.net_pnl if trade.net_pnl is not None else (trade.pnl or 0.0))
+            )
+            for trade in closed_trades
+        )
 
         unrealized_pnl = 0.0
         gross_exposure = 0.0
         net_exposure = 0.0
+        reserved_capital_total = 0.0
+        notional_open_positions = 0.0
         rebuilt_positions = 0
         for trade in open_trades:
             latest_candle = self._database.get_recent_candles(symbol=trade.symbol, timeframe=trade.timeframe, limit=1)
             if not latest_candle:
                 notes.append(f"missing mark price for {trade.symbol} {trade.timeframe}")
-                continue
-            mark = latest_candle[-1].close
+            mark = latest_candle[-1].close if latest_candle else trade.entry_price
             quantity = (trade.notional_exposure or 0.0) / trade.entry_price if trade.entry_price else 0.0
             trade_unrealized = ((trade.entry_price - mark) * quantity) if trade.direction == "SHORT" else ((mark - trade.entry_price) * quantity)
             unrealized_pnl += trade_unrealized
             gross_exposure += trade.notional_exposure or 0.0
             net_exposure += -(trade.notional_exposure or 0.0) if trade.direction == "SHORT" else (trade.notional_exposure or 0.0)
+            reserved_capital_total += trade.margin_used or self._settings.simulated_position_size_usd
+            notional_open_positions += trade.notional_exposure or 0.0
 
             if mutate:
-                exposure_pct = (trade.notional_exposure or 0.0) / max(total_equity_seed, 1.0)
+                exposure_pct = (trade.notional_exposure or 0.0) / max(starting_capital + realized_pnl + unrealized_pnl, 1.0)
                 self._database.upsert_paper_position(
                     PaperPositionRecord(
                         symbol=trade.symbol,
@@ -120,16 +160,56 @@ class LedgerReconciler:
                         status="OPEN",
                         opened_at=trade.entry_time,
                         updated_at=now,
-                        provider_used=trade.provider_used or latest_candle[-1].provider,
+                        provider_used=trade.provider_used or (latest_candle[-1].provider if latest_candle else "UNKNOWN"),
                     )
                 )
                 rebuilt_positions += 1
 
-        margin_in_use = sum((trade.margin_used or self._settings.simulated_position_size_usd) for trade in open_trades)
-        available_cash = starting_capital + realized_pnl - margin_in_use
+        open_entry_fees = sum(float(trade.fees_open or trade.fees_paid or 0.0) for trade in open_trades)
+        closed_total_fees = sum(float(trade.total_fees or trade.fees_paid or 0.0) for trade in closed_trades)
+        fees_paid_total = closed_total_fees + open_entry_fees
+        available_cash = starting_capital + realized_pnl - reserved_capital_total
         total_equity = starting_capital + realized_pnl + unrealized_pnl
-        cash_check = available_cash - float(portfolio.get("available_cash", available_cash))
-        equity_check = total_equity - float(portfolio.get("total_equity", total_equity))
+        actual_available_cash = float(portfolio.get("available_cash", available_cash))
+        actual_total_equity = float(portfolio.get("total_equity", total_equity))
+        cash_check = available_cash - actual_available_cash
+        equity_check = total_equity - actual_total_equity
+
+        latest_trade = max(open_trades, key=lambda item: item.entry_time, default=None)
+        latest_accounting: dict[str, object] = {}
+        latest_position_notional = 0.0
+        latest_entry_fees = 0.0
+        latest_entry_slippage = 0.0
+        latest_entry_spread = 0.0
+        latest_available_cash_before_open = 0.0
+        latest_available_cash_after_open = 0.0
+        latest_reserved_cash_after_open = 0.0
+        latest_equity_before_open = 0.0
+        latest_equity_after_open = 0.0
+        if latest_trade is not None:
+            latest_position_notional = float(latest_trade.notional_exposure or 0.0)
+            latest_entry_fees = float(latest_trade.fees_open or latest_trade.fees_paid or 0.0)
+            latest_entry_slippage = float(latest_trade.slippage_cost or 0.0)
+            latest_entry_spread = float(latest_trade.spread_cost or 0.0)
+            try:
+                entry_context = json.loads(latest_trade.entry_context or "{}")
+            except json.JSONDecodeError:
+                entry_context = {}
+            latest_accounting = entry_context.get("accounting", {}) if isinstance(entry_context, dict) else {}
+            if isinstance(latest_accounting, dict):
+                latest_available_cash_before_open = float(latest_accounting.get("available_cash_before_open", 0.0) or 0.0)
+                latest_available_cash_after_open = float(latest_accounting.get("expected_cash_after_open", actual_available_cash) or 0.0)
+                latest_reserved_cash_after_open = float(latest_accounting.get("reserved_cash_after_open", reserved_capital_total) or 0.0)
+                latest_equity_before_open = float(latest_accounting.get("equity_before_open", 0.0) or 0.0)
+            latest_equity_after_open = total_equity
+            if latest_available_cash_before_open == 0.0:
+                inferred_margin = float(latest_trade.margin_used or self._settings.simulated_position_size_usd)
+                if latest_available_cash_after_open == 0.0:
+                    latest_available_cash_after_open = actual_available_cash
+                latest_available_cash_before_open = actual_available_cash + inferred_margin
+                latest_reserved_cash_after_open = reserved_capital_total
+            if latest_equity_before_open == 0.0:
+                latest_equity_before_open = total_equity - unrealized_pnl
 
         if mutate:
             updated_portfolio = PaperPortfolioRecord(
@@ -144,11 +224,20 @@ class LedgerReconciler:
                 gross_exposure=round(gross_exposure, 6),
                 net_exposure=round(net_exposure, 6),
                 open_positions=len(open_trades),
-                total_fees_paid=float(trade_metrics["total_fees_paid"]),
-                total_slippage_paid=float(trade_metrics["total_slippage_paid"]),
+                total_fees_paid=round(fees_paid_total, 6),
+                total_slippage_paid=round(
+                    sum(float(trade.slippage_cost or 0.0) for trade in closed_trades)
+                    + sum(float(trade.slippage_cost or 0.0) for trade in open_trades)
+                    + sum(float(trade.spread_cost or 0.0) for trade in open_trades),
+                    6,
+                ),
             )
             self._database.upsert_paper_portfolio(updated_portfolio)
             self._database.append_paper_equity_curve(updated_portfolio)
+            actual_available_cash = available_cash
+            actual_total_equity = total_equity
+            cash_check = 0.0
+            equity_check = 0.0
 
         if orphan_positions:
             notes.append(f"orphan positions detected: {len(orphan_positions)}")
@@ -164,11 +253,14 @@ class LedgerReconciler:
         if not notes:
             notes.append("ledger is internally consistent")
 
+        ledger_fail_reason = ""
         result = "OK"
         if duplicates or orphan_positions or abs(cash_check) > 0.5 or abs(equity_check) > 0.5:
             result = "WARNING"
         if abs(cash_check) > 5 or abs(equity_check) > 5:
             result = "FAIL"
+        if result != "OK":
+            ledger_fail_reason = notes[0]
 
         if mutate:
             self._database.insert_error_event(
@@ -191,10 +283,25 @@ class LedgerReconciler:
             net_exposure=round(net_exposure, 6),
             unrealized_pnl=round(unrealized_pnl, 6),
             available_cash=round(available_cash, 6),
+            actual_available_cash=round(actual_available_cash, 6),
+            reserved_capital_total=round(reserved_capital_total, 6),
+            notional_open_positions=round(notional_open_positions, 6),
+            fees_paid_total=round(fees_paid_total, 6),
             realized_pnl=round(realized_pnl, 6),
             total_equity=round(total_equity, 6),
+            actual_total_equity=round(actual_total_equity, 6),
             cash_check=round(cash_check, 6),
             equity_check=round(equity_check, 6),
+            latest_position_notional=round(latest_position_notional, 6),
+            latest_entry_fees=round(latest_entry_fees, 6),
+            latest_entry_slippage=round(latest_entry_slippage, 6),
+            latest_entry_spread=round(latest_entry_spread, 6),
+            latest_available_cash_before_open=round(latest_available_cash_before_open, 6),
+            latest_available_cash_after_open=round(latest_available_cash_after_open, 6),
+            latest_reserved_cash_after_open=round(latest_reserved_cash_after_open, 6),
+            latest_equity_before_open=round(latest_equity_before_open, 6),
+            latest_equity_after_open=round(latest_equity_after_open, 6),
+            ledger_fail_reason=ledger_fail_reason,
             reconciled_positions=reconciled_positions,
             reconciled_duplicates=reconciled_duplicates,
             result=result,

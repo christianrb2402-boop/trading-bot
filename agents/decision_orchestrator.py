@@ -173,7 +173,14 @@ class DecisionOrchestrator:
         short_intraday_run: bool,
     ) -> float:
         if timeframe == execution_timeframe:
-            return 0.45 if short_intraday_run else 0.35
+            return 0.48 if short_intraday_run else 0.4
+        if execution_timeframe == "15m":
+            if timeframe == "30m":
+                return 0.3 if short_intraday_run else 0.26
+            if timeframe == "1h":
+                return 0.17 if short_intraday_run else 0.2
+            if timeframe == "4h":
+                return 0.08 if short_intraday_run else 0.12
         if timeframe in self._settings.structural_timeframes:
             return 0.0 if short_intraday_run else 0.25
         if short_intraday_run:

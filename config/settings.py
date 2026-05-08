@@ -213,11 +213,11 @@ def load_settings() -> Settings:
         os.getenv("LOGS_DIR", "logs"),
         ROOT_DIR / "logs",
     )
-    market_timeframes = _parse_timeframes(os.getenv("MARKET_TIMEFRAMES", "1m,3m,5m,15m,30m,1h,4h,1d"))
+    market_timeframes = _parse_timeframes(os.getenv("MARKET_TIMEFRAMES", "15m,30m,1h,4h"))
     market_timeframe = os.getenv("MARKET_TIMEFRAME", market_timeframes[0] if market_timeframes else "1m")
-    execution_timeframes = _parse_timeframes(os.getenv("EXECUTION_TIMEFRAMES", "1m,3m,5m"))
-    context_timeframes = _parse_timeframes(os.getenv("CONTEXT_TIMEFRAMES", "15m,30m,1h"))
-    structural_timeframes = _parse_timeframes(os.getenv("STRUCTURAL_TIMEFRAMES", "4h,1d"))
+    execution_timeframes = _parse_timeframes(os.getenv("EXECUTION_TIMEFRAMES", "15m"))
+    context_timeframes = _parse_timeframes(os.getenv("CONTEXT_TIMEFRAMES", "30m,1h"))
+    structural_timeframes = _parse_timeframes(os.getenv("STRUCTURAL_TIMEFRAMES", "4h"))
 
     return Settings(
         app_name=os.getenv("APP_NAME", "multiagent-trading-system"),
@@ -227,8 +227,8 @@ def load_settings() -> Settings:
         logs_dir=logs_dir,
         binance_base_url=os.getenv("BINANCE_BASE_URL", "https://api.binance.com").rstrip("/"),
         binance_timeout_seconds=int(os.getenv("BINANCE_TIMEOUT_SECONDS", "10")),
-        market_symbols=_parse_symbols(os.getenv("MARKET_SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT")),
-        core_symbols=_parse_symbols(os.getenv("CORE_SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT")),
+        market_symbols=_parse_symbols(os.getenv("MARKET_SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT")),
+        core_symbols=_parse_symbols(os.getenv("CORE_SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT")),
         watchlist_symbols=_parse_symbols(
             os.getenv(
                 "WATCHLIST_SYMBOLS",

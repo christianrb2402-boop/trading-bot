@@ -306,6 +306,7 @@ class TradingBrainOrchestrator:
             execution_timeframe=timeframe,
             current_context=market_context,
             operating_horizon_minutes=operating_horizon_minutes,
+            prefer_fallback=prefer_fallback,
         )
         direction_bias = "LONG" if market_state.trend_state == "UP" else "SHORT" if market_state.trend_state == "DOWN" else "NONE"
         proposals = self._collect_strategy_proposals(
@@ -317,6 +318,15 @@ class TradingBrainOrchestrator:
             selection=selection,
         )
         best_proposal = max(proposals, key=lambda item: item.confidence)
+
+        proposal_stop_loss_price = None
+        proposal_take_profit_price = None
+        if best_proposal.proposed_decision in {"LONG", "SHORT"}:
+            proposal_stop_loss_price, proposal_take_profit_price = self._proposal_price_levels(
+                entry_price=recent_candles[-1].close,
+                direction=best_proposal.proposed_decision,
+                proposal=best_proposal,
+            )
 
         exploration_position_size = max(
             min(
@@ -333,6 +343,8 @@ class TradingBrainOrchestrator:
             position_size_usd=min(self._settings.simulated_position_size_usd, total_equity * risk_manager.position_size_pct),
             volatility_pct=float(feature_snapshot.payload.get("atr_pct", 0.0)),
             market_type=self._settings.simulated_market_type,
+            stop_loss_price=proposal_stop_loss_price,
+            take_profit_price=proposal_take_profit_price,
         )
         delta_context = dict(market_context)
         delta_signal = self._delta_agent.evaluate_from_candles(
@@ -400,12 +412,38 @@ class TradingBrainOrchestrator:
             alignment=tf_alignment,
             external_context_bias=external_context_bias,
         )
+        selective_position_size = max(
+            1.0,
+            min(
+                self._settings.simulated_position_size_usd,
+                total_equity * max(risk_manager.position_size_pct, 0.0),
+            ),
+        )
+        proposal_stop_loss_price = None
+        proposal_take_profit_price = None
+        if best_proposal.proposed_decision in {"LONG", "SHORT"}:
+            proposal_stop_loss_price, proposal_take_profit_price = self._proposal_price_levels(
+                entry_price=recent_candles[-1].close,
+                direction=best_proposal.proposed_decision,
+                proposal=best_proposal,
+            )
+        cost_snapshot = self._cost_model_agent.estimate(
+            entry_price=recent_candles[-1].close,
+            direction=best_proposal.proposed_decision if best_proposal.proposed_decision in {"LONG", "SHORT"} else "LONG",
+            position_size_usd=selective_position_size,
+            volatility_pct=float(feature_snapshot.payload.get("atr_pct", 0.0)),
+            market_type=self._settings.simulated_market_type,
+            stop_loss_price=proposal_stop_loss_price,
+            take_profit_price=proposal_take_profit_price,
+        )
         exploration_cost_snapshot = self._cost_model_agent.estimate(
             entry_price=recent_candles[-1].close,
             direction=best_proposal.proposed_decision if best_proposal.proposed_decision in {"LONG", "SHORT"} else "LONG",
             position_size_usd=exploration_position_size,
             volatility_pct=float(feature_snapshot.payload.get("atr_pct", 0.0)),
             market_type=self._settings.simulated_market_type,
+            stop_loss_price=proposal_stop_loss_price,
+            take_profit_price=proposal_take_profit_price,
         )
         exploration_signal = dict(delta_signal)
         exploration_signal["position_size_usd"] = exploration_position_size
@@ -501,7 +539,7 @@ class TradingBrainOrchestrator:
             paper_mode="OBSERVE_ONLY",
         )
         active_cost_snapshot = exploration_cost_snapshot if paper_mode == "PAPER_EXPLORATION" else cost_snapshot
-        active_position_size = exploration_position_size if paper_mode == "PAPER_EXPLORATION" else min(self._settings.simulated_position_size_usd, total_equity * risk_manager.position_size_pct)
+        active_position_size = exploration_position_size if paper_mode == "PAPER_EXPLORATION" else selective_position_size
         delta_signal["paper_mode"] = paper_mode
         delta_signal["position_size_usd"] = active_position_size
         risk_reward = self._risk_reward_agent.evaluate(signal=delta_signal, cost_snapshot=active_cost_snapshot)
@@ -675,6 +713,10 @@ class TradingBrainOrchestrator:
             "market_state": market_state.as_dict(),
             "strategy_selection": selection.as_dict(),
             "best_proposal": best_proposal.as_dict(),
+            "proposal_price_levels": {
+                "stop_loss_price": proposal_stop_loss_price,
+                "take_profit_price": proposal_take_profit_price,
+            },
             "cost_snapshot": active_cost_snapshot.as_dict(),
             "exploration_cost_snapshot": exploration_cost_snapshot.as_dict(),
             "risk_reward": risk_reward.as_dict(),
@@ -985,17 +1027,59 @@ class TradingBrainOrchestrator:
         distance_ema9 = abs(float(features.get("distance_to_ema_9_pct", 0.0)))
         distance_ema21 = abs(float(features.get("distance_to_ema_21_pct", 0.0)))
         candle_strength = abs(float(features.get("candle_strength", 0.0)))
+        relative_volume = max(float(features.get("relative_volume", 0.0)), 0.0)
         break_even_move_pct = max(float(features.get("break_even_move_pct", 0.0)), 0.0)
         required_net_move_pct = max(float(features.get("required_net_move_pct", 0.0)), break_even_move_pct)
-        intraday_floor = 0.12 if timeframe == "1m" else 0.16 if timeframe == "3m" else 0.2
-        momentum_component = max((roc * 2.6), (acceleration * 1.8), (candle_strength * 0.8), 0.0)
-        swing_component = max((atr_pct * 1.15), (avg_range_pct * 0.9), (distance_ema9 * 1.8), (distance_ema21 * 1.35), 0.0)
-        expected_move_pct = max(float(proposal.expected_move_pct), momentum_component, swing_component, required_net_move_pct * 1.25, intraday_floor)
-        stop_loss_pct = max(float(proposal.stop_loss_pct), atr_pct * 0.75, avg_range_pct * 0.55, break_even_move_pct * 0.65, 0.07 if timeframe == "1m" else 0.09)
-        take_profit_pct = max(float(proposal.take_profit_pct), expected_move_pct, stop_loss_pct * 1.35, required_net_move_pct * 1.3)
+        profile = self._timeframe_trade_profile(timeframe)
+        intraday_floor = float(profile["target_floor"])
+        momentum_component = max(
+            (roc * float(profile["roc_weight"])),
+            (acceleration * float(profile["acceleration_weight"])),
+            (candle_strength * float(profile["candle_weight"])),
+            0.0,
+        )
+        swing_component = max(
+            (atr_pct * float(profile["atr_swing_weight"])),
+            (avg_range_pct * float(profile["range_swing_weight"])),
+            (distance_ema9 * float(profile["ema9_weight"])),
+            (distance_ema21 * float(profile["ema21_weight"])),
+            0.0,
+        )
+        liquidity_boost = 1.08 if relative_volume >= 1.2 else 1.0
+        tactical_target_component = max(
+            swing_component * liquidity_boost * float(profile["liquidity_swing_multiplier"]),
+            momentum_component + (swing_component * float(profile["momentum_swing_mix"])),
+            atr_pct * float(profile["atr_target_multiplier"]),
+            avg_range_pct * float(profile["range_target_multiplier"]),
+            0.0,
+        )
+        stop_loss_pct = max(
+            float(proposal.stop_loss_pct),
+            atr_pct * float(profile["stop_atr_multiplier"]),
+            avg_range_pct * float(profile["stop_range_multiplier"]),
+            break_even_move_pct * float(profile["break_even_stop_multiplier"]),
+            float(profile["stop_floor"]),
+        )
+        desired_net_rr = float(profile["desired_net_rr"])
+        minimum_rr_target_pct = break_even_move_pct + ((stop_loss_pct + break_even_move_pct) * desired_net_rr)
+        expected_move_pct = max(
+            float(proposal.expected_move_pct),
+            tactical_target_component,
+            required_net_move_pct * float(profile["required_move_multiplier"]),
+            minimum_rr_target_pct,
+            intraday_floor,
+        )
+        take_profit_pct = max(
+            float(proposal.take_profit_pct),
+            expected_move_pct,
+            stop_loss_pct * float(profile["take_profit_stop_multiplier"]),
+            required_net_move_pct * float(profile["required_move_multiplier"]),
+            minimum_rr_target_pct,
+        )
         risk_reward_ratio = take_profit_pct / max(stop_loss_pct, 0.000001)
         expected_net_edge_pct = max(take_profit_pct - break_even_move_pct, 0.0)
-        confidence_boost = 0.03 if proposal.proposed_decision == direction_bias and expected_move_pct > required_net_move_pct else 0.0
+        expected_net_reward_risk = expected_net_edge_pct / max(stop_loss_pct + break_even_move_pct, 0.000001)
+        confidence_boost = float(profile["confidence_boost"]) if proposal.proposed_decision == direction_bias and expected_move_pct > required_net_move_pct else 0.0
         return replace(
             proposal,
             confidence=round(max(0.0, min(1.0, proposal.confidence + confidence_boost)), 6),
@@ -1011,6 +1095,11 @@ class TradingBrainOrchestrator:
                 "required_net_move_pct": round(required_net_move_pct, 6),
                 "momentum_component": round(momentum_component, 6),
                 "swing_component": round(swing_component, 6),
+                "tactical_target_component": round(tactical_target_component, 6),
+                "minimum_rr_target_pct": round(minimum_rr_target_pct, 6),
+                "desired_net_rr": round(desired_net_rr, 6),
+                "expected_net_reward_risk_from_proposal": round(expected_net_reward_risk, 6),
+                "timeframe_trade_profile": dict(profile),
             },
         )
 
@@ -1046,8 +1135,14 @@ class TradingBrainOrchestrator:
             and rsi <= 55
             and (roc <= 0.02 or acceleration <= 0 or distance_ema9 >= -0.08)
         )
-        microstructure_present = atr_pct >= 0.08 or abs(roc) >= 0.03 or abs(candle_strength) >= 0.015 or relative_volume >= 0.85
-        if not microstructure_present or not (long_ok or short_ok):
+        profile = self._timeframe_trade_profile(timeframe)
+        structure_present = (
+            atr_pct >= float(profile["fallback_atr_floor"])
+            or abs(roc) >= float(profile["fallback_roc_floor"])
+            or abs(candle_strength) >= float(profile["fallback_candle_floor"])
+            or relative_volume >= float(profile["fallback_volume_floor"])
+        )
+        if not structure_present or not (long_ok or short_ok):
             return None
         strategy_name = "PULLBACK_CONTINUATION" if abs(distance_ema9) >= 0.05 else "TREND_FOLLOWING"
         agent_name = "PullbackContinuationAgent" if strategy_name == "PULLBACK_CONTINUATION" else "TrendFollowingAgent"
@@ -1063,8 +1158,8 @@ class TradingBrainOrchestrator:
             take_profit_pct=0.0,
             risk_reward_ratio=0.0,
             expected_net_edge_pct=0.0,
-            entry_reason=f"intraday fallback sees {trend_state} with usable microstructure and structure {structure}",
-            invalidation_reason="fallback microstructure no longer supports the tactical direction",
+            entry_reason=f"structural fallback sees {trend_state} with usable 15m pullback structure {structure}",
+            invalidation_reason="fallback structure no longer supports the tactical direction",
             risk_flags=("intraday_fallback",),
             raw_payload={"fallback": True, "structure": structure, "rsi": rsi, "relative_volume": relative_volume},
         )
@@ -1074,6 +1169,191 @@ class TradingBrainOrchestrator:
             timeframe=timeframe,
             direction_bias=direction_bias,
         )
+
+    @staticmethod
+    def _proposal_price_levels(
+        *,
+        entry_price: float,
+        direction: str,
+        proposal: StrategyProposal,
+    ) -> tuple[float | None, float | None]:
+        if entry_price <= 0 or direction not in {"LONG", "SHORT"}:
+            return None, None
+        stop_loss_pct = max(float(proposal.stop_loss_pct), 0.0)
+        take_profit_pct = max(float(proposal.take_profit_pct), 0.0)
+        if stop_loss_pct <= 0 or take_profit_pct <= 0:
+            return None, None
+        if direction == "SHORT":
+            stop_loss_price = entry_price * (1 + (stop_loss_pct / 100))
+            take_profit_price = entry_price * (1 - (take_profit_pct / 100))
+        else:
+            stop_loss_price = entry_price * (1 - (stop_loss_pct / 100))
+            take_profit_price = entry_price * (1 + (take_profit_pct / 100))
+        return round(stop_loss_price, 8), round(take_profit_price, 8)
+
+    @staticmethod
+    def _timeframe_trade_profile(timeframe: str) -> dict[str, float]:
+        if timeframe == "15m":
+            return {
+                "target_floor": 0.85,
+                "stop_floor": 0.18,
+                "desired_net_rr": 1.35,
+                "roc_weight": 4.2,
+                "acceleration_weight": 2.8,
+                "candle_weight": 1.55,
+                "atr_swing_weight": 1.7,
+                "range_swing_weight": 1.35,
+                "ema9_weight": 2.5,
+                "ema21_weight": 2.0,
+                "liquidity_swing_multiplier": 1.3,
+                "momentum_swing_mix": 0.78,
+                "atr_target_multiplier": 2.85,
+                "range_target_multiplier": 1.95,
+                "stop_atr_multiplier": 0.92,
+                "stop_range_multiplier": 0.74,
+                "break_even_stop_multiplier": 0.5,
+                "required_move_multiplier": 1.55,
+                "take_profit_stop_multiplier": 1.7,
+                "confidence_boost": 0.04,
+                "fallback_atr_floor": 0.12,
+                "fallback_roc_floor": 0.08,
+                "fallback_candle_floor": 0.03,
+                "fallback_volume_floor": 0.95,
+            }
+        if timeframe == "30m":
+            return {
+                "target_floor": 1.15,
+                "stop_floor": 0.24,
+                "desired_net_rr": 1.5,
+                "roc_weight": 4.4,
+                "acceleration_weight": 3.0,
+                "candle_weight": 1.6,
+                "atr_swing_weight": 1.9,
+                "range_swing_weight": 1.45,
+                "ema9_weight": 2.7,
+                "ema21_weight": 2.15,
+                "liquidity_swing_multiplier": 1.34,
+                "momentum_swing_mix": 0.82,
+                "atr_target_multiplier": 3.05,
+                "range_target_multiplier": 2.1,
+                "stop_atr_multiplier": 0.95,
+                "stop_range_multiplier": 0.78,
+                "break_even_stop_multiplier": 0.48,
+                "required_move_multiplier": 1.62,
+                "take_profit_stop_multiplier": 1.78,
+                "confidence_boost": 0.04,
+                "fallback_atr_floor": 0.14,
+                "fallback_roc_floor": 0.09,
+                "fallback_candle_floor": 0.035,
+                "fallback_volume_floor": 0.98,
+            }
+        if timeframe in {"1h", "4h"}:
+            return {
+                "target_floor": 1.45,
+                "stop_floor": 0.32,
+                "desired_net_rr": 1.6,
+                "roc_weight": 4.6,
+                "acceleration_weight": 3.1,
+                "candle_weight": 1.65,
+                "atr_swing_weight": 2.1,
+                "range_swing_weight": 1.55,
+                "ema9_weight": 2.85,
+                "ema21_weight": 2.25,
+                "liquidity_swing_multiplier": 1.36,
+                "momentum_swing_mix": 0.86,
+                "atr_target_multiplier": 3.25,
+                "range_target_multiplier": 2.2,
+                "stop_atr_multiplier": 1.0,
+                "stop_range_multiplier": 0.82,
+                "break_even_stop_multiplier": 0.46,
+                "required_move_multiplier": 1.7,
+                "take_profit_stop_multiplier": 1.85,
+                "confidence_boost": 0.04,
+                "fallback_atr_floor": 0.16,
+                "fallback_roc_floor": 0.1,
+                "fallback_candle_floor": 0.04,
+                "fallback_volume_floor": 1.0,
+            }
+        if timeframe == "5m":
+            return {
+                "target_floor": 0.28,
+                "stop_floor": 0.1,
+                "desired_net_rr": 1.15,
+                "roc_weight": 3.1,
+                "acceleration_weight": 2.1,
+                "candle_weight": 1.2,
+                "atr_swing_weight": 1.45,
+                "range_swing_weight": 1.1,
+                "ema9_weight": 2.2,
+                "ema21_weight": 1.7,
+                "liquidity_swing_multiplier": 1.2,
+                "momentum_swing_mix": 0.55,
+                "atr_target_multiplier": 2.0,
+                "range_target_multiplier": 1.45,
+                "stop_atr_multiplier": 0.75,
+                "stop_range_multiplier": 0.6,
+                "break_even_stop_multiplier": 0.55,
+                "required_move_multiplier": 1.35,
+                "take_profit_stop_multiplier": 1.45,
+                "confidence_boost": 0.03,
+                "fallback_atr_floor": 0.08,
+                "fallback_roc_floor": 0.03,
+                "fallback_candle_floor": 0.015,
+                "fallback_volume_floor": 0.85,
+            }
+        if timeframe == "3m":
+            return {
+                "target_floor": 0.22,
+                "stop_floor": 0.08,
+                "desired_net_rr": 1.05,
+                "roc_weight": 3.1,
+                "acceleration_weight": 2.1,
+                "candle_weight": 1.2,
+                "atr_swing_weight": 1.45,
+                "range_swing_weight": 1.1,
+                "ema9_weight": 2.2,
+                "ema21_weight": 1.7,
+                "liquidity_swing_multiplier": 1.2,
+                "momentum_swing_mix": 0.55,
+                "atr_target_multiplier": 2.0,
+                "range_target_multiplier": 1.45,
+                "stop_atr_multiplier": 0.75,
+                "stop_range_multiplier": 0.6,
+                "break_even_stop_multiplier": 0.55,
+                "required_move_multiplier": 1.35,
+                "take_profit_stop_multiplier": 1.45,
+                "confidence_boost": 0.03,
+                "fallback_atr_floor": 0.08,
+                "fallback_roc_floor": 0.03,
+                "fallback_candle_floor": 0.015,
+                "fallback_volume_floor": 0.85,
+            }
+        return {
+            "target_floor": 0.14,
+            "stop_floor": 0.06,
+            "desired_net_rr": 0.95,
+            "roc_weight": 3.1,
+            "acceleration_weight": 2.1,
+            "candle_weight": 1.2,
+            "atr_swing_weight": 1.45,
+            "range_swing_weight": 1.1,
+            "ema9_weight": 2.2,
+            "ema21_weight": 1.7,
+            "liquidity_swing_multiplier": 1.2,
+            "momentum_swing_mix": 0.55,
+            "atr_target_multiplier": 2.0,
+            "range_target_multiplier": 1.45,
+            "stop_atr_multiplier": 0.75,
+            "stop_range_multiplier": 0.6,
+            "break_even_stop_multiplier": 0.55,
+            "required_move_multiplier": 1.35,
+            "take_profit_stop_multiplier": 1.45,
+            "confidence_boost": 0.03,
+            "fallback_atr_floor": 0.08,
+            "fallback_roc_floor": 0.03,
+            "fallback_candle_floor": 0.015,
+            "fallback_volume_floor": 0.85,
+        }
 
     def _relax_intraday_risk_manager(
         self,
@@ -1117,12 +1397,19 @@ class TradingBrainOrchestrator:
         execution_timeframe: str,
         current_context: dict[str, object],
         operating_horizon_minutes: int | None,
+        prefer_fallback: bool,
     ) -> dict[str, dict[str, object]]:
         contexts: dict[str, dict[str, object]] = {execution_timeframe: current_context}
-        allowed_contexts = list(self._settings.context_timeframes)
-        if operating_horizon_minutes is None or operating_horizon_minutes > 60:
-            allowed_contexts.extend(self._settings.structural_timeframes)
+        allowed_contexts = list(dict.fromkeys((*self._settings.context_timeframes, *self._settings.structural_timeframes)))
         for timeframe in allowed_contexts:
+            provider_result = self._provider_router.fetch_latest_closed_candles(
+                symbol=symbol,
+                timeframe=timeframe,
+                limit=max(self._settings.feature_store_lookback, 20),
+                prefer_fallback=prefer_fallback,
+            )
+            for candle in provider_result.candles:
+                self._database.insert_candles([candle])
             candles = self._database.get_recent_candles(symbol=symbol, timeframe=timeframe, limit=20)
             if len(candles) < 5:
                 continue
@@ -1219,8 +1506,8 @@ class TradingBrainOrchestrator:
             "trade_id": None,
         }
 
-    @staticmethod
     def _classify_signal_actionability(
+        self,
         *,
         proposed_direction: str,
         signal_tier: str,
@@ -1231,6 +1518,20 @@ class TradingBrainOrchestrator:
     ) -> str:
         if proposed_direction not in {"LONG", "SHORT"}:
             return "NO_SIGNAL"
+        if timeframe not in self._settings.execution_timeframes:
+            return "NO_SIGNAL"
+        if timeframe == "15m":
+            if signal_tier in {"STRONG"}:
+                return "VALID_STRONG"
+            if signal_tier == "MEDIUM":
+                return "VALID_NON_SELECTIVE"
+            if signal_tier == "WEAK":
+                return "VALID_NON_SELECTIVE" if confidence >= 0.5 and expected_net_edge_pct > 0 and expected_net_reward_risk >= 1.0 else "WEAK_EXPLORABLE"
+            if signal_tier in {"NONE", "UNKNOWN"}:
+                return "VALID_NON_SELECTIVE" if confidence >= 0.5 and expected_net_edge_pct > 0 and expected_net_reward_risk >= 1.0 else "NO_SIGNAL"
+            if signal_tier == "REJECTED":
+                return "WEAK_EXPLORABLE" if confidence >= 0.52 and expected_net_edge_pct > 0 and expected_net_reward_risk >= 1.05 else "NO_SIGNAL"
+            return "WEAK_EXPLORABLE" if confidence >= 0.48 and expected_net_edge_pct > 0 and expected_net_reward_risk >= 1.0 else "NO_SIGNAL"
         intraday_execution_timeframe = timeframe in {"1m", "3m", "5m"}
         if signal_tier == "REJECTED":
             if confidence >= 0.46:
@@ -1582,12 +1883,12 @@ class TradingBrainOrchestrator:
             threshold = self._settings.brain_min_final_score_exploration
             short_intraday_run = operating_horizon_minutes is not None and operating_horizon_minutes <= 60
             if short_intraday_run:
-                if timeframe == "1m":
-                    threshold -= 0.05
-                elif timeframe == "3m":
-                    threshold -= 0.04
-                elif timeframe == "5m":
-                    threshold -= 0.02
+                if timeframe == "15m":
+                    threshold -= 0.015
+                elif timeframe == "30m":
+                    threshold += 0.005
+                elif timeframe in {"1h", "4h"}:
+                    threshold += 0.015
             if signal_actionability == "WEAK_EXPLORABLE":
                 threshold -= 0.01
             elif signal_actionability == "VALID_NON_SELECTIVE":

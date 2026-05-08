@@ -209,6 +209,205 @@ def _build_rejection_reason_summary(rows: list[dict[str, object]]) -> dict[str, 
     }
 
 
+def _build_net_gate_diagnostics(
+    rows: list[dict[str, object]],
+    *,
+    settings: Settings,
+) -> dict[str, object]:
+    aggregate: dict[tuple[str, str], dict[str, float | int | str]] = {}
+    symbol_summary: dict[str, dict[str, int]] = {}
+    examples: list[dict[str, object]] = []
+    near_rr_floor = settings.paper_exploration_min_rr * 0.9
+    near_coverage_floor = settings.paper_exploration_min_cost_coverage * 0.9
+
+    for row in rows:
+        payload = _safe_json_loads(str(row.get("raw_payload") or ""))
+        best_proposal = payload.get("best_proposal", {}) if isinstance(payload, dict) else {}
+        cost_snapshot = payload.get("cost_snapshot", {}) if isinstance(payload, dict) else {}
+        net_gate = payload.get("net_gate", {}) if isinstance(payload, dict) else {}
+        rejection_diagnostics = payload.get("rejection_diagnostics", {}) if isinstance(payload, dict) else {}
+        if not isinstance(best_proposal, dict):
+            best_proposal = {}
+        if not isinstance(cost_snapshot, dict):
+            cost_snapshot = {}
+        if not isinstance(net_gate, dict):
+            net_gate = {}
+        if not isinstance(rejection_diagnostics, dict):
+            rejection_diagnostics = {}
+
+        symbol = str(row.get("symbol") or "UNKNOWN")
+        timeframe = str(row.get("timeframe") or "UNKNOWN")
+        key = (symbol, timeframe)
+        bucket = aggregate.setdefault(
+            key,
+            {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "total": 0,
+                "net_gate_pass": 0,
+                "near_gate": 0,
+                "poor_data_quality_count": 0,
+                "costs_consume_target_count": 0,
+                "net_reward_risk_too_low_count": 0,
+                "avg_expected_move_pct": 0.0,
+                "avg_stop_distance_pct": 0.0,
+                "avg_target_distance_pct": 0.0,
+                "avg_fee_pct": 0.0,
+                "avg_spread_pct": 0.0,
+                "avg_slippage_pct": 0.0,
+                "avg_net_reward_pct": 0.0,
+                "avg_net_risk_pct": 0.0,
+                "avg_rr_gross": 0.0,
+                "avg_rr_net": 0.0,
+                "avg_cost_coverage": 0.0,
+            },
+        )
+        bucket["total"] += 1
+        approved = bool(net_gate.get("approved"))
+        if approved:
+            bucket["net_gate_pass"] += 1
+        reasons = [str(item) for item in (net_gate.get("rejection_reasons") or [])]
+        if "poor_data_quality" in str(row.get("reason") or ""):
+            bucket["poor_data_quality_count"] += 1
+        if any("net reward/risk" in reason for reason in reasons) or "net_reward_risk_too_low" in str(row.get("reason") or ""):
+            bucket["net_reward_risk_too_low_count"] += 1
+        if any(marker in reason for reason in reasons for marker in ("expected net edge", "cost drag", "covers", "minimum profitable move")) or "costs_consume_target" in str(row.get("reason") or ""):
+            bucket["costs_consume_target_count"] += 1
+
+        expected_move_pct = float(net_gate.get("expected_move_pct") or best_proposal.get("expected_move_pct") or 0.0)
+        stop_distance_pct = float(cost_snapshot.get("expected_gross_risk_pct") or best_proposal.get("stop_loss_pct") or 0.0)
+        target_distance_pct = float(cost_snapshot.get("expected_gross_reward_pct") or best_proposal.get("take_profit_pct") or 0.0)
+        net_reward_pct = float(cost_snapshot.get("expected_net_reward_pct") or net_gate.get("expected_net_reward_pct") or 0.0)
+        net_risk_pct = float(cost_snapshot.get("expected_net_risk_pct") or net_gate.get("expected_net_risk_pct") or 0.0)
+        rr_gross = target_distance_pct / max(stop_distance_pct, 0.000001)
+        rr_net = float(cost_snapshot.get("expected_net_reward_risk") or net_gate.get("expected_net_reward_risk") or 0.0)
+        fee_pct = float(cost_snapshot.get("round_trip_fee_pct") or 0.0)
+        spread_pct = float(cost_snapshot.get("spread_pct") or 0.0)
+        slippage_pct = float(cost_snapshot.get("slippage_entry_pct") or 0.0) + float(cost_snapshot.get("slippage_exit_pct") or 0.0)
+        coverage = float(net_gate.get("cost_coverage_multiple") or 0.0)
+
+        bucket["avg_expected_move_pct"] += expected_move_pct
+        bucket["avg_stop_distance_pct"] += stop_distance_pct
+        bucket["avg_target_distance_pct"] += target_distance_pct
+        bucket["avg_fee_pct"] += fee_pct
+        bucket["avg_spread_pct"] += spread_pct
+        bucket["avg_slippage_pct"] += slippage_pct
+        bucket["avg_net_reward_pct"] += net_reward_pct
+        bucket["avg_net_risk_pct"] += net_risk_pct
+        bucket["avg_rr_gross"] += rr_gross
+        bucket["avg_rr_net"] += rr_net
+        bucket["avg_cost_coverage"] += coverage
+
+        near_gate = (
+            not approved
+            and float(net_gate.get("expected_net_edge_pct") or 0.0) > 0
+            and rr_net >= near_rr_floor
+            and coverage >= near_coverage_floor
+        )
+        if near_gate:
+            bucket["near_gate"] += 1
+
+        symbol_bucket = symbol_summary.setdefault(
+            symbol,
+            {"total": 0, "net_gate_pass": 0, "near_gate": 0, "poor_data_quality_count": 0},
+        )
+        symbol_bucket["total"] += 1
+        symbol_bucket["net_gate_pass"] += 1 if approved else 0
+        symbol_bucket["near_gate"] += 1 if near_gate else 0
+        symbol_bucket["poor_data_quality_count"] += 1 if "poor_data_quality" in str(row.get("reason") or "") else 0
+
+        if (
+            str(rejection_diagnostics.get("rejected_stage") or "") == "NET_GATE"
+            or str(rejection_diagnostics.get("rejected_by_agent") or "") == "NetProfitabilityGate"
+        ) and len(examples) < 10:
+            examples.append(
+                {
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "strategy": best_proposal.get("strategy_name", "UNKNOWN"),
+                    "direction": best_proposal.get("proposed_decision", "NO_TRADE"),
+                    "expected_move_pct": round(expected_move_pct, 6),
+                    "stop_distance_pct": round(stop_distance_pct, 6),
+                    "target_distance_pct": round(target_distance_pct, 6),
+                    "fees_pct": round(fee_pct, 6),
+                    "spread_pct": round(spread_pct, 6),
+                    "slippage_pct": round(slippage_pct, 6),
+                    "net_reward_pct": round(net_reward_pct, 6),
+                    "net_risk_pct": round(net_risk_pct, 6),
+                    "rr_gross": round(rr_gross, 6),
+                    "rr_net": round(rr_net, 6),
+                    "cost_coverage_multiple": round(coverage, 6),
+                    "expected_net_edge_pct": round(float(net_gate.get("expected_net_edge_pct") or 0.0), 6),
+                    "reason": str(row.get("reason") or ""),
+                }
+            )
+
+    profile_rows: list[dict[str, object]] = []
+    for bucket in aggregate.values():
+        total = max(int(bucket["total"]), 1)
+        profile_rows.append(
+            {
+                "symbol": bucket["symbol"],
+                "timeframe": bucket["timeframe"],
+                "total": int(bucket["total"]),
+                "net_gate_pass": int(bucket["net_gate_pass"]),
+                "near_gate": int(bucket["near_gate"]),
+                "poor_data_quality_count": int(bucket["poor_data_quality_count"]),
+                "costs_consume_target_count": int(bucket["costs_consume_target_count"]),
+                "net_reward_risk_too_low_count": int(bucket["net_reward_risk_too_low_count"]),
+                "avg_expected_move_pct": round(float(bucket["avg_expected_move_pct"]) / total, 6),
+                "avg_stop_distance_pct": round(float(bucket["avg_stop_distance_pct"]) / total, 6),
+                "avg_target_distance_pct": round(float(bucket["avg_target_distance_pct"]) / total, 6),
+                "avg_fee_pct": round(float(bucket["avg_fee_pct"]) / total, 6),
+                "avg_spread_pct": round(float(bucket["avg_spread_pct"]) / total, 6),
+                "avg_slippage_pct": round(float(bucket["avg_slippage_pct"]) / total, 6),
+                "avg_net_reward_pct": round(float(bucket["avg_net_reward_pct"]) / total, 6),
+                "avg_net_risk_pct": round(float(bucket["avg_net_risk_pct"]) / total, 6),
+                "avg_rr_gross": round(float(bucket["avg_rr_gross"]) / total, 6),
+                "avg_rr_net": round(float(bucket["avg_rr_net"]) / total, 6),
+                "avg_cost_coverage": round(float(bucket["avg_cost_coverage"]) / total, 6),
+            }
+        )
+    profile_rows.sort(key=lambda row: (-int(row["near_gate"]), -float(row["avg_rr_net"]), -float(row["avg_cost_coverage"]), str(row["symbol"]), str(row["timeframe"])))
+    symbol_rows = [
+        {
+            "symbol": symbol,
+            "total": values["total"],
+            "net_gate_pass": values["net_gate_pass"],
+            "near_gate": values["near_gate"],
+            "poor_data_quality_count": values["poor_data_quality_count"],
+        }
+        for symbol, values in sorted(symbol_summary.items())
+    ]
+    never_pass_rows = [row for row in profile_rows if int(row["net_gate_pass"]) == 0]
+    almost_pass_rows = [row for row in profile_rows if int(row["near_gate"]) > 0][:10]
+    return {
+        "profile_rows": profile_rows,
+        "symbol_rows": symbol_rows,
+        "never_pass_rows": never_pass_rows,
+        "almost_pass_rows": almost_pass_rows,
+        "recent_examples": examples,
+    }
+
+
+def _rows_to_dicts(rows: list[object]) -> list[dict[str, object]]:
+    normalized: list[dict[str, object]] = []
+    for row in rows:
+        if isinstance(row, dict):
+            normalized.append(row)
+            continue
+        if hasattr(row, "as_dict"):
+            converted = row.as_dict()
+            if isinstance(converted, dict):
+                normalized.append(converted)
+                continue
+        if hasattr(row, "__dict__"):
+            normalized.append({key: value for key, value in vars(row).items() if not key.startswith("_")})
+            continue
+        normalized.append({"value": str(row)})
+    return normalized
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Market data reader for Binance")
     parser.add_argument("--init-only", action="store_true", help="Inicializa SQLite y termina")
@@ -1660,11 +1859,20 @@ def build_status_snapshot(
     aggregate_cost_drag_values: list[float] = []
     aggregate_expected_edge_values: list[float] = []
     aggregate_required_move_values: list[float] = []
+    primary_entry_timeframe = settings.execution_timeframes[0] if settings.execution_timeframes else settings.market_timeframe
     proposals_generated = 0
     proposals_with_expected_move_zero = 0
     actionable_signals_before_cost_gate = 0
     actionable_signals_after_cost_gate = 0
     trades_candidate_count = 0
+    setups_generated_primary_timeframe = 0
+    setups_confirmed_30m = 0
+    setups_validated_1h = 0
+    setups_supported_4h = 0
+    setups_failed_by_cost = 0
+    setups_failed_by_score = 0
+    setups_failed_by_contradiction = 0
+    setups_passed_net_gate = 0
     for row in brain_snapshot["aggregate_brain_decisions"]:
         payload = _safe_json_loads(str(row.get("raw_payload") or ""))
         best_proposal = payload.get("best_proposal", {}) if isinstance(payload, dict) else {}
@@ -1679,6 +1887,9 @@ def build_status_snapshot(
         cost_snapshot = payload.get("cost_snapshot", {}) if isinstance(payload, dict) else {}
         if not isinstance(cost_snapshot, dict):
             cost_snapshot = {}
+        tf_alignment_payload = payload.get("timeframe_alignment", {}) if isinstance(payload, dict) else {}
+        if not isinstance(tf_alignment_payload, dict):
+            tf_alignment_payload = {}
         proposals_generated += 1 if best_proposal else 0
         expected_move_pct = float(best_proposal.get("expected_move_pct", row.get("expected_move_pct") or 0.0) or 0.0)
         if expected_move_pct <= 0.000001:
@@ -1699,8 +1910,36 @@ def build_status_snapshot(
             aggregate_required_move_values.append(required_move)
         if expected_edge > 0:
             aggregate_expected_edge_values.append(expected_edge)
+        if str(row.get("timeframe") or "") == primary_entry_timeframe:
+            proposed_decision = str(best_proposal.get("proposed_decision", "NO_TRADE"))
+            if proposed_decision in {"LONG", "SHORT"}:
+                setups_generated_primary_timeframe += 1
+            supporting_timeframes = {str(item) for item in (tf_alignment_payload.get("supporting_timeframes") or [])}
+            if "30m" in supporting_timeframes:
+                setups_confirmed_30m += 1
+            if "1h" in supporting_timeframes:
+                setups_validated_1h += 1
+            if "4h" in supporting_timeframes:
+                setups_supported_4h += 1
+            simple_reasons = {
+                str(item)
+                for item in (rejection_diagnostics.get("simple_reasons") or _extract_rejection_diagnostics(dict(row)).get("simple_reasons", []))
+                if str(item).strip()
+            }
+            if "costs_consume_target" in simple_reasons or "net_reward_risk_too_low" in simple_reasons:
+                setups_failed_by_cost += 1
+            if "final_score_below_threshold" in simple_reasons:
+                setups_failed_by_score += 1
+            if "multi_timeframe_contradiction" in simple_reasons:
+                setups_failed_by_contradiction += 1
+            if bool(net_gate_payload.get("approved")):
+                setups_passed_net_gate += 1
     rejection_reason_summary = _build_rejection_reason_summary(
         [row for row in brain_snapshot["aggregate_brain_decisions"] if str(row.get("final_decision")) == "NO_TRADE"]
+    )
+    net_gate_diagnostics = _build_net_gate_diagnostics(
+        brain_snapshot["aggregate_brain_decisions"],
+        settings=settings,
     )
     with database.connection() as conn:
         brain_counts_row = conn.execute(
@@ -1882,11 +2121,21 @@ def build_status_snapshot(
         "actionable_signals_before_cost_gate": actionable_signals_before_cost_gate,
         "actionable_signals_after_cost_gate": actionable_signals_after_cost_gate,
         "trades_candidate_count": trades_candidate_count,
+        "primary_entry_timeframe": primary_entry_timeframe,
+        "setups_generated_primary_timeframe": setups_generated_primary_timeframe,
+        "setups_confirmed_30m": setups_confirmed_30m,
+        "setups_validated_1h": setups_validated_1h,
+        "setups_supported_4h": setups_supported_4h,
+        "setups_failed_by_cost": setups_failed_by_cost,
+        "setups_failed_by_score": setups_failed_by_score,
+        "setups_failed_by_contradiction": setups_failed_by_contradiction,
+        "setups_passed_net_gate": setups_passed_net_gate,
         "signal_only_count": rejection_reason_summary["signal_only_count"],
         "final_score_only_count": rejection_reason_summary["final_score_only_count"],
         "less_strict_exploration_count": rejection_reason_summary["less_strict_exploration_count"],
         "opportunity_count": int(experiment_quality_row["approved_opportunities"] or 0) + int(experiment_quality_row["rejected_opportunities"] or 0),
         "trades_per_timeframe": dict(trades_per_timeframe),
+        "net_gate_diagnostics": net_gate_diagnostics,
         "total_paper_orders": database.count_paper_orders(),
         "open_paper_positions_count": database.count_open_paper_positions(),
         "symbol_health": symbol_health,
@@ -1944,7 +2193,9 @@ def run_status_report(
     brain_snapshot = snapshot["brain_snapshot"]
     current_experiment = snapshot["current_experiment"]
     external_context = snapshot["external_context"]
+    net_gate_diagnostics = snapshot["net_gate_diagnostics"]
     intraday_core = snapshot["intraday_core"]
+    net_gate_diagnostics = snapshot["net_gate_diagnostics"]
 
     print("Status Report")
     print(f"Database path: {snapshot['database_path']}")
@@ -2130,6 +2381,15 @@ def run_status_report(
     print(f"- good avoidances: {snapshot['good_avoidances']}")
     print(f"- approved opportunity count: {snapshot['approved_opportunity_count']}")
     print(f"- approved trades count: {snapshot['approved_trade_count']}")
+    print(f"- primary entry timeframe: {snapshot['primary_entry_timeframe']}")
+    print(f"- setups generated in {snapshot['primary_entry_timeframe']}: {snapshot['setups_generated_primary_timeframe']}")
+    print(f"- setups confirmed by 30m: {snapshot['setups_confirmed_30m']}")
+    print(f"- setups validated by 1h: {snapshot['setups_validated_1h']}")
+    print(f"- setups supported by 4h bias: {snapshot['setups_supported_4h']}")
+    print(f"- setups failed by cost: {snapshot['setups_failed_by_cost']}")
+    print(f"- setups failed by score: {snapshot['setups_failed_by_score']}")
+    print(f"- setups failed by contradiction: {snapshot['setups_failed_by_contradiction']}")
+    print(f"- setups passed NET_GATE: {snapshot['setups_passed_net_gate']}")
     print(f"- proposals generated: {snapshot['proposals_generated']}")
     print(f"- proposals with expected_move zero: {snapshot['proposals_with_expected_move_zero']}")
     print(f"- actionable signals before cost gate: {snapshot['actionable_signals_before_cost_gate']}")
@@ -2157,6 +2417,35 @@ def run_status_report(
     print(f"- blocked only by signal_not_actionable: {snapshot['signal_only_count']}")
     print(f"- blocked only by final_score: {snapshot['final_score_only_count']}")
     print(f"- would enter with less strict exploration: {snapshot['less_strict_exploration_count']}")
+    print("")
+
+    print("NET_GATE by symbol/timeframe:")
+    if net_gate_diagnostics["profile_rows"]:
+        for row in net_gate_diagnostics["profile_rows"][:10]:
+            print(
+                f"- {row['symbol']} {row['timeframe']} total={row['total']} pass={row['net_gate_pass']} near={row['near_gate']} "
+                f"poor_data={row['poor_data_quality_count']} move={row['avg_expected_move_pct']} stop={row['avg_stop_distance_pct']} "
+                f"target={row['avg_target_distance_pct']} fee={row['avg_fee_pct']} spread={row['avg_spread_pct']} "
+                f"slippage={row['avg_slippage_pct']} rr_gross={row['avg_rr_gross']} rr_net={row['avg_rr_net']} "
+                f"coverage={row['avg_cost_coverage']}"
+            )
+    else:
+        print("- none")
+    print("")
+
+    print("NET_GATE rejected examples:")
+    if net_gate_diagnostics["recent_examples"]:
+        for row in net_gate_diagnostics["recent_examples"]:
+            print(
+                f"- {row['symbol']} {row['timeframe']} {row['strategy']} {row['direction']} "
+                f"move={row['expected_move_pct']} stop={row['stop_distance_pct']} target={row['target_distance_pct']} "
+                f"fees={row['fees_pct']} spread={row['spread_pct']} slippage={row['slippage_pct']} "
+                f"net_reward={row['net_reward_pct']} net_risk={row['net_risk_pct']} rr_gross={row['rr_gross']} "
+                f"rr_net={row['rr_net']} coverage={row['cost_coverage_multiple']} edge={row['expected_net_edge_pct']} "
+                f"reason={row['reason']}"
+            )
+    else:
+        print("- none")
     print("")
 
     print("Open paper positions:")
@@ -2587,6 +2876,7 @@ def run_brain_report(
     portfolio = snapshot["portfolio"] or {}
     current_experiment = snapshot["current_experiment"]
     external_context = snapshot["external_context"]
+    net_gate_diagnostics = snapshot["net_gate_diagnostics"]
 
     fresh_symbols = [row for row in symbol_health if not row["is_stale"] and row["is_valid"]]
     stale_symbols = [row for row in symbol_health if row["is_stale"]]
@@ -2638,6 +2928,15 @@ def run_brain_report(
     print(f"Missed opportunities: {snapshot['missed_opportunities']}")
     print(f"Good avoidances: {snapshot['good_avoidances']}")
     print(f"Approved trades count: {snapshot['approved_trade_count']}")
+    print(f"Primary entry timeframe: {snapshot['primary_entry_timeframe']}")
+    print(f"Setups generated in {snapshot['primary_entry_timeframe']}: {snapshot['setups_generated_primary_timeframe']}")
+    print(f"Setups confirmed by 30m: {snapshot['setups_confirmed_30m']}")
+    print(f"Setups validated by 1h: {snapshot['setups_validated_1h']}")
+    print(f"Setups supported by 4h bias: {snapshot['setups_supported_4h']}")
+    print(f"Setups failed by cost: {snapshot['setups_failed_by_cost']}")
+    print(f"Setups failed by score: {snapshot['setups_failed_by_score']}")
+    print(f"Setups failed by contradiction: {snapshot['setups_failed_by_contradiction']}")
+    print(f"Setups passed NET_GATE: {snapshot['setups_passed_net_gate']}")
     print(f"proposals_generated: {snapshot['proposals_generated']}")
     print(f"proposals_with_expected_move_zero: {snapshot['proposals_with_expected_move_zero']}")
     print(f"actionable_signals_before_cost_gate: {snapshot['actionable_signals_before_cost_gate']}")
@@ -2666,6 +2965,33 @@ def run_brain_report(
     print(f"Too aggressive: {'YES' if too_aggressive else 'NO'}")
     print(f"Recommendation: {recommendation}")
     print("")
+
+    print("NET_GATE by symbol/timeframe:")
+    if net_gate_diagnostics["profile_rows"]:
+        for row in net_gate_diagnostics["profile_rows"][:10]:
+            print(
+                f"- {row['symbol']} {row['timeframe']} pass={row['net_gate_pass']}/{row['total']} near={row['near_gate']} "
+                f"move={row['avg_expected_move_pct']} stop={row['avg_stop_distance_pct']} target={row['avg_target_distance_pct']} "
+                f"rr_net={row['avg_rr_net']} coverage={row['avg_cost_coverage']} poor_data={row['poor_data_quality_count']}"
+            )
+    else:
+        print("- none")
+    print("")
+
+    print("NET_GATE rejected examples:")
+    if net_gate_diagnostics["recent_examples"]:
+        for row in net_gate_diagnostics["recent_examples"]:
+            print(
+                f"- {row['symbol']} {row['timeframe']} {row['strategy']} {row['direction']} "
+                f"move={row['expected_move_pct']} stop={row['stop_distance_pct']} target={row['target_distance_pct']} "
+                f"fees={row['fees_pct']} spread={row['spread_pct']} slippage={row['slippage_pct']} "
+                f"net_reward={row['net_reward_pct']} net_risk={row['net_risk_pct']} rr_net={row['rr_net']} "
+                f"coverage={row['cost_coverage_multiple']} edge={row['expected_net_edge_pct']} reason={row['reason']}"
+            )
+    else:
+        print("- none")
+    print("")
+
     print("News context:")
     print(
         f"- news source={external_context['news_status']['source']} status={external_context['news_status']['status']} "
@@ -2855,6 +3181,8 @@ def run_export_report(
             {"combination": reason, "count": count}
             for reason, count in intraday_core["top_rejection_combinations"]
         ]
+        net_gate_profile_rows = snapshot["net_gate_diagnostics"]["profile_rows"]
+        net_gate_example_rows = snapshot["net_gate_diagnostics"]["recent_examples"]
         csv_targets = {
             "trades.csv": snapshot["recent_trades"],
             "decisions.csv": snapshot["recent_decisions"],
@@ -2882,6 +3210,8 @@ def run_export_report(
             "rejection_reason_summary.csv": rejection_summary_rows,
             "rejection_combinations.csv": rejection_combination_rows,
             "near_approved_setups.csv": snapshot["near_approved_rows"],
+            "net_gate_profile.csv": net_gate_profile_rows,
+            "net_gate_examples.csv": net_gate_example_rows,
             "news_events.csv": snapshot["external_context"]["latest_news"],
             "sentiment_snapshots.csv": snapshot["external_context"]["latest_sentiment"],
             "intraday_core_summary.csv": intraday_core_summary_rows,
@@ -2892,14 +3222,15 @@ def run_export_report(
         }
         for filename, rows in csv_targets.items():
             path = output_dir / filename
-            if not rows:
+            row_dicts = _rows_to_dicts(list(rows))
+            if not row_dicts:
                 path.write_text("", encoding="utf-8")
                 continue
-            fieldnames = sorted({key for row in rows for key in row.keys()})
+            fieldnames = sorted({key for row in row_dicts for key in row.keys()})
             with path.open("w", encoding="utf-8", newline="") as handle:
                 writer = csv.DictWriter(handle, fieldnames=fieldnames)
                 writer.writeheader()
-                for row in rows:
+                for row in row_dicts:
                     writer.writerow({key: row.get(key) for key in fieldnames})
         print(f"Exported CSV report bundle to {output_dir}")
         return str(output_dir)
@@ -2959,10 +3290,26 @@ def run_export_report(
                     "actionable_signals_before_cost_gate": snapshot["actionable_signals_before_cost_gate"],
                     "actionable_signals_after_cost_gate": snapshot["actionable_signals_after_cost_gate"],
                     "trades_candidate_count": snapshot["trades_candidate_count"],
+                    "primary_entry_timeframe": snapshot["primary_entry_timeframe"],
+                    "setups_generated_primary_timeframe": snapshot["setups_generated_primary_timeframe"],
+                    "setups_confirmed_30m": snapshot["setups_confirmed_30m"],
+                    "setups_validated_1h": snapshot["setups_validated_1h"],
+                    "setups_supported_4h": snapshot["setups_supported_4h"],
+                    "setups_failed_by_cost": snapshot["setups_failed_by_cost"],
+                    "setups_failed_by_score": snapshot["setups_failed_by_score"],
+                    "setups_failed_by_contradiction": snapshot["setups_failed_by_contradiction"],
+                    "setups_passed_net_gate": snapshot["setups_passed_net_gate"],
                     "signal_only_count": snapshot["signal_only_count"],
                     "final_score_only_count": snapshot["final_score_only_count"],
                     "less_strict_exploration_count": snapshot["less_strict_exploration_count"],
                 },
+            "net_gate_diagnostics": {
+                "profile_rows": snapshot["net_gate_diagnostics"]["profile_rows"],
+                "symbol_rows": snapshot["net_gate_diagnostics"]["symbol_rows"],
+                "never_pass_rows": snapshot["net_gate_diagnostics"]["never_pass_rows"],
+                "almost_pass_rows": snapshot["net_gate_diagnostics"]["almost_pass_rows"],
+                "recent_examples": snapshot["net_gate_diagnostics"]["recent_examples"],
+            },
             "brain": {
                 "recent_strategy_votes": brain_snapshot["recent_strategy_votes"],
                 "recent_strategy_evaluations": brain_snapshot["recent_strategy_evaluations"],

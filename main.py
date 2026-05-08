@@ -182,8 +182,17 @@ def _build_rejection_reason_summary(rows: list[dict[str, object]]) -> dict[str, 
                     "would_open_with_5pct_laxer_threshold": near_approval.get("would_open_with_5pct_laxer_threshold", False),
                     "would_open_with_smaller_size": near_approval.get("would_open_with_smaller_size", False),
                     "would_open_without_secondary_contradiction": near_approval.get("would_open_without_secondary_contradiction", False),
+                    "would_open_with_more_symbol_entry_room": near_approval.get("would_open_with_more_symbol_entry_room", False),
                 }
             )
+    less_strict_exploration_count = sum(
+        1
+        for row in near_approved_rows
+        if bool(row.get("would_open_with_5pct_laxer_threshold"))
+        or bool(row.get("would_open_with_smaller_size"))
+        or bool(row.get("would_open_without_secondary_contradiction"))
+        or bool(row.get("would_open_with_more_symbol_entry_room"))
+    )
     return {
         "simple_counts": dict(simple_counts),
         "combination_counts": dict(combination_counts),
@@ -194,6 +203,9 @@ def _build_rejection_reason_summary(rows: list[dict[str, object]]) -> dict[str, 
         "top_primary_reasons": sorted(primary_counts.items(), key=lambda item: item[1], reverse=True)[:10],
         "top_secondary_reasons": sorted(secondary_counts.items(), key=lambda item: item[1], reverse=True)[:10],
         "near_approved_rows": near_approved_rows,
+        "signal_only_count": int(combination_counts.get("signal_not_actionable", 0)),
+        "final_score_only_count": int(combination_counts.get("final_score_below_threshold", 0)),
+        "less_strict_exploration_count": less_strict_exploration_count,
     }
 
 
@@ -1358,6 +1370,9 @@ def run_quick_audit(
     print(f"- signal_not_actionable={int(rejection_summary['simple_counts'].get('signal_not_actionable', 0))}")
     print(f"- risk_capital_protection={int(rejection_summary['simple_counts'].get('risk_too_high_capital_protection', 0))}")
     print(f"- final_score_below_threshold={int(rejection_summary['simple_counts'].get('final_score_below_threshold', 0))}")
+    print(f"- blocked_only_by_signal_not_actionable={rejection_summary['signal_only_count']}")
+    print(f"- blocked_only_by_final_score={rejection_summary['final_score_only_count']}")
+    print(f"- would_enter_if_exploration_less_strict={rejection_summary['less_strict_exploration_count']}")
     print("Recent trades:")
     if recent_trades:
         for trade in recent_trades:
@@ -1566,6 +1581,9 @@ def build_brain_snapshot(database: Database, *, experiment_id: int | None = None
         "simple_reason_counts": rejection_summary["simple_counts"],
         "combination_reason_counts": rejection_summary["combination_counts"],
         "near_approved_rows": rejection_summary["near_approved_rows"],
+        "signal_only_count": rejection_summary["signal_only_count"],
+        "final_score_only_count": rejection_summary["final_score_only_count"],
+        "less_strict_exploration_count": rejection_summary["less_strict_exploration_count"],
         "rejected_symbols": sorted(rejected_symbols.items(), key=lambda item: item[1], reverse=True)[:10],
         "rejected_timeframes": sorted(rejected_timeframes.items(), key=lambda item: item[1], reverse=True)[:10],
         "rejected_strategies": sorted(rejected_strategies.items(), key=lambda item: item[1], reverse=True)[:10],
@@ -1642,11 +1660,36 @@ def build_status_snapshot(
     aggregate_cost_drag_values: list[float] = []
     aggregate_expected_edge_values: list[float] = []
     aggregate_required_move_values: list[float] = []
+    proposals_generated = 0
+    proposals_with_expected_move_zero = 0
+    actionable_signals_before_cost_gate = 0
+    actionable_signals_after_cost_gate = 0
+    trades_candidate_count = 0
     for row in brain_snapshot["aggregate_brain_decisions"]:
         payload = _safe_json_loads(str(row.get("raw_payload") or ""))
+        best_proposal = payload.get("best_proposal", {}) if isinstance(payload, dict) else {}
+        if not isinstance(best_proposal, dict):
+            best_proposal = {}
+        rejection_diagnostics = payload.get("rejection_diagnostics", {}) if isinstance(payload, dict) else {}
+        if not isinstance(rejection_diagnostics, dict):
+            rejection_diagnostics = {}
+        net_gate_payload = payload.get("net_gate", {}) if isinstance(payload, dict) else {}
+        if not isinstance(net_gate_payload, dict):
+            net_gate_payload = {}
         cost_snapshot = payload.get("cost_snapshot", {}) if isinstance(payload, dict) else {}
         if not isinstance(cost_snapshot, dict):
             cost_snapshot = {}
+        proposals_generated += 1 if best_proposal else 0
+        expected_move_pct = float(best_proposal.get("expected_move_pct", row.get("expected_move_pct") or 0.0) or 0.0)
+        if expected_move_pct <= 0.000001:
+            proposals_with_expected_move_zero += 1
+        signal_actionability = str(rejection_diagnostics.get("signal_actionability") or "")
+        if signal_actionability and signal_actionability != "NO_SIGNAL":
+            actionable_signals_before_cost_gate += 1
+            if bool(net_gate_payload.get("approved")):
+                actionable_signals_after_cost_gate += 1
+                if str(best_proposal.get("proposed_decision", row.get("final_decision") or "NO_TRADE")) in {"LONG", "SHORT"}:
+                    trades_candidate_count += 1
         cost_drag = float(cost_snapshot.get("cost_drag_pct", 0.0) or 0.0)
         required_move = float(cost_snapshot.get("minimum_profitable_move_pct", row.get("total_cost_pct") or 0.0) or 0.0)
         expected_edge = float(row.get("expected_net_edge_pct") or 0.0)
@@ -1826,6 +1869,22 @@ def build_status_snapshot(
         "signal_not_actionable_count": int(rejection_reason_summary["simple_counts"].get("signal_not_actionable", 0)),
         "risk_capital_protection_count": int(rejection_reason_summary["simple_counts"].get("risk_too_high_capital_protection", 0)),
         "final_score_below_threshold_count": int(rejection_reason_summary["simple_counts"].get("final_score_below_threshold", 0)),
+        "proposals_generated": proposals_generated,
+        "proposals_with_expected_move_zero": proposals_with_expected_move_zero,
+        "proposals_rejected_by_cost_only": int(rejection_reason_summary["combination_counts"].get("costs_consume_target", 0)),
+        "proposals_rejected_by_rr_only": int(rejection_reason_summary["combination_counts"].get("net_reward_risk_too_low", 0)),
+        "proposals_rejected_by_mode_only": int(rejection_reason_summary["combination_counts"].get("mode_restriction", 0)),
+        "proposals_rejected_by_risk_only": int(rejection_reason_summary["combination_counts"].get("risk_blocked", 0)) + int(rejection_reason_summary["combination_counts"].get("risk_too_high_capital_protection", 0)),
+        "proposals_rejected_by_score_only": int(rejection_reason_summary["combination_counts"].get("final_score_below_threshold", 0)),
+        "proposals_rejected_by_multiple_filters": sum(
+            count for combo, count in rejection_reason_summary["combination_counts"].items() if " | " in combo
+        ),
+        "actionable_signals_before_cost_gate": actionable_signals_before_cost_gate,
+        "actionable_signals_after_cost_gate": actionable_signals_after_cost_gate,
+        "trades_candidate_count": trades_candidate_count,
+        "signal_only_count": rejection_reason_summary["signal_only_count"],
+        "final_score_only_count": rejection_reason_summary["final_score_only_count"],
+        "less_strict_exploration_count": rejection_reason_summary["less_strict_exploration_count"],
         "opportunity_count": int(experiment_quality_row["approved_opportunities"] or 0) + int(experiment_quality_row["rejected_opportunities"] or 0),
         "trades_per_timeframe": dict(trades_per_timeframe),
         "total_paper_orders": database.count_paper_orders(),
@@ -2071,6 +2130,11 @@ def run_status_report(
     print(f"- good avoidances: {snapshot['good_avoidances']}")
     print(f"- approved opportunity count: {snapshot['approved_opportunity_count']}")
     print(f"- approved trades count: {snapshot['approved_trade_count']}")
+    print(f"- proposals generated: {snapshot['proposals_generated']}")
+    print(f"- proposals with expected_move zero: {snapshot['proposals_with_expected_move_zero']}")
+    print(f"- actionable signals before cost gate: {snapshot['actionable_signals_before_cost_gate']}")
+    print(f"- actionable signals after cost gate: {snapshot['actionable_signals_after_cost_gate']}")
+    print(f"- trades candidate count: {snapshot['trades_candidate_count']}")
     print(f"- rejected opportunity count: {snapshot['rejected_opportunity_count']}")
     print(f"- near approved exploration setups: {snapshot['near_approved_exploration_setups']}")
     no_trade_rate = round((snapshot['rejected_opportunity_count'] / max(snapshot['current_experiment_brain_decisions'], 1)) * 100, 2) if snapshot['current_experiment_brain_decisions'] else 0.0
@@ -2084,6 +2148,15 @@ def run_status_report(
     print(f"- signal_not_actionable count: {snapshot['signal_not_actionable_count']}")
     print(f"- risk_capital_protection count: {snapshot['risk_capital_protection_count']}")
     print(f"- final_score_below_threshold count: {snapshot['final_score_below_threshold_count']}")
+    print(f"- proposals rejected by cost only: {snapshot['proposals_rejected_by_cost_only']}")
+    print(f"- proposals rejected by rr only: {snapshot['proposals_rejected_by_rr_only']}")
+    print(f"- proposals rejected by mode only: {snapshot['proposals_rejected_by_mode_only']}")
+    print(f"- proposals rejected by risk only: {snapshot['proposals_rejected_by_risk_only']}")
+    print(f"- proposals rejected by score only: {snapshot['proposals_rejected_by_score_only']}")
+    print(f"- proposals rejected by multiple filters: {snapshot['proposals_rejected_by_multiple_filters']}")
+    print(f"- blocked only by signal_not_actionable: {snapshot['signal_only_count']}")
+    print(f"- blocked only by final_score: {snapshot['final_score_only_count']}")
+    print(f"- would enter with less strict exploration: {snapshot['less_strict_exploration_count']}")
     print("")
 
     print("Open paper positions:")
@@ -2565,6 +2638,11 @@ def run_brain_report(
     print(f"Missed opportunities: {snapshot['missed_opportunities']}")
     print(f"Good avoidances: {snapshot['good_avoidances']}")
     print(f"Approved trades count: {snapshot['approved_trade_count']}")
+    print(f"proposals_generated: {snapshot['proposals_generated']}")
+    print(f"proposals_with_expected_move_zero: {snapshot['proposals_with_expected_move_zero']}")
+    print(f"actionable_signals_before_cost_gate: {snapshot['actionable_signals_before_cost_gate']}")
+    print(f"actionable_signals_after_cost_gate: {snapshot['actionable_signals_after_cost_gate']}")
+    print(f"trades_candidate_count: {snapshot['trades_candidate_count']}")
     print(f"Rejected by cost: {snapshot['rejected_by_cost']}")
     print(f"Rejected by risk: {snapshot['rejected_by_risk']}")
     print(f"Rejected by contradiction: {snapshot['rejected_by_contradiction']}")
@@ -2575,6 +2653,15 @@ def run_brain_report(
     print(f"signal_not_actionable count: {snapshot['signal_not_actionable_count']}")
     print(f"risk_capital_protection count: {snapshot['risk_capital_protection_count']}")
     print(f"final_score_below_threshold count: {snapshot['final_score_below_threshold_count']}")
+    print(f"proposals rejected by cost only: {snapshot['proposals_rejected_by_cost_only']}")
+    print(f"proposals rejected by rr only: {snapshot['proposals_rejected_by_rr_only']}")
+    print(f"proposals rejected by mode only: {snapshot['proposals_rejected_by_mode_only']}")
+    print(f"proposals rejected by risk only: {snapshot['proposals_rejected_by_risk_only']}")
+    print(f"proposals rejected by score only: {snapshot['proposals_rejected_by_score_only']}")
+    print(f"proposals rejected by multiple filters: {snapshot['proposals_rejected_by_multiple_filters']}")
+    print(f"blocked only by signal_not_actionable: {snapshot['signal_only_count']}")
+    print(f"blocked only by final_score: {snapshot['final_score_only_count']}")
+    print(f"would enter with less strict exploration: {snapshot['less_strict_exploration_count']}")
     print(f"Too conservative: {'YES' if too_conservative else 'NO'}")
     print(f"Too aggressive: {'YES' if too_aggressive else 'NO'}")
     print(f"Recommendation: {recommendation}")
@@ -2861,6 +2948,20 @@ def run_export_report(
                     "signal_not_actionable_count": snapshot["signal_not_actionable_count"],
                     "risk_capital_protection_count": snapshot["risk_capital_protection_count"],
                     "final_score_below_threshold_count": snapshot["final_score_below_threshold_count"],
+                    "proposals_generated": snapshot["proposals_generated"],
+                    "proposals_with_expected_move_zero": snapshot["proposals_with_expected_move_zero"],
+                    "proposals_rejected_by_cost_only": snapshot["proposals_rejected_by_cost_only"],
+                    "proposals_rejected_by_rr_only": snapshot["proposals_rejected_by_rr_only"],
+                    "proposals_rejected_by_mode_only": snapshot["proposals_rejected_by_mode_only"],
+                    "proposals_rejected_by_risk_only": snapshot["proposals_rejected_by_risk_only"],
+                    "proposals_rejected_by_score_only": snapshot["proposals_rejected_by_score_only"],
+                    "proposals_rejected_by_multiple_filters": snapshot["proposals_rejected_by_multiple_filters"],
+                    "actionable_signals_before_cost_gate": snapshot["actionable_signals_before_cost_gate"],
+                    "actionable_signals_after_cost_gate": snapshot["actionable_signals_after_cost_gate"],
+                    "trades_candidate_count": snapshot["trades_candidate_count"],
+                    "signal_only_count": snapshot["signal_only_count"],
+                    "final_score_only_count": snapshot["final_score_only_count"],
+                    "less_strict_exploration_count": snapshot["less_strict_exploration_count"],
                 },
             "brain": {
                 "recent_strategy_votes": brain_snapshot["recent_strategy_votes"],
@@ -2884,6 +2985,9 @@ def run_export_report(
                 "missed_opportunities": snapshot["missed_opportunities"],
                 "good_avoidances": snapshot["good_avoidances"],
                 "near_approved_rows": snapshot["near_approved_rows"],
+                "signal_only_count": snapshot["signal_only_count"],
+                "final_score_only_count": snapshot["final_score_only_count"],
+                "less_strict_exploration_count": snapshot["less_strict_exploration_count"],
             },
         },
         "details": snapshot,
